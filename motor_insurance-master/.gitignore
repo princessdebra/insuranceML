@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+.env
+*.pyc
+*.db
+*.log
+cv/venv/
+cv/.env
+cv/data/*/
+!cv/data/.gitkeep
+cv/models/*.onnx
+cv/models/*.pt
+runs/

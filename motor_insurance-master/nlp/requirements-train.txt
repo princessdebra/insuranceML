@@ -1,0 +1,11 @@
+# GPU-box only -- not needed in the main app environment or this sandbox.
+# Installs the LoRA fine-tuning stack for nlp/scripts/train_lora.py.
+# Needs a CUDA GPU with ~24GB VRAM for 4-bit QLoRA on a 7B model.
+
+torch>=2.3
+transformers>=4.44
+peft>=0.12
+trl>=0.12
+accelerate>=0.33
+bitsandbytes>=0.43
+datasets>=2.20

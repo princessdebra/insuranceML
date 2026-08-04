@@ -1,0 +1,37 @@
+# --- Backend (Python) ---
+motor_insurance-master/venv/
+**/__pycache__/
+*.pyc
+motor_insurance-master/claims_database.db
+motor_insurance-master/claim_videos/
+motor_insurance-master/*.log
+motor_insurance-master/ollama_tunnel_watchdog.log
+motor_insurance-master/nlp/_staging/
+motor_insurance-master/motor_underwriting_ai.log
+motor_insurance-master/output_videos/
+
+# Large training/eval datasets and raw data -- regeneratable, not source code.
+# claims_finetune_train.jsonl alone is 103MB, over GitHub's 100MB hard limit.
+motor_insurance-master/nlp/data/
+motor_insurance-master/cv/data/
+motor_insurance-master/Old_Mutual_Kenya_Motor_Claims_Synthetic_Data*.xlsx
+
+# Pretrained base checkpoints (auto-downloaded by ultralytics) -- not our
+# trained output, redundant to store. Our actual trained weights in
+# cv/models/*/best.pt are kept.
+motor_insurance-master/cv/yolov8n-seg.pt
+motor_insurance-master/cv/yolov8n.pt
+
+# --- Frontend (Node) ---
+**/node_modules/
+**/dist/
+**/.vite/
+**/*.local
+
+# --- General ---
+.env
+.env.local
+*.db
+.DS_Store
+Thumbs.db
+.claude/
