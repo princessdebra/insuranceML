@@ -14,6 +14,27 @@ export default function AssessorDashboard() {
     getAssessorClaims(assessorId).then((d) => { setData(d); setLoading(false); }).catch(() => setLoading(false));
   }, [navigate]);
 
+  // Claims still being analyzed (risk_level === "pending") finish on the
+  // backend in the background -- without this, the dashboard would just
+  // keep showing "Analyzing..." forever until the assessor manually
+  // refreshes the page. Poll while anything is still pending, and stop
+  // once every claim has a real result, so this doesn't run forever.
+  const claimsForPolling = data?.claims || [];
+  const hasPendingClaims = claimsForPolling.some((c: any) => c.risk_level === "pending");
+
+  useEffect(() => {
+    if (!hasPendingClaims) return;
+    const assessorId = localStorage.getItem("assessorId");
+    if (!assessorId) return;
+
+    const interval = setInterval(() => {
+      getAssessorClaims(assessorId).then((d) => setData(d)).catch(() => {});
+    }, 18000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasPendingClaims]);
+
   if (loading) return <AssessorLayout><div className="flex items-center justify-center h-full"><p className="text-muted-foreground">Loading...</p></div></AssessorLayout>;
 
   const claims = data?.claims || [];
@@ -50,7 +71,15 @@ export default function AssessorDashboard() {
         {/* Claims Table */}
         <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
           <div className="px-6 py-5 border-b border-border flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <h3 className="text-lg font-bold text-foreground">Active Claim Assignments</h3>
+            <div className="flex items-center gap-3">
+              <h3 className="text-lg font-bold text-foreground">Active Claim Assignments</h3>
+              {hasPendingClaims && (
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-muted-foreground italic">
+                  <span className="size-2.5 border-2 border-muted-foreground/40 border-t-primary rounded-full animate-spin"></span>
+                  Auto-refreshing while claims are analyzing...
+                </span>
+              )}
+            </div>
             <div className="flex items-center gap-2">
               <button className="px-4 py-2 border border-border rounded-lg text-sm font-medium flex items-center gap-2 hover:bg-muted transition-colors text-foreground">
                 <span className="material-symbols-outlined text-[18px]">filter_list</span>Filter

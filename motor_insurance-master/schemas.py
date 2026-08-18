@@ -21,6 +21,12 @@ class PhotoAnomalySchema(BaseModel):
     anomalies: List[Dict[str, Any]]
     risk_score: int = Field(..., ge=0, le=100)
     analysis_confidence: int = Field(..., ge=0, le=100)
+    # Trained-YOLO-model-only severity read (low/medium/high), independent of
+    # any vision-LLM text reasoning or narrative — used as the anchor signal
+    # when cross-checking a party's numeric/narrative damage claims against
+    # what the photos actually show.
+    cv_severity: Optional[str] = None
+    detected_classes: List[str] = Field(default_factory=list)
 
 
 class NarrativeAnalysisSchema(BaseModel):

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import AdminLayout from "@/layouts/AdminLayout";
-import { getClaimFullReport, getSimulationStatus, BASE_URL } from "@/lib/api";
+import { getClaimFullReport, getSimulationStatus, getClaimDecision, recordClaimDecision, BASE_URL } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { Button } from "@/components/ui/button";
 
 export default function AdminClaimReport() {
   const { claimId } = useParams();
@@ -16,6 +17,48 @@ export default function AdminClaimReport() {
   // Trajectory Simulation States
   const [simulationStatus, setSimulationStatus] = useState<any>(null);
   const [loadingSimulation, setLoadingSimulation] = useState(false);
+
+  // Final triage decision (PAY / DENY / ESCALATE) -- the human reviewer's
+  // actual, persisted business call, distinct from the AI's recomputed
+  // "Recommended Action" suggestion shown below.
+  const [decisionAction, setDecisionAction] = useState<"PAY" | "DENY" | "ESCALATE" | null>(null);
+  const [decisionReason, setDecisionReason] = useState("");
+  const [payoutAmount, setPayoutAmount] = useState("");
+  const [submittingDecision, setSubmittingDecision] = useState(false);
+  const [decisionError, setDecisionError] = useState("");
+
+  const submitDecision = async () => {
+    if (!decisionAction || !claimId) return;
+    if ((decisionAction === "DENY" || decisionAction === "ESCALATE") && !decisionReason.trim()) {
+      setDecisionError(`A reason is required to ${decisionAction.toLowerCase()} this claim.`);
+      return;
+    }
+    setSubmittingDecision(true);
+    setDecisionError("");
+    try {
+      const adminId = localStorage.getItem("adminId") || "admin";
+      const res = await recordClaimDecision({
+        claim_id: claimId,
+        decision: decisionAction,
+        decided_by: adminId,
+        reason: decisionReason.trim() || undefined,
+        payout_amount: decisionAction === "PAY" && payoutAmount ? Number(payoutAmount) : undefined,
+      });
+      if (res.success) {
+        const updated = await getClaimDecision(claimId);
+        setReport((prev: any) => ({ ...prev, claim_decision: updated.current_decision }));
+        setDecisionAction(null);
+        setDecisionReason("");
+        setPayoutAmount("");
+      } else {
+        setDecisionError(res.detail || "Could not record decision.");
+      }
+    } catch (e) {
+      setDecisionError("Could not record decision — check your connection.");
+    } finally {
+      setSubmittingDecision(false);
+    }
+  };
 
   useEffect(() => {
     if (!localStorage.getItem("adminId")) {
@@ -135,6 +178,57 @@ export default function AdminClaimReport() {
 
   const riskBarColor = (score: number) => (score >= 70 ? "bg-destructive" : score >= 50 ? "bg-amber-500" : "bg-primary");
 
+  // Consolidated "why was this flagged" summary -- pulls together signals
+  // that are otherwise scattered across four different tabs (fraud
+  // indicators, physics, measurement discrepancy, assessor pattern) into
+  // one ranked list, so a reviewer doesn't have to click through everything
+  // to get the headline reasons.
+  const severityRank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+  type Reason = { severity: string; message: string; source: string };
+  const topReasons: Reason[] = [];
+
+  warnings.forEach((w: any) => {
+    topReasons.push({
+      severity: (w.severity || "medium").toLowerCase(),
+      message: w.message,
+      source: w.party ? `${w.type?.replace(/_/g, " ")} — ${w.party}` : w.type?.replace(/_/g, " "),
+    });
+  });
+
+  (pr.inconsistencies || []).forEach((inc: any) => {
+    topReasons.push({
+      severity: (inc.severity || "medium").toLowerCase(),
+      message: inc.description,
+      source: "Physics reconstruction",
+    });
+  });
+
+  if (pr.has_measurement_discrepancy) {
+    (pr.measurement_flags || []).forEach((f: string) => {
+      topReasons.push({ severity: "high", message: f, source: "Assessor measurement cross-check" });
+    });
+  }
+
+  if (report.assessor_track_record?.flagged_rate_pct >= 30) {
+    topReasons.push({
+      severity: "high",
+      message: `Assessor ${report.assessor_track_record.assessor_id} has a ${report.assessor_track_record.flagged_rate_pct}% measurement-discrepancy flag rate across ${report.assessor_track_record.total_assessed_claims} prior claims.`,
+      source: "Assessor track record",
+    });
+  }
+
+  if (cp.inconsistencies_found && crossPartyIssues.length === 0 && cp.duplicate_photos_detected > 0) {
+    topReasons.push({
+      severity: "high",
+      message: `${cp.duplicate_photos_detected} duplicate photo(s) detected across parties.`,
+      source: "Cross-party verification",
+    });
+  }
+
+  const rankedReasons = topReasons
+    .sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0))
+    .slice(0, 5);
+
   return (
     <AdminLayout>
       <div className="p-8 max-w-7xl mx-auto w-full space-y-8 pb-24">
@@ -181,6 +275,156 @@ export default function AdminClaimReport() {
             </div>
           </div>
         )}
+
+        {/* Why This Claim Was Flagged -- consolidated top reasons, ranked by
+            severity, pulled from across the report so a reviewer gets the
+            headline picture without clicking through every tab. */}
+        {rankedReasons.length > 0 ? (
+          <Card className="overflow-hidden border-none shadow-sm w-full">
+            <CardHeader className="bg-destructive/5 border-b border-destructive/10">
+              <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-destructive">
+                <span className="material-symbols-outlined">flag</span>
+                Why This Claim Was Flagged — Top {rankedReasons.length} Reason{rankedReasons.length > 1 ? "s" : ""}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pt-6">
+              <div className="space-y-3">
+                {rankedReasons.map((r, idx) => (
+                  <div key={idx} className={`p-4 rounded-xl border flex gap-3 ${getSeverityColor(r.severity)}`}>
+                    <span className="text-sm font-black shrink-0 mt-0.5 opacity-60">#{idx + 1}</span>
+                    <div>
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-black/10">{r.severity}</span>
+                        <span className="text-[9px] font-bold uppercase tracking-wide opacity-70">{r.source}</span>
+                      </div>
+                      <p className="text-xs font-semibold leading-relaxed">{r.message}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="p-5 rounded-2xl border bg-emerald-500/5 border-emerald-500/20 text-emerald-700 flex items-center gap-3">
+            <span className="material-symbols-outlined text-2xl">verified</span>
+            <p className="text-sm font-bold">No specific fraud indicators found for this claim.</p>
+          </div>
+        )}
+
+        {/* Final Triage Decision -- the human reviewer's actual, persisted
+            call. Distinct from `final_assessment.decision` above, which is
+            only ever a freshly recomputed AI suggestion and was never
+            written to the database before this. */}
+        <Card className="overflow-hidden border-none shadow-sm w-full">
+          <CardHeader className="bg-foreground/[0.03] border-b border-border">
+            <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-foreground">
+              <span className="material-symbols-outlined">gavel</span>
+              Final Triage Decision
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-6 space-y-4">
+            {report.claim_decision ? (
+              <div className={`p-4 rounded-xl border-2 flex items-start gap-3 ${
+                report.claim_decision.decision === "PAY" ? "bg-emerald-500/5 border-emerald-500/30" :
+                report.claim_decision.decision === "DENY" ? "bg-destructive/5 border-destructive/30" :
+                "bg-amber-500/5 border-amber-500/30"
+              }`}>
+                <span className={`material-symbols-outlined text-2xl ${
+                  report.claim_decision.decision === "PAY" ? "text-emerald-600" :
+                  report.claim_decision.decision === "DENY" ? "text-destructive" : "text-amber-600"
+                }`}>
+                  {report.claim_decision.decision === "PAY" ? "paid" : report.claim_decision.decision === "DENY" ? "block" : "priority_high"}
+                </span>
+                <div className="flex-1">
+                  <p className="text-sm font-black uppercase tracking-wide">
+                    {report.claim_decision.decision}
+                    {report.claim_decision.decision === "PAY" && report.claim_decision.payout_amount
+                      ? ` — KES ${Number(report.claim_decision.payout_amount).toLocaleString()}`
+                      : ""}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    by {report.claim_decision.decided_by} on {report.claim_decision.decided_at?.split(" ")[0]}
+                  </p>
+                  {report.claim_decision.reason && (
+                    <p className="text-xs text-foreground/80 mt-2 italic">"{report.claim_decision.reason}"</p>
+                  )}
+                </div>
+                <Button size="sm" variant="outline" className="text-xs" onClick={() => setDecisionAction("PAY")}>
+                  Re-decide
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">No decision has been recorded for this claim yet.</p>
+            )}
+
+            {decisionAction ? (
+              <div className="p-4 rounded-xl border border-border bg-muted/20 space-y-3">
+                <p className="text-xs font-black uppercase tracking-wide text-foreground">
+                  Recording: <span className={
+                    decisionAction === "PAY" ? "text-emerald-600" : decisionAction === "DENY" ? "text-destructive" : "text-amber-600"
+                  }>{decisionAction}</span>
+                </p>
+                {decisionAction === "PAY" && (
+                  <div>
+                    <label className="text-[10px] font-black uppercase text-muted-foreground block mb-1">Payout Amount (KES, optional)</label>
+                    <input
+                      type="number"
+                      className="w-full text-sm border border-border rounded-lg px-3 py-2 bg-card"
+                      value={payoutAmount}
+                      onChange={(e) => setPayoutAmount(e.target.value)}
+                      placeholder="e.g. 250000"
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="text-[10px] font-black uppercase text-muted-foreground block mb-1">
+                    Reason {decisionAction !== "PAY" ? "(required)" : "(optional)"}
+                  </label>
+                  <textarea
+                    className="w-full text-sm border border-border rounded-lg px-3 py-2 bg-card min-h-[70px]"
+                    value={decisionReason}
+                    onChange={(e) => setDecisionReason(e.target.value)}
+                    placeholder={decisionAction === "DENY" ? "Why is this claim being denied?" : decisionAction === "ESCALATE" ? "Why does this need investigation?" : "Any notes for the record..."}
+                  />
+                </div>
+                {decisionError && <p className="text-xs text-destructive font-semibold">{decisionError}</p>}
+                <div className="flex gap-2">
+                  <Button size="sm" disabled={submittingDecision} onClick={submitDecision} className="font-bold">
+                    {submittingDecision ? "Recording..." : `Confirm ${decisionAction}`}
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={submittingDecision} onClick={() => { setDecisionAction(null); setDecisionError(""); }}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-3">
+                <Button
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center gap-2"
+                  onClick={() => setDecisionAction("PAY")}
+                >
+                  <span className="material-symbols-outlined text-[18px]">paid</span>
+                  Pay Claim
+                </Button>
+                <Button
+                  variant="destructive"
+                  className="font-bold flex items-center gap-2"
+                  onClick={() => setDecisionAction("DENY")}
+                >
+                  <span className="material-symbols-outlined text-[18px]">block</span>
+                  Deny Claim
+                </Button>
+                <Button
+                  className="bg-amber-500 hover:bg-amber-600 text-white font-bold flex items-center gap-2"
+                  onClick={() => setDecisionAction("ESCALATE")}
+                >
+                  <span className="material-symbols-outlined text-[18px]">priority_high</span>
+                  Escalate to SIU
+                </Button>
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
         {/* Diagnostic Tabs */}
         <div className="flex gap-2 border-b overflow-x-auto pb-px">
@@ -693,6 +937,65 @@ export default function AdminClaimReport() {
                     </div>
                   </div>
 
+                  {/* Assessor measurement discrepancy: a colluding assessor can type in
+                      whatever crush depth/angle produces the outcome they want -- this
+                      surfaces when that number was cross-checked against the narrative
+                      and the CV-detected photo severity and found inconsistent. */}
+                  {pr.has_measurement_discrepancy && pr.measurement_flags?.length > 0 && (
+                    <div className="p-5 bg-destructive/5 border-2 border-destructive/30 rounded-2xl space-y-3 w-full">
+                      <p className="text-xs font-black text-destructive uppercase tracking-widest flex items-center gap-2">
+                        <span className="material-symbols-outlined">gpp_maybe</span>
+                        Assessor Measurement Discrepancy Detected
+                      </p>
+                      <p className="text-[11px] text-muted-foreground font-medium leading-relaxed">
+                        The assessor's on-site measurement was cross-checked against the narrative and the
+                        trained CV model's read of the photos. It did not match.
+                      </p>
+                      {pr.measurement_flags.map((f: string, idx: number) => (
+                        <div key={idx} className="p-3 bg-card border border-destructive/20 rounded-xl text-xs font-semibold text-foreground/90 leading-relaxed">
+                          {f}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Assessor's historical measurement-discrepancy rate across all
+                      their claims -- a repeated pattern is a stronger fraud signal
+                      than any single flagged claim. */}
+                  {report.assessor_track_record && report.assessor_track_record.total_assessed_claims > 0 && (
+                    <div className={`p-5 rounded-2xl border-2 space-y-3 w-full ${
+                      report.assessor_track_record.flagged_rate_pct >= 30
+                        ? "bg-destructive/5 border-destructive/30"
+                        : "bg-muted/20 border-border"
+                    }`}>
+                      <p className={`text-xs font-black uppercase tracking-widest flex items-center gap-2 ${
+                        report.assessor_track_record.flagged_rate_pct >= 30 ? "text-destructive" : "text-foreground"
+                      }`}>
+                        <span className="material-symbols-outlined">badge</span>
+                        Assessor Track Record — {report.assessor_track_record.assessor_id}
+                      </p>
+                      <div className="grid grid-cols-3 gap-3 w-full">
+                        <div className="p-3 bg-card border rounded-xl text-center">
+                          <p className="text-lg font-black">{report.assessor_track_record.total_assessed_claims}</p>
+                          <p className="text-[9px] font-black uppercase text-muted-foreground mt-1">Claims Assessed</p>
+                        </div>
+                        <div className="p-3 bg-card border rounded-xl text-center">
+                          <p className="text-lg font-black">{report.assessor_track_record.flagged_measurement_discrepancies}</p>
+                          <p className="text-[9px] font-black uppercase text-muted-foreground mt-1">Flagged Claims</p>
+                        </div>
+                        <div className="p-3 bg-card border rounded-xl text-center">
+                          <p className="text-lg font-black">{report.assessor_track_record.flagged_rate_pct}%</p>
+                          <p className="text-[9px] font-black uppercase text-muted-foreground mt-1">Flag Rate</p>
+                        </div>
+                      </div>
+                      {report.assessor_track_record.flagged_rate_pct >= 30 && (
+                        <p className="text-[11px] font-bold text-destructive">
+                          Flag rate is elevated — recommend supervisor review of this assessor's recent claims.
+                        </p>
+                      )}
+                    </div>
+                  )}
+
                   {/* Physics contradictions Stacked Vertically */}
                   {pr.inconsistencies?.length > 0 && (
                     <div className="space-y-3 pt-3 border-t w-full">
@@ -911,6 +1214,120 @@ export default function AdminClaimReport() {
                   No Document alignment analysis available.
                 </div>
               )}
+
+              {/* Supporting documents (police abstract / ID / garage quote) uploaded
+                  by member or assessor, with their OCR-extracted data. */}
+              <Card className="overflow-hidden border-none shadow-sm w-full">
+                <CardHeader className="bg-primary/5 border-b border-primary/10">
+                  <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
+                    <span className="material-symbols-outlined">document_scanner</span>
+                    Supporting Documents (OCR Extraction)
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="pt-6">
+                  {report.documents?.length > 0 ? (
+                    <div className="space-y-4 w-full">
+                      {report.documents.map((doc: any, idx: number) => {
+                        const fields = doc.parsed_fields
+                          ? (typeof doc.parsed_fields === "string" ? JSON.parse(doc.parsed_fields) : doc.parsed_fields)
+                          : {};
+                        const populatedFields = Object.entries(fields).filter(
+                          ([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0)
+                        );
+                        const correctedFields = doc.corrected_fields
+                          ? (typeof doc.corrected_fields === "string" ? JSON.parse(doc.corrected_fields) : doc.corrected_fields)
+                          : null;
+                        const populatedCorrections = correctedFields
+                          ? Object.entries(correctedFields).filter(
+                              ([, v]) => v !== null && v !== "" && !(Array.isArray(v) && v.length === 0)
+                            )
+                          : [];
+                        const confidence = doc.extraction_confidence ?? 0;
+                        return (
+                          <div key={idx} className="p-4 border rounded-xl bg-muted/10 w-full space-y-3">
+                            <div className="flex justify-between items-center flex-wrap gap-2">
+                              <div className="flex items-center gap-2">
+                                <Badge variant="outline" className="uppercase text-[9px] font-black">{doc.party}</Badge>
+                                <p className="text-xs font-black uppercase tracking-wide">
+                                  {doc.document_type?.replace(/_/g, " ")}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {correctedFields && (
+                                  <Badge variant="outline" className="text-[9px] font-bold uppercase border-amber-500/50 text-amber-700">
+                                    Self-corrected
+                                  </Badge>
+                                )}
+                                <Badge className={confidence >= 60 ? "bg-emerald-600" : confidence > 0 ? "bg-amber-500" : "bg-muted-foreground/40"}>
+                                  {confidence}% confidence
+                                </Badge>
+                                <a
+                                  href={`${BASE_URL}/api/analysis/documents/${doc.id}/file`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="View original document"
+                                  className="text-muted-foreground hover:text-primary transition-colors"
+                                >
+                                  <span className="material-symbols-outlined text-[18px] align-middle">visibility</span>
+                                </a>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-muted-foreground font-mono">{doc.filename}</p>
+
+                            <div>
+                              <p className="text-[9px] font-black uppercase text-muted-foreground mb-1">
+                                {correctedFields ? "Original OCR Read" : "OCR Read"}
+                              </p>
+                              {populatedFields.length > 0 ? (
+                                <div className="grid grid-cols-2 gap-2 pt-2 border-t border-dashed">
+                                  {populatedFields.map(([k, v]) => (
+                                    <div key={k} className="text-xs">
+                                      <span className="text-muted-foreground uppercase text-[9px] font-black block">{k.replace(/_/g, " ")}</span>
+                                      <span className="font-semibold text-foreground/90">
+                                        {Array.isArray(v) ? v.join(", ") : String(v)}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <p className="text-[11px] italic text-muted-foreground pt-2 border-t border-dashed">
+                                  No structured fields extracted — document may be illegible or extraction failed.
+                                </p>
+                              )}
+                            </div>
+
+                            {correctedFields && (
+                              <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3">
+                                <p className="text-[9px] font-black uppercase text-amber-800 mb-1">
+                                  Corrected by {doc.corrected_by} on {doc.corrected_at?.split(" ")[0]}
+                                </p>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {populatedCorrections.map(([k, v]) => {
+                                    const original = fields[k];
+                                    const changed = JSON.stringify(original) !== JSON.stringify(v);
+                                    return (
+                                      <div key={k} className="text-xs">
+                                        <span className="text-muted-foreground uppercase text-[9px] font-black block">{k.replace(/_/g, " ")}</span>
+                                        <span className={`font-semibold ${changed ? "text-amber-800" : "text-foreground/90"}`}>
+                                          {Array.isArray(v) ? v.join(", ") : String(v)}
+                                        </span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-xs italic text-muted-foreground bg-muted/20 rounded-xl border border-dashed w-full">
+                      No supporting documents uploaded for this claim.
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
 
             </div>
           )}

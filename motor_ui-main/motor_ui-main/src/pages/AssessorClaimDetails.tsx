@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import AssessorLayout from "@/layouts/AssessorLayout";
 import { getClaimDetails, getSimulationStatus, getAiRolAuditTrail, recordAiRolAction, AiRolRecord, BASE_URL } from "@/lib/api";
+import DocumentsPanel from "@/components/DocumentsPanel";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -29,13 +30,9 @@ export default function AssessorClaimDetails() {
   const [overrideReason, setOverrideReason] = useState("");
   const [actionError, setActionError] = useState("");
 
-  useEffect(() => {
+  const refetchClaimDetails = () => {
     const assessorId = localStorage.getItem("assessorId");
-    if (!assessorId || !claimId) {
-      navigate("/assessor/login");
-      return;
-    }
-    
+    if (!assessorId || !claimId) return;
     getClaimDetails(claimId, assessorId)
       .then((d) => {
         if (d.success) {
@@ -53,6 +50,16 @@ export default function AssessorClaimDetails() {
         setLoading(false);
       })
       .catch(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    const assessorId = localStorage.getItem("assessorId");
+    if (!assessorId || !claimId) {
+      navigate("/assessor/login");
+      return;
+    }
+    refetchClaimDetails();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claimId, navigate]);
 
   // Fetch simulation video status on tab shift
@@ -1029,13 +1036,23 @@ export default function AssessorClaimDetails() {
                   <div className="space-y-6">
                     {photos?.map((photo: any, i: number) => {
                       const result = photoResults.find((r: any) => r.filename === photo.filename);
-                      const detectedParty = result?.party || result?.anomalies?.find((a: any) => a.party)?.party || 'Unknown';
-                      
+                      const detectedParty = photo.party || result?.party || result?.anomalies?.find((a: any) => a.party)?.party || 'Unknown';
+
                       return (
                         <div key={i} className="group border border-border rounded-2xl overflow-hidden p-5 hover:border-primary/30 transition-all space-y-4">
                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-border">
-                            <div className="flex items-center gap-2">
-                              <span className="material-symbols-outlined text-muted-foreground">image</span>
+                            <div className="flex items-center gap-3">
+                              {photo.id ? (
+                                <a href={`${BASE_URL}/api/analysis/photos/${photo.id}/file`} target="_blank" rel="noopener noreferrer">
+                                  <img
+                                    src={`${BASE_URL}/api/analysis/photos/${photo.id}/file`}
+                                    alt={photo.filename}
+                                    className="size-14 rounded-lg object-cover border border-border hover:opacity-80 transition-opacity"
+                                  />
+                                </a>
+                              ) : (
+                                <span className="material-symbols-outlined text-muted-foreground">image</span>
+                              )}
                               <div className="flex flex-col">
                                 <span className="text-sm font-bold text-foreground">{photo.filename}</span>
                                 <span className="text-xs text-muted-foreground">{(photo.file_size / 1024 / 1024).toFixed(2)} MB</span>
@@ -1045,6 +1062,17 @@ export default function AssessorClaimDetails() {
                               <Badge variant="outline" className="font-mono text-[9px] uppercase">
                                 Party: {detectedParty}
                               </Badge>
+                              {photo.id && (
+                                <a
+                                  href={`${BASE_URL}/api/analysis/photos/${photo.id}/file`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="View full photo"
+                                  className="text-muted-foreground hover:text-primary transition-colors"
+                                >
+                                  <span className="material-symbols-outlined text-[18px] align-middle">visibility</span>
+                                </a>
+                              )}
                             </div>
                           </div>
 
@@ -1084,6 +1112,26 @@ export default function AssessorClaimDetails() {
                       );
                     })}
                   </div>
+                </CardContent>
+              </Card>
+
+              {/* Supporting documents (police abstract / ID / garage quote) uploaded
+                  by either party, with their OCR-extracted data -- e.g. the member's
+                  police abstract, useful context before or during inspection. */}
+              <Card className="overflow-hidden border-none shadow-sm">
+                <CardHeader className="bg-primary/5 border-b border-primary/10">
+                  <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
+                    <span className="material-symbols-outlined">document_scanner</span>
+                    Supporting Documents
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="pt-6">
+                  <DocumentsPanel
+                    documents={data?.documents || []}
+                    viewerParty="assessor"
+                    correctorId={localStorage.getItem("assessorId") || ""}
+                    onCorrected={refetchClaimDetails}
+                  />
                 </CardContent>
               </Card>
             </div>

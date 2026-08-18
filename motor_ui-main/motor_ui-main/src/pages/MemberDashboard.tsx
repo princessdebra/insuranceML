@@ -257,6 +257,12 @@ export default function MemberDashboard() {
                       {claim.risk_level} Risk
                     </span>
                     <Link
+                      to={`/member/claim/${claim.claim_id}`}
+                      className="text-xs font-bold text-primary hover:underline px-3 py-1.5 hover:bg-primary/5 rounded-lg transition-colors"
+                    >
+                      View Details
+                    </Link>
+                    <Link
                       to="/member/claim-submission"
                       onClick={() => {
                         localStorage.setItem(

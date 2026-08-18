@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import AssessorLayout from "@/layouts/AssessorLayout";
-import { scheduleInspection } from "@/lib/api";
+import { scheduleInspection, getClaimDetails } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -60,7 +60,10 @@ export default function ScheduleInspectionChatbot() {
   const navigate = useNavigate();
   const scrollRef = useRef<HTMLDivElement>(null);
   
-  const assessorId = localStorage.getItem("assessorId") || "ASS001";
+  // No fallback to a hardcoded assessor -- that silently let anyone with an
+  // expired/missing session act as ASS001 instead of being sent back to log
+  // in, the same class of bug as the hardcoded assignment_id above.
+  const assessorId = localStorage.getItem("assessorId");
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [step, setStep] = useState("START");
@@ -68,11 +71,12 @@ export default function ScheduleInspectionChatbot() {
   const [isTyping, setIsTyping] = useState(false);
 
   const [formData, setFormData] = useState({
-    assignment_id: "ASG-90D48EC0", 
+    assignment_id: "",
     inspection_date: "",
     location: "",
     notes: "",
   });
+  const [assignmentLoadError, setAssignmentLoadError] = useState(false);
 
   const getRand = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 
@@ -117,12 +121,40 @@ export default function ScheduleInspectionChatbot() {
     setMessages((prev) => [...prev, { sender: "user", text }]);
   };
 
-  // 1. Initial Greeting
+  // 1. Look up the real assignment for this claim, then greet.
+  // Previously this used a hardcoded placeholder assignment_id that matched
+  // no real record -- the backend's UPDATE silently affected zero rows and
+  // still reported success, so every "confirmed" inspection was a no-op.
   useEffect(() => {
+    if (!assessorId) {
+      navigate("/assessor/login");
+      return;
+    }
     const startWorkflow = async () => {
-      await addBotMessage(getRand(RESPONSES.GREETING(claimId || "N/A")), 
+      if (!claimId) {
+        setAssignmentLoadError(true);
+        await addBotMessage("No claim ID was provided -- I can't schedule an inspection without one.");
+        return;
+      }
+      try {
+        const details = await getClaimDetails(claimId, assessorId);
+        const realAssignmentId = details?.assignment?.assignment_id;
+        if (!details?.success || !realAssignmentId) {
+          throw new Error("assignment not found");
+        }
+        setFormData((prev) => ({ ...prev, assignment_id: realAssignmentId }));
+      } catch (err) {
+        setAssignmentLoadError(true);
+        await addBotMessage(
+          "I couldn't find your assignment record for this claim -- scheduling can't continue. " +
+          "Please return to the dashboard and open this claim again."
+        );
+        return;
+      }
+
+      await addBotMessage(getRand(RESPONSES.GREETING(claimId || "N/A")),
         <div className="mt-3 bg-card p-2 rounded-xl border shadow-lg w-fit">
-          <Calendar 
+          <Calendar
             mode="single"
             onSelect={(date) => date && handleDateSelect(date)}
             disabled={(date) => date < new Date(new Date().setHours(0,0,0,0))}
@@ -133,6 +165,7 @@ export default function ScheduleInspectionChatbot() {
       setStep("ASK_DATE");
     };
     startWorkflow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claimId]);
 
   useEffect(() => {
@@ -212,7 +245,8 @@ export default function ScheduleInspectionChatbot() {
       const result = await scheduleInspection({
         assignment_id: data.assignment_id,
         inspection_date: data.inspection_date,
-        notes: data.notes ? `${data.location} - ${data.notes}` : data.location,
+        location: data.location,
+        notes: data.notes || undefined,
       });
 
       if (result.success) {
@@ -289,12 +323,12 @@ export default function ScheduleInspectionChatbot() {
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              disabled={["ASK_DATE", "CONFIRMATION", "FINISHED", "PROCESSING"].includes(step)}
+              disabled={assignmentLoadError || ["ASK_DATE", "CONFIRMATION", "FINISHED", "PROCESSING"].includes(step)}
             />
-            <Button 
-              className="size-12 rounded-full shadow-lg" 
-              onClick={handleSend} 
-              disabled={["ASK_DATE", "CONFIRMATION", "FINISHED", "PROCESSING"].includes(step) || !inputValue}
+            <Button
+              className="size-12 rounded-full shadow-lg"
+              onClick={handleSend}
+              disabled={assignmentLoadError || ["ASK_DATE", "CONFIRMATION", "FINISHED", "PROCESSING"].includes(step) || !inputValue}
             >
               <span className="material-symbols-outlined">send</span>
             </Button>

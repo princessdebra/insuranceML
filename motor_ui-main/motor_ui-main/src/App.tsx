@@ -10,6 +10,11 @@ import MemberPolicies from "./pages/MemberPolicies";
 import CoverageCheck from "./pages/CoverageCheck";
 import ClaimCreation from "./pages/ClaimCreation";
 import ClaimSubmission from "./pages/ClaimSubmission";
+import MemberClaimDetails from "./pages/MemberClaimDetails";
+import AnalystLogin from "./pages/AnalystLogin";
+import AnalystDashboard from "./pages/AnalystDashboard";
+import AnalystClaimIntake from "./pages/AnalystClaimIntake";
+import AnalystClaimPhotos from "./pages/AnalystClaimPhotos";
 import AssessorLogin from "./pages/AssessorLogin";
 import AssessorDashboard from "./pages/AssessorDashboard";
 import AssessorClaimDetails from "./pages/AssessorClaimDetails";
@@ -40,6 +45,11 @@ const App = () => (
           <Route path="/member/coverage-check" element={<ClaimChatbot />} />
           <Route path="/member/claim-creation" element={<ClaimCreation />} />
           <Route path="/member/claim-submission" element={<ClaimSubmission />} />
+          <Route path="/member/claim/:claimId" element={<MemberClaimDetails />} />
+          <Route path="/analyst/login" element={<AnalystLogin />} />
+          <Route path="/analyst/dashboard" element={<AnalystDashboard />} />
+          <Route path="/analyst/file-claim" element={<AnalystClaimIntake />} />
+          <Route path="/analyst/claim/:claimId/photos" element={<AnalystClaimPhotos />} />
           <Route path="/assessor/login" element={<AssessorLogin />} />
           <Route path="/assessor/dashboard" element={<AssessorDashboard />} />
           <Route path="/assessor/claim/:claimId" element={<AssessorClaimDetails />} />

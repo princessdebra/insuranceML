@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import AssessorLayout from "@/layouts/AssessorLayout";
-import { submitAssessorReport } from "@/lib/api";
+import { submitAssessorReport, assessNarrative } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -32,6 +32,22 @@ const RESPONSES = {
     "Reporting phase: Please summarize the forensics and specific damage observed:",
     "Forensic details required: Enter your assessment of the structural and mechanical damage:",
     "Technical summary needed: Describe the nature of the damage and integrity of the vehicle:"
+  ],
+  ANALYZING_REPORT: [
+    "Reviewing your findings for completeness... 🔍",
+    "Checking whether this has enough technical detail... 🧠",
+  ],
+  ASK_CRUSH_DEPTH: [
+    "What is the measured crush/deformation depth in mm? (Enter your best on-site measurement, or 'unknown')",
+    "Please provide the measured crush depth in millimeters, or type 'unknown' if not measured:",
+  ],
+  ASK_APPROACH_ANGLE: [
+    "Based on the damage pattern, what was the approximate impact angle?",
+    "Which best describes the direction of impact based on your findings?",
+  ],
+  ASK_THIRD_PARTY_CONFIRM: [
+    "Did you independently confirm the third-party vehicle's details on-site (registration, make/model)? Type them, or 'skip' if not applicable.",
+    "Please note any third-party vehicle details you personally verified at the scene, or type 'skip':",
   ],
   ASK_PHOTOS: [
     "Requirement: Technical Evidence. Please upload the inspection photos below.",
@@ -71,10 +87,22 @@ export default function StartInspectionChatbot() {
     assessor_id: assessorId,
     damage_report: "",
     estimated_cost: "",
-    inspection_date: new Date().toISOString().split("T")[0],
+    // toISOString() converts to UTC before formatting -- for a timezone
+    // where local time and UTC fall on different calendar days at the
+    // moment this runs, that silently produces yesterday's or tomorrow's
+    // date instead of today's. format() uses the Date object's local
+    // components directly, so it always matches what the assessor's own
+    // clock says "today" is.
+    inspection_date: format(new Date(), "yyyy-MM-dd"),
+    crush_depth_mm: "",
+    approach_angle_deg: "",
+    third_party_vehicle_confirmed: "",
   });
-  
+
   const [photos, setPhotos] = useState<File[]>([]);
+  const [garageQuote, setGarageQuote] = useState<File | null>(null);
+  const [idDocument, setIdDocument] = useState<File | null>(null);
+  const narrativeClarifyRoundRef = useRef(0);
 
   const getRand = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 
@@ -122,9 +150,15 @@ export default function StartInspectionChatbot() {
     const startWorkflow = async () => {
       await addBotMessage(getRand(RESPONSES.GREETING(claimId || "N/A")), 
         <div className="mt-3 bg-card p-2 rounded-xl border shadow-lg w-fit">
-          <Calendar 
+          <Calendar
             mode="single"
-            selected={new Date(formData.inspection_date)}
+            // No `selected` here on purpose: pre-selecting today made the
+            // calendar's own "click an already-selected day to deselect it"
+            // behavior fire on the very first click, which the `date &&`
+            // guard below then silently swallowed -- exactly the "clicking
+            // 8 does nothing" bug. The assessor is meant to actively pick a
+            // date; react-day-picker already marks today distinctly on its
+            // own without needing it pre-selected.
             onSelect={(date) => date && handleDateSelect(date)}
             disabled={(date) => date > new Date()}
             className="rounded-md"
@@ -148,6 +182,45 @@ export default function StartInspectionChatbot() {
     await addBotMessage(getRand(RESPONSES.ASK_COST));
   };
 
+  // --- STRUCTURED FOLLOW-UP STEPS ---
+  // Crush depth / approach angle / third-party confirmation are asked as
+  // deliberate on-site measurements rather than left to narrative inference
+  // -- these feed the physics engine as direct, authoritative overrides
+  // instead of being guessed from the free-text report the same way the
+  // member's narrative used to be.
+
+  const askCrushDepth = async () => {
+    setStep("ASK_CRUSH_DEPTH");
+    await addBotMessage(getRand(RESPONSES.ASK_CRUSH_DEPTH));
+  };
+
+  const askApproachAngle = async () => {
+    setStep("ASK_APPROACH_ANGLE");
+    await addBotMessage(getRand(RESPONSES.ASK_APPROACH_ANGLE),
+      <div className="flex flex-wrap gap-2 mt-3">
+        {[
+          { label: "Rear-end (0°)", value: "0" },
+          { label: "Angled (45°)", value: "45" },
+          { label: "T-bone (90°)", value: "90" },
+          { label: "Angled head-on (135°)", value: "135" },
+          { label: "Head-on (180°)", value: "180" },
+          { label: "Unknown", value: "" },
+        ].map((opt) => (
+          <Button key={opt.label} variant="secondary" className="rounded-full font-bold" onClick={() => handleApproachAngleSelect(opt.label, opt.value)}>
+            {opt.label}
+          </Button>
+        ))}
+      </div>
+    );
+  };
+
+  const handleApproachAngleSelect = async (label: string, value: string) => {
+    addUserMessage(label);
+    setFormData(prev => ({ ...prev, approach_angle_deg: value }));
+    setStep("ASK_THIRD_PARTY_CONFIRM");
+    await addBotMessage(getRand(RESPONSES.ASK_THIRD_PARTY_CONFIRM));
+  };
+
   const handleSend = async () => {
     if (!inputValue) return;
     const val = inputValue;
@@ -159,7 +232,41 @@ export default function StartInspectionChatbot() {
       setStep("ASK_REPORT");
       await addBotMessage(getRand(RESPONSES.ASK_REPORT));
     } else if (step === "ASK_REPORT") {
-      setFormData(prev => ({ ...prev, damage_report: val }));
+      // Agentic step: same sufficiency check used on the member's narrative
+      // -- a one-line assessor report used to sail straight through even
+      // though it's treated as the MORE authoritative source for physics
+      // and narrative intelligence whenever it's present.
+      const combinedReport = formData.damage_report
+        ? `${formData.damage_report}\n\n${val}`
+        : val;
+      setFormData(prev => ({ ...prev, damage_report: combinedReport }));
+
+      await addBotMessage(getRand(RESPONSES.ANALYZING_REPORT));
+      let sufficient = true;
+      let clarifyingQuestion: string | null = null;
+      try {
+        const assessment = await assessNarrative({
+          narrative: combinedReport,
+          claim_type: "motor",
+          round: narrativeClarifyRoundRef.current,
+        });
+        sufficient = assessment.sufficient;
+        clarifyingQuestion = assessment.clarifying_question;
+      } catch (err) {
+        console.error("Report assessment failed, proceeding anyway", err);
+      }
+
+      if (!sufficient && clarifyingQuestion) {
+        narrativeClarifyRoundRef.current += 1;
+        await addBotMessage(clarifyingQuestion);
+      } else {
+        askCrushDepth();
+      }
+    } else if (step === "ASK_CRUSH_DEPTH") {
+      setFormData(prev => ({ ...prev, crush_depth_mm: val.toLowerCase() === "unknown" ? "" : val }));
+      askApproachAngle();
+    } else if (step === "ASK_THIRD_PARTY_CONFIRM") {
+      setFormData(prev => ({ ...prev, third_party_vehicle_confirmed: val.toLowerCase() === "skip" ? "" : val }));
       setStep("ASK_PHOTOS");
       await addBotMessage(getRand(RESPONSES.ASK_PHOTOS));
     }
@@ -192,9 +299,17 @@ export default function StartInspectionChatbot() {
     
     try {
       const result = await submitAssessorReport({
-        ...formData,
+        claim_id: formData.claim_id,
+        assessor_id: formData.assessor_id,
+        damage_report: formData.damage_report,
         estimated_cost: Number(formData.estimated_cost),
-        photos: photos
+        inspection_date: formData.inspection_date,
+        crush_depth_mm: formData.crush_depth_mm ? Number(formData.crush_depth_mm) : undefined,
+        approach_angle_deg: formData.approach_angle_deg ? Number(formData.approach_angle_deg) : undefined,
+        third_party_vehicle_confirmed: formData.third_party_vehicle_confirmed || undefined,
+        photos: photos,
+        garage_quote: garageQuote || undefined,
+        id_document: idDocument || undefined,
       });
 
       if (result.success) {
@@ -279,6 +394,21 @@ export default function StartInspectionChatbot() {
                     onChange={(e) => setPhotos(Array.from(e.target.files || []))} 
                   />
                   {photos.length > 0 && <div className="mb-4"><PhotoGrid files={photos} /></div>}
+
+                  <div className="border-t pt-4 mt-2 mb-4 space-y-3">
+                    <p className="text-[10px] font-black uppercase text-primary tracking-widest">Supporting Documents (optional)</p>
+                    <div>
+                      <label className="text-[10px] text-muted-foreground mb-1 block">Garage Quote photo</label>
+                      <Input type="file" accept="image/*" className="text-xs cursor-pointer" onChange={(e) => setGarageQuote(e.target.files?.[0] || null)} />
+                      {garageQuote && <p className="text-[10px] text-emerald-600 mt-1">✓ {garageQuote.name}</p>}
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-muted-foreground mb-1 block">ID / Licence photo (on-site verification)</label>
+                      <Input type="file" accept="image/*" className="text-xs cursor-pointer" onChange={(e) => setIdDocument(e.target.files?.[0] || null)} />
+                      {idDocument && <p className="text-[10px] text-emerald-600 mt-1">✓ {idDocument.name}</p>}
+                    </div>
+                  </div>
+
                   <Button className="w-full bg-primary font-bold py-6" disabled={photos.length === 0 || isTyping} onClick={triggerSubmission}>
                     Finalize & Submit
                   </Button>
@@ -295,14 +425,14 @@ export default function StartInspectionChatbot() {
           <div className="max-w-2xl mx-auto flex gap-3">
             <Input
               className="flex-1 h-12"
-              placeholder={["ASK_DATE", "ASK_PHOTOS", "FINISHED"].includes(step) ? "Follow interface prompts..." : "Type details here..."}
+              placeholder={["ASK_DATE", "ASK_APPROACH_ANGLE", "ASK_PHOTOS", "FINISHED"].includes(step) ? "Follow interface prompts..." : "Type details here..."}
               type={step === "ASK_COST" ? "number" : "text"}
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              disabled={["ASK_DATE", "ASK_PHOTOS", "FINISHED", "PROCESSING"].includes(step)}
+              disabled={["ASK_DATE", "ASK_APPROACH_ANGLE", "ASK_PHOTOS", "FINISHED", "PROCESSING"].includes(step)}
             />
-            <Button className="size-12 rounded-full shadow-lg" onClick={handleSend} disabled={!inputValue || ["ASK_DATE", "ASK_PHOTOS", "FINISHED"].includes(step)}>
+            <Button className="size-12 rounded-full shadow-lg" onClick={handleSend} disabled={!inputValue || ["ASK_DATE", "ASK_APPROACH_ANGLE", "ASK_PHOTOS", "FINISHED"].includes(step)}>
               <span className="material-symbols-outlined">send</span>
             </Button>
           </div>

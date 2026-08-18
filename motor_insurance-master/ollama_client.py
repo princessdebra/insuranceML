@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import os
+import random
 import time
 
 import requests
@@ -84,7 +85,7 @@ def generate(
     json_mode: bool = False,
     timeout: int = 90,
     images: list = None,
-    gpu_retries: int = 2,
+    gpu_retries: int = 4,
     system: str = None,
 ) -> str:
     """
@@ -106,6 +107,14 @@ def generate(
     output — it's actively wrong, not just slow). Instead we retry on GPU
     with backoff, since most failures here are transient contention from
     other jobs on the shared GPU.
+
+    The service is not actually going down (checked directly: systemd unit,
+    6+ days continuous uptime, healthy on every check) -- the failures seen
+    in practice are transient connection resets mid-request from other
+    tenants' load, often on BOTH attempts within a couple of seconds of each
+    other. A flat 3s gap wasn't giving those enough room to clear, so this
+    backs off exponentially (with jitter, to avoid every concurrent request
+    retrying in lockstep) and tries more times before giving up.
     """
 
     resolved_model = model or OLLAMA_MODEL
@@ -119,7 +128,8 @@ def generate(
             last_error = e
             logger.warning(f"Ollama generate attempt {attempt + 1}/{gpu_retries} failed: {e}")
             if attempt < gpu_retries - 1:
-                time.sleep(3)
+                backoff = min(2 ** attempt, 10) + random.uniform(0, 1.5)
+                time.sleep(backoff)
 
     raise OllamaError(f"Ollama request failed after {gpu_retries} attempts: {last_error}")
 

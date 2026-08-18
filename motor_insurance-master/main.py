@@ -270,6 +270,44 @@ async def list_all_assessors(
         )
 
 
+# ANALYST ENDPOINTS
+
+@app.get("/api/analysts")
+async def list_all_analysts(active_only: bool = Query(True)):
+    """List all claims analysts (staff who file claims on members' behalf)."""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM analysts WHERE 1=1"
+            params = []
+            if active_only:
+                query += " AND active_status = 1"
+            query += " ORDER BY name"
+            cursor.execute(query, params)
+            analysts = [dict(row) for row in cursor.fetchall()]
+        return {"success": True, "total_analysts": len(analysts), "analysts": analysts}
+    except Exception as e:
+        logger.error(f"❌ Error listing analysts: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analyst-claims")
+async def get_claims_filed_by_analyst(analyst_id: str):
+    """
+    **Analyst Dashboard: claims this analyst has filed on behalf of members**
+
+    Mirrors the assessor's /my-claims (claims assigned TO them), but for the
+    opposite relationship -- claims this analyst filed, as the point of
+    contact instead of the field inspector.
+    """
+    try:
+        claims = db_manager.get_analyst_claims(analyst_id)
+        return {"success": True, "analyst_id": analyst_id, "total_claims": len(claims), "claims": claims}
+    except Exception as e:
+        logger.error(f"❌ Error fetching claims for analyst {analyst_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/assign")
 async def manually_assign_assessor(
     claim_id: str = Form(..., description="Claim ID to assign"),
@@ -496,24 +534,93 @@ async def get_claim_details_for_assessor(claim_id: str, assessor_id: str):
             # Get member info
             member_info = db_manager.get_member_info(claim_data.get('member_id', ''))
             
-            # Get photos
+            # Get photos -- claim_photo_files (raw uploads) is the source of
+            # truth for "what was uploaded", populated synchronously at
+            # submission time. claim_photos (AI analysis results) only gets
+            # a row once the background pipeline reaches that photo, which
+            # can take minutes -- querying it here meant a freshly-uploaded
+            # photo simply didn't appear until analysis finished.
             cursor.execute('''
-                SELECT filename, file_size, created_at
-                FROM claim_photos
+                SELECT id, filename, party, file_size, content_type, uploaded_at
+                FROM claim_photo_files
                 WHERE claim_id = ?
+                ORDER BY uploaded_at ASC
             ''', (claim_id,))
-            
+
             photos = [dict(row) for row in cursor.fetchall()]
-        
+
+        # Supporting documents (police abstract, ID, garage quote) uploaded
+        # by either party, with their OCR-extracted data -- the assessor has
+        # a legitimate need to see e.g. the member's police abstract before
+        # or during inspection. This endpoint carries no fraud/risk data, so
+        # unlike the admin full-report it's safe to expose here.
+        documents = db_manager.get_documents_by_claim(claim_id)
+
         return {
             "success": True,
             "claim_id": claim_id,
             "assignment": dict(assignment),
             "claim_details": claim_data,
             "member_info": member_info,
-            "photos": photos
+            "photos": photos,
+            "documents": documents,
         }
         
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/member-claim-details/{claim_id}")
+async def get_claim_details_for_member(claim_id: str, member_id: str):
+    """
+    **Get claim details for the member who filed it**
+
+    Same shape as the assessor's claim-details endpoint, scoped to the
+    member's own claim instead of an assessor's assignment. Carries no
+    fraud/risk data (that stays admin-only) -- shows the member their own
+    submission and their own uploaded documents, so they can correct
+    anything OCR got wrong.
+
+    Documents are filtered to party='member' only -- the assessor's own
+    uploads (garage quote, on-site ID capture, etc.) are deliberately not
+    exposed here. The assessor's evidence is meant to be independent of what
+    the member says; showing it back to the member would let a colluding
+    member tailor their own story to match what the assessor found, which
+    defeats the point of keeping the two parties' evidence separate.
+    """
+    try:
+        claim_data = db_manager.get_claim(claim_id)
+        if not claim_data:
+            raise HTTPException(status_code=404, detail="Claim not found")
+
+        if claim_data.get('member_id') != member_id:
+            raise HTTPException(status_code=403, detail="This claim does not belong to you")
+
+        member_info = db_manager.get_member_info(member_id)
+
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, filename, party, file_size, content_type, uploaded_at
+                FROM claim_photo_files
+                WHERE claim_id = ? AND party = 'member'
+                ORDER BY uploaded_at ASC
+            ''', (claim_id,))
+            photos = [dict(row) for row in cursor.fetchall()]
+
+        documents = db_manager.get_documents_by_claim(claim_id, party='member')
+
+        return {
+            "success": True,
+            "claim_id": claim_id,
+            "claim_details": claim_data,
+            "member_info": member_info,
+            "photos": photos,
+            "documents": documents,
+        }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -524,11 +631,12 @@ async def get_claim_details_for_assessor(claim_id: str, assessor_id: str):
 async def schedule_inspection(
     assignment_id: str = Form(...),
     inspection_date: str = Form(...),
+    location: Optional[str] = Form(None),
     notes: Optional[str] = Form(None)
 ):
     """
     **Assessor schedules inspection**
-    
+
     Updates assignment status to 'in_progress'
     """
     try:
@@ -538,15 +646,16 @@ async def schedule_inspection(
                 assignment_id=assignment_id,
                 status='in_progress',
                 inspection_date=inspection_date,
-                notes=notes
+                notes=notes,
+                inspection_location=location
             )
-        
+
         return {
             "success": True,
             "message": "Inspection scheduled successfully",
             "inspection_date": inspection_date
         }
-        
+
     except Exception as e:
         logger.error(f"❌ Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -629,7 +738,8 @@ async def create_claim_after_coverage(
     incident_date: str = Form(...),
     incident_location: str = Form(...),
     brief_description: str = Form(...),
-    claim_type: str = Form(...)  # motor/marine/domestic
+    claim_type: str = Form(...),  # motor/marine/domestic
+    filed_by_analyst_id: Optional[str] = Form(None, description="Set when a claims analyst is filing this on the member's behalf"),
 ):
     """
     **STEP 2: Create claim AFTER coverage is confirmed**
@@ -691,14 +801,14 @@ async def create_claim_after_coverage(
             claim_id = db_manager.generate_claim_id(conn)
             
             # Create basic claim record
-            # Create basic claim record
             cursor.execute('''
                 INSERT INTO claims (
-                    claim_id, member_id, policy_id, narrative, 
-                    estimated_cost, location, accident_time, 
-                    fraud_risk_score, risk_level, processing_time_ms, analysis_result, created_at
+                    claim_id, member_id, policy_id, narrative,
+                    estimated_cost, location, accident_time,
+                    fraud_risk_score, risk_level, processing_time_ms, analysis_result, created_at,
+                    filed_by_analyst_id, filed_via
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
             ''', (
                 claim_id,
                 member_id,
@@ -710,7 +820,9 @@ async def create_claim_after_coverage(
                 0,          # Will be calculated after submissions
                 'pending',
                 0,          # processing_time_ms - updated after AI analysis
-                '{}'        # analysis_result - populated after full analysis
+                '{}',       # analysis_result - populated after full analysis
+                filed_by_analyst_id,
+                'analyst_phone' if filed_by_analyst_id else 'member_self',
             ))
             
             # Link coverage check to claim
@@ -822,6 +934,24 @@ async def get_member_stats(member_id: str):
     except Exception as e:
         return {"success": False, "error": str(e)}
    
+@app.get("/api/members/search")
+async def search_members(q: str = Query(..., min_length=2, description="Name, phone, email, or member ID")):
+    """
+    **Look up a member for a staff-filed (phoned-in) claim**
+
+    A member self-filing is already identified by their own login session
+    -- an analyst taking a call has none of that, only whatever the caller
+    tells them (their name, phone number, or member ID if they have it
+    handy). This is a simple LIKE search across those fields.
+    """
+    try:
+        results = db_manager.search_members(q)
+        return {"success": True, "results": results}
+    except Exception as e:
+        logger.error(f"❌ Member search error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/member/{member_id}")
 async def get_member_info(member_id: str):
     """Get member information with policies, claims and stats"""

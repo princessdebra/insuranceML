@@ -8,9 +8,17 @@ export default function CoverageCheck() {
   const memberId = localStorage.getItem("memberId") || "";
   const memberName = localStorage.getItem("memberName") || "";
 
+  // toISOString() converts to UTC before formatting -- can silently produce
+  // yesterday's or tomorrow's date instead of today's, depending on
+  // timezone and time of day. Build the local date string directly instead.
+  const todayLocal = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+
   const [formData, setFormData] = useState({
     claim_type: "motor",
-    incident_date: new Date().toISOString().split("T")[0],
+    incident_date: todayLocal(),
     driver_name: memberName,
     incident_location: "",
     brief_description: "",

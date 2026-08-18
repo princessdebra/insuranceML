@@ -1,6 +1,6 @@
 
-from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, status, Query, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, status, Query, BackgroundTasks, Response
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import asyncio
@@ -27,7 +27,9 @@ from ollama_client import generate_json
 from utils import ValidationUtils, generate_unique_id
 from database import db_manager
 import ai_rol
+import business_rules
 import devserver_watchdog
+import email_service
 import os
  
 logger = logging.getLogger(__name__)
@@ -99,21 +101,101 @@ def build_structured_intake_block(
     return "STRUCTURED INTAKE FACTS (claimant-confirmed at submission, not free text):\n" + "\n".join(f"- {l}" for l in lines)
 
 
+def build_assessor_measurement_block(
+    crush_depth_mm: Optional[float] = None,
+    approach_angle_deg: Optional[float] = None,
+    third_party_vehicle_confirmed: Optional[str] = None,
+) -> str:
+    """
+    Same idea as build_structured_intake_block, but for the assessor's
+    on-site findings. Crush depth and approach angle are also passed through
+    separately as direct physics overrides (see
+    ClaimOrchestrator._run_physics_reconstruction) -- this text block exists
+    so the numbers are ALSO visible to narrative extraction and any human
+    reading the report, not just the physics engine.
+    """
+    lines = []
+
+    if crush_depth_mm is not None:
+        lines.append(f"Measured crush/deformation depth: {crush_depth_mm}mm (assessor on-site measurement)")
+    if approach_angle_deg is not None:
+        lines.append(f"Assessed impact/approach angle: {approach_angle_deg}° (0=rear-end, 90=T-bone, 180=head-on)")
+    if third_party_vehicle_confirmed:
+        lines.append(f"Third-party vehicle confirmed on-site: {third_party_vehicle_confirmed}")
+
+    if not lines:
+        return ""
+
+    return "ASSESSOR ON-SITE MEASUREMENTS (professional observation, not narrative inference):\n" + "\n".join(f"- {l}" for l in lines)
+
+
 async def _process_member_claim_background(
     claim_id: str,
     clean_narrative: str,
     photo_data: list,
     estimated_cost: float,
     location: str,
+    id_document_data: Optional[tuple] = None,
 ):
     try:
+        from document_ocr import extract_document_data, build_document_evidence_block
+
+        # Documents already uploaded+OCR'd earlier in the intake flow -- e.g.
+        # the police abstract, which the wizard now uploads and reads
+        # immediately when the claimant confirms police were involved,
+        # instead of waiting until this final submission step.
+        documents_ocr = [
+            {
+                "document_type": d.get("document_type"),
+                "raw_text": d.get("raw_text"),
+                "parsed_fields": d.get("parsed_fields"),
+                "extraction_confidence": d.get("extraction_confidence"),
+            }
+            for d in db_manager.get_documents_by_claim(claim_id, party="member")
+        ]
+
+        for doc_data, doc_type in (
+            (id_document_data, "id_document"),
+        ):
+            if not doc_data:
+                continue
+            content, filename = doc_data
+            ocr_result = await extract_document_data(content, filename, doc_type)
+            try:
+                db_manager.store_document(
+                    claim_id=claim_id, party="member", document_type=doc_type,
+                    filename=filename, file_data=content, ocr_result=ocr_result,
+                )
+            except Exception as e:
+                logger.error(f"Failed to store document {filename} for {claim_id}: {str(e)}")
+            documents_ocr.append(ocr_result)
+
+        evidence_block = build_document_evidence_block(documents_ocr)
+        enriched_narrative = f"{evidence_block}\n\n{clean_narrative}" if evidence_block else clean_narrative
+
+        claim_row = db_manager.get_claim(claim_id) or {}
+        incident_details = {"police_reported": bool(next(
+            (d.get("parsed_fields", {}).get("ob_number") for d in documents_ocr if d.get("document_type") == "police_abstract"),
+            None,
+        ))}
+        ob_number = next(
+            (d.get("parsed_fields", {}).get("ob_number") for d in documents_ocr if d.get("document_type") == "police_abstract"),
+            None,
+        )
+        if ob_number:
+            incident_details["ob_number"] = ob_number
+
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
-            member_narrative=clean_narrative,
+            member_narrative=enriched_narrative,
             member_photos=photo_data,
             estimated_cost=estimated_cost,
-            location=location
+            location=location,
+            member_id=claim_row.get("member_id"),
+            policy_id=claim_row.get("policy_id"),
+            claim_type="motor",
+            incident_details=incident_details,
         )
 
         with db_manager.get_connection() as conn:
@@ -141,17 +223,48 @@ async def _process_assessor_analysis_background(
     assessor_photo_data: list,
     estimated_cost: float,
     location: str,
+    assessor_crush_depth_mm: Optional[float] = None,
+    assessor_approach_angle_deg: Optional[float] = None,
+    assessor_id: Optional[str] = None,
+    garage_quote_data: Optional[tuple] = None,
+    id_document_data: Optional[tuple] = None,
 ):
     try:
+        from document_ocr import extract_document_data, build_document_evidence_block
+
+        documents_ocr = []
+        for doc_data, doc_type in (
+            (garage_quote_data, "garage_quote"),
+            (id_document_data, "id_document"),
+        ):
+            if not doc_data:
+                continue
+            content, filename = doc_data
+            ocr_result = await extract_document_data(content, filename, doc_type)
+            try:
+                db_manager.store_document(
+                    claim_id=claim_id, party="assessor", document_type=doc_type,
+                    filename=filename, file_data=content, ocr_result=ocr_result,
+                )
+            except Exception as e:
+                logger.error(f"Failed to store document {filename} for {claim_id}: {str(e)}")
+            documents_ocr.append(ocr_result)
+
+        evidence_block = build_document_evidence_block(documents_ocr)
+        enriched_report = f"{evidence_block}\n\n{clean_report}" if evidence_block else clean_report
+
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
             member_narrative=member_narrative,
             member_photos=member_photo_data,
-            assessor_report=clean_report,
+            assessor_report=enriched_report,
             assessor_photos=assessor_photo_data,
             estimated_cost=estimated_cost,
-            location=location
+            location=location,
+            assessor_crush_depth_mm=assessor_crush_depth_mm,
+            assessor_approach_angle_deg=assessor_approach_angle_deg,
+            assessor_id=assessor_id,
         )
         db_manager.store_claim(analysis_result)
         logger.info(
@@ -217,7 +330,7 @@ async def assess_narrative_completeness(
     call itself fails.
     """
     if round >= 2:
-        return {"sufficient": True, "clarifying_question": None, "missing_aspect": None}
+        return {"sufficient": True, "clarifying_question": None, "missing_aspect": None, "extracted_facts": {}}
 
     prompt = f"""
 You are assisting with First Notification of Loss (FNOL) intake for a {claim_type or "motor"} insurance claim.
@@ -235,11 +348,27 @@ A single vague sentence (e.g. "car accident happened", "someone hit my car") is 
 A narrative that already describes how the collision happened and what was damaged IS sufficient,
 even if it omits precise street names or exact addresses.
 
+Separately, the intake flow also asks the claimant four yes/no questions after this narrative:
+whether a third party was involved, whether police were called, whether there were witnesses, and
+whether anyone was injured. Asking these blind when the narrative already answered them reads as
+not having listened -- so also extract what the narrative ALREADY makes clear about each, to be
+confirmed with the claimant instead of asked cold. Only fill a field when the narrative is explicit
+or unambiguous about it (e.g. describing a collision with another vehicle clearly means a third
+party was involved; "no injuries" clearly means injuries_reported is No). Leave a field null if the
+narrative is silent on it or genuinely ambiguous -- do not guess.
+
 Respond in JSON only:
 {{
     "sufficient": true/false,
     "missing_aspect": "the single most important missing detail (not date or location), or null if sufficient",
-    "clarifying_question": "one natural, conversational follow-up question about that one missing aspect, or null if sufficient"
+    "clarifying_question": "one natural, conversational follow-up question about that one missing aspect, or null if sufficient",
+    "extracted_facts": {{
+        "third_party_involved": "Yes"/"No"/null,
+        "third_party_summary": "one short phrase describing the other party/vehicle if involved, or null",
+        "police_reported": "Yes"/"No"/null,
+        "witnesses_present": "Yes"/"No"/null,
+        "injuries_reported": "Yes"/"No"/null
+    }}
 }}
 
 Ask about only ONE missing aspect at a time, phrased the way a helpful human intake agent would
@@ -254,10 +383,498 @@ Ask about only ONE missing aspect at a time, phrased the way a helpful human int
             "sufficient": bool(result.get("sufficient", True)),
             "clarifying_question": result.get("clarifying_question"),
             "missing_aspect": result.get("missing_aspect"),
+            "extracted_facts": result.get("extracted_facts") or {},
         }
     except Exception as e:
         logger.warning(f"Narrative sufficiency check failed: {e} — defaulting to sufficient")
-        return {"sufficient": True, "clarifying_question": None, "missing_aspect": None}
+        return {"sufficient": True, "clarifying_question": None, "missing_aspect": None, "extracted_facts": {}}
+
+
+async def _reevaluate_business_rules_background(claim_id: str):
+    """
+    Re-runs the Business Rules Engine after a document is added to a claim
+    that has already been through its initial analysis -- most importantly,
+    a police abstract arriving hours after the member filed. Without this,
+    a claim gets permanently stuck with an "unreported theft" / "missing
+    evidence" flag even after the claimant does the right thing and reports
+    it late, because the original evaluation only ever ran once, right
+    after initial submission.
+
+    Only touches the business_rules section, the AI advisory's
+    business_rules_observation, and the risk level (raise-only, same floor
+    logic as the initial evaluation) -- it does not re-run photo/narrative/
+    physics analysis, which stays exactly as originally computed.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim or not claim.get("member_id") or not claim.get("policy_id"):
+            return
+
+        analysis_result = json.loads(claim.get("analysis_result") or "{}")
+        if not analysis_result:
+            # Initial analysis hasn't run/finished yet -- it will pick up
+            # this document naturally when it does.
+            return
+
+        photos = db_manager.get_photos_metadata_by_claim(claim_id, party="member")
+        documents = db_manager.get_documents_by_claim(claim_id, party="member")
+        ob_doc = next((d for d in documents if d.get("document_type") == "police_abstract"), None)
+
+        incident_details = {}
+        if ob_doc:
+            fields = ob_doc.get("corrected_fields") or ob_doc.get("parsed_fields") or {}
+            ob_number = fields.get("ob_number")
+            if ob_number:
+                incident_details["police_reported"] = True
+                incident_details["ob_number"] = ob_number
+
+        narrative = claim.get("narrative") or analysis_result.get("narrative", "")
+
+        result = business_rules.BusinessRulesEngine(db_manager).evaluate(
+            claim_id=claim_id,
+            member_id=claim["member_id"],
+            policy_id=claim["policy_id"],
+            claim_type="motor",
+            narrative_text=narrative,
+            photo_count=len(photos),
+            incident_details=incident_details,
+        )
+
+        analysis_result["business_rules"] = result.to_dict()
+        if isinstance(analysis_result.get("ai_advisory"), dict):
+            analysis_result["ai_advisory"]["business_rules_observation"] = result.observation_text
+
+        # Raise-only floor, applied against whatever risk_level is currently
+        # stored -- matches the pattern used during the initial evaluation.
+        # New evidence resolving a flag doesn't retroactively lower a level
+        # that other signals (photo/narrative/physics) already justified.
+        _level_order = {"low": 0, "medium": 1, "high": 2}
+        current_level = analysis_result.get("risk_level", "low")
+        highest_severity = max(
+            (f.severity for f in result.findings),
+            key=lambda s: business_rules.SEVERITY_WEIGHT.get(s, 0),
+            default=None,
+        )
+        implied_level = (
+            "high" if highest_severity in ("high", "critical") else
+            "medium" if highest_severity == "medium" else
+            "low"
+        )
+        new_level = implied_level if _level_order[implied_level] > _level_order.get(current_level, 0) else current_level
+
+        analysis_result["risk_level"] = new_level
+        if isinstance(analysis_result.get("final_assessment"), dict):
+            analysis_result["final_assessment"]["risk_level"] = new_level
+        if isinstance(analysis_result.get("risk_scoring"), dict):
+            analysis_result["risk_scoring"].setdefault("component_scores", {})["business_rules"] = result.risk_score
+
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                "UPDATE claims SET analysis_result = ?, risk_level = ? WHERE claim_id = ?",
+                (json.dumps(analysis_result), new_level, claim_id),
+            )
+            conn.commit()
+
+        ai_rol.record_recommendation(
+            claim_id=claim_id,
+            capability="business_rules",
+            recommendation=(
+                f"Re-evaluated after new document upload — {len(result.findings)} rule(s) triggered"
+                if result.findings else
+                "Re-evaluated after new document upload — no rules triggered"
+            ),
+            confidence=None,
+            evidence=result.to_dict(),
+        )
+        logger.info(f"Business rules re-evaluated for {claim_id} after document upload — risk_level now {new_level}")
+    except Exception as e:
+        logger.error(f"Business rules re-evaluation failed for {claim_id}: {str(e)}")
+
+
+@analysis_router.post("/documents/upload")
+async def upload_and_ocr_document(
+    background_tasks: BackgroundTasks,
+    claim_id: str = Form(...),
+    party: str = Form(..., description="'member' or 'assessor'"),
+    document_type: str = Form(..., description="police_abstract / id_document / garage_quote / other"),
+    uploader_id: str = Form(..., description="member_id or assessor_id, for ownership verification"),
+    file: UploadFile = File(...),
+):
+    """
+    **Upload a single supporting document ahead of full claim submission and OCR it immediately**
+
+    Unlike the documents bundled into /api/analysis/member or /assessor
+    (which OCR in the background, after the claimant has already moved on),
+    this runs synchronously -- a few seconds -- so the intake wizard can
+    show the claimant what was read (e.g. the OB number) and let them
+    confirm or correct it right there, instead of asking them to separately
+    type a number that a photo of the same document already contains.
+
+    Already-uploaded documents are picked up by the final submission's
+    background processing (see _process_member_claim_background) rather
+    than needing to be re-uploaded at that point.
+    """
+    try:
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
+
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds 10MB limit")
+
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Claim not found")
+
+        authorized = False
+        if party == "member":
+            authorized = claim.get("member_id") == uploader_id
+        elif party == "assessor":
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM claim_assignments WHERE claim_id = ? AND assessor_id = ?",
+                    (claim_id, uploader_id)
+                )
+                authorized = cursor.fetchone() is not None
+        else:
+            authorized = True
+
+        if not authorized:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to upload documents for this claim")
+
+        from document_ocr import extract_document_data
+        ocr_result = await extract_document_data(content, file.filename, document_type)
+
+        doc_id = db_manager.store_document(
+            claim_id=claim_id, party=party, document_type=document_type,
+            filename=file.filename, file_data=content, ocr_result=ocr_result,
+            content_type=file.content_type,
+        )
+
+        # A police abstract arriving after the claim's already been analyzed
+        # (e.g. the member gets the OB number hours later) should clear the
+        # "unreported theft" / "missing evidence" business-rules flags
+        # instead of leaving them stuck from the original evaluation.
+        if document_type == "police_abstract" and party == "member":
+            background_tasks.add_task(_reevaluate_business_rules_background, claim_id)
+
+        return {
+            "success": True,
+            "document_id": doc_id,
+            "parsed_fields": ocr_result.get("parsed_fields", {}),
+            "extraction_confidence": ocr_result.get("extraction_confidence", 0),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading/OCR'ing document for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/documents/{document_id}/file")
+async def get_document_file(document_id: int):
+    """
+    **Serve the raw image bytes of an uploaded document, for inline viewing**
+
+    Lets the UI show an eye icon next to a document card that opens the
+    actual photo (police abstract, ID, garage quote) instead of only ever
+    showing the OCR-extracted text -- useful for a human to sanity-check
+    what OCR read against the real document.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT file_data, content_type FROM claim_documents WHERE id = ?",
+                (document_id,)
+            )
+            row = cursor.fetchone()
+        if not row or not row["file_data"]:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document file not found")
+        return Response(content=row["file_data"], media_type=row["content_type"] or "image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving document file {document_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/photos/{photo_id}/file")
+async def get_photo_file(photo_id: int):
+    """
+    **Serve the raw image bytes of an uploaded claim photo, for inline viewing**
+
+    The Evidence & Photos tab previously only ever showed filename/size and
+    AI-analysis anomalies -- there was no way to actually see the photo
+    itself. This lets the UI put a real <img> next to that metadata.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT file_data, content_type FROM claim_photo_files WHERE id = ?",
+                (photo_id,)
+            )
+            row = cursor.fetchone()
+        if not row or not row["file_data"]:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Photo file not found")
+        return Response(content=row["file_data"], media_type=row["content_type"] or "image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving photo file {photo_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/claim/{claim_id}/lookup")
+async def lookup_claim(claim_id: str):
+    """
+    **Minimal, safe claim lookup -- confirms a claim ID is real before an
+    analyst navigates to it**
+
+    Deliberately returns only enough to let an analyst confirm "yes, this is
+    the right claim" (who it belongs to, where, when) -- no fraud/risk data,
+    consistent with what's already shown to members about their own claims.
+    Backs the "look up any claim" search on the analyst dashboard, since an
+    analyst picking up a follow-up call about a claim they didn't personally
+    file has no other way to find it (their dashboard only lists claims
+    they filed themselves).
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        member = db_manager.get_member_info(claim.get("member_id")) if claim.get("member_id") else None
+
+        return {
+            "success": True,
+            "claim_id": claim_id,
+            "member_id": claim.get("member_id"),
+            "member_name": member.get("name") if member else None,
+            "location": claim.get("location"),
+            "estimated_cost": claim.get("estimated_cost"),
+            "created_at": claim.get("created_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error looking up claim {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/claim/{claim_id}/photos")
+async def list_claim_photos(claim_id: str, party: Optional[str] = Query(None)):
+    """
+    Lightweight photo listing (no raw bytes) for an already-submitted claim
+    -- backs both the member's and the analyst's "view + add more photos"
+    screens.
+    """
+    try:
+        if not db_manager.get_claim(claim_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+        photos = db_manager.get_photos_metadata_by_claim(claim_id, party=party)
+        return {"success": True, "claim_id": claim_id, "photos": photos}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing photos for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim/{claim_id}/photos")
+async def add_claim_photos(
+    claim_id: str,
+    uploader_type: str = Form(..., description="'member' or 'analyst'"),
+    uploader_id: str = Form(..., description="member_id or analyst_id"),
+    photos: List[UploadFile] = File(...),
+):
+    """
+    **Add photos to an already-submitted claim**
+
+    The original /api/analysis/member submission only supports one round of
+    photo evidence. This covers everything after that: a member who didn't
+    have photos ready at filing time, or an analyst adding photos a caller
+    emailed in after a phone-filed claim (see /api/analysis/documents/upload
+    for the equivalent on documents).
+
+    Each photo gets the same per-photo CV analysis as the original
+    submission (real anomaly detection, not inert storage) and is logged to
+    the AI-ROL trail. This does NOT re-run narrative analysis or physics
+    reconstruction for the claim as a whole -- those reflect the evidence
+    available at original submission time, same boundary as document
+    corrections (see /documents/{id}/correct).
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        if uploader_type == "member":
+            if claim.get("member_id") != uploader_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to add photos to this claim")
+        elif uploader_type == "analyst":
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM analysts WHERE analyst_id = ? AND active_status = 1", (uploader_id,))
+                if not cursor.fetchone():
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unknown or inactive analyst")
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="uploader_type must be 'member' or 'analyst'")
+
+        orchestrator = get_claim_orchestrator()
+        stored = []
+
+        for photo in photos:
+            if not photo.content_type or not photo.content_type.startswith('image/'):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{photo.filename} is not a valid image")
+            content = await photo.read()
+            if len(content) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"{photo.filename} exceeds 10MB limit")
+
+            photo_id = db_manager.store_photo_file(
+                claim_id=claim_id, filename=photo.filename, party='member',
+                file_data=content, content_type=photo.content_type,
+                uploaded_by=uploader_id,
+            )
+
+            try:
+                result = await orchestrator.photo_service.analyze_photo(
+                    content, photo.filename, claim_id, party='member',
+                )
+                ai_rol.record_recommendation(
+                    claim_id=claim_id,
+                    capability="computer_vision",
+                    recommendation=f"Late-added photo analyzed — {len(result.anomalies)} anomaly(ies) detected",
+                    confidence=result.analysis_confidence / 100,
+                    evidence={"filename": photo.filename, "risk_score": result.risk_score, "anomalies": result.anomalies},
+                )
+            except Exception as e:
+                logger.warning(f"CV analysis failed for late-added photo {photo.filename} on {claim_id}: {e}")
+
+            stored.append({"photo_id": photo_id, "filename": photo.filename})
+
+        logger.info(f"📸 {len(stored)} photo(s) added to {claim_id} by {uploader_type} {uploader_id}")
+        return {"success": True, "claim_id": claim_id, "photos_added": len(stored), "photos": stored}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding photos to {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim/{claim_id}/notify-member")
+async def notify_member_to_add_photos(
+    claim_id: str,
+    requested_by: str = Form(..., description="analyst_id or admin_id triggering this"),
+):
+    """
+    **Email the member a link to add photos to a claim filed on their behalf**
+
+    For phone-filed claims with no photos yet -- lets the analyst hand off
+    getting real evidence to the person who actually has the vehicle in
+    front of them, instead of that evidence never arriving at all. Email is
+    best-effort: if GMAIL_ADDRESS/GMAIL_APP_PASSWORD aren't configured on
+    this deployment, this returns success=false with a clear reason rather
+    than failing the request outright -- filing a claim should never be
+    blocked by whether notification email happens to be set up.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        member_id = claim.get("member_id")
+        member = db_manager.get_member_info(member_id) if member_id else None
+        if not member or not member.get("email"):
+            return {"success": False, "reason": "No email on file for this claim's member"}
+
+        sent = email_service.send_add_photos_email(
+            to_email=member["email"],
+            member_name=member.get("name") or "there",
+            member_id=member_id,
+            claim_id=claim_id,
+        )
+
+        if sent:
+            logger.info(f"📧 Notified member {member_id} about claim {claim_id} (requested by {requested_by})")
+            return {"success": True, "sent_to": member["email"]}
+        else:
+            return {"success": False, "reason": "Email is not configured on this deployment"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error notifying member for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/documents/{document_id}/correct")
+async def correct_document(
+    document_id: int,
+    corrected_fields: str = Form(..., description="JSON object of corrected field values"),
+    corrected_by: str = Form(..., description="member_id or assessor_id making the correction"),
+):
+    """
+    **Member or assessor corrects a field OCR got wrong on their own uploaded document**
+
+    The original OCR output (raw_text / parsed_fields) is never overwritten
+    -- it stays as the ground truth for audit. The correction is stored
+    alongside it, so admin can see both and a self-serving "correction" that
+    changes a fraud-relevant field (e.g. an OB number) is visible to a
+    reviewer, not silently trusted the way the raw OCR read would be.
+
+    Note: this updates the stored document record only. It does not
+    re-trigger narrative analysis or physics reconstruction, which already
+    ran against the original OCR output at submission time.
+    """
+    try:
+        doc = db_manager.get_document_by_id(document_id)
+        if not doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+        claim_id = doc["claim_id"]
+        party = doc["party"]
+
+        authorized = False
+        if party == "member":
+            claim = db_manager.get_claim(claim_id)
+            authorized = bool(claim and claim.get("member_id") == corrected_by)
+        elif party == "assessor":
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM claim_assignments WHERE claim_id = ? AND assessor_id = ?",
+                    (claim_id, corrected_by)
+                )
+                authorized = cursor.fetchone() is not None
+        else:
+            # repair_shop / other -- no ownership table wired up for this
+            # party yet, so no strict check within current PoC scope.
+            authorized = True
+
+        if not authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to correct this document"
+            )
+
+        try:
+            fields_dict = json.loads(corrected_fields)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="corrected_fields must be valid JSON")
+
+        db_manager.correct_document_fields(document_id, fields_dict, corrected_by)
+
+        return {"success": True, "document_id": document_id, "corrected_fields": fields_dict}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error correcting document {document_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @analysis_router.post("/member")
@@ -269,7 +886,12 @@ async def submit_member_claim(
     estimated_cost: float = Form(..., description="Member's estimated repair cost"),
     location: str = Form(..., description="Accident location"),
     incident_date: str = Form(..., description="Date of incident (YYYY-MM-DD)"),
-    photos: List[UploadFile] = File(..., description="Photos from member"),
+    # Required for a member self-filing (they have the vehicle in front of
+    # them), but not for a claims analyst filing over the phone -- they have
+    # no photos to upload in the moment. The assessor's own on-site
+    # inspection photos (captured later, independently) still provide real
+    # visual evidence for the claim either way.
+    photos: List[UploadFile] = File(default=[], description="Photos from member -- required when the member self-files, optional when a claims analyst files on their behalf"),
     third_party_involved: Optional[str] = Form(None),
     third_party_details: Optional[str] = Form(None),
     third_party_fled: Optional[str] = Form(None),
@@ -279,6 +901,7 @@ async def submit_member_claim(
     witness_details: Optional[str] = Form(None),
     injuries_reported: Optional[str] = Form(None),
     injury_details: Optional[str] = Form(None),
+    id_document: Optional[UploadFile] = File(None, description="Photo of national ID or driving licence — optional"),
 ):
     """
     **Member submits initial claim**
@@ -327,7 +950,17 @@ async def submit_member_claim(
                 logger.error(f"Failed to store photo {photo.filename}: {str(e)}")
  
             photo_data.append((content, photo.filename))
- 
+
+        # OCR runs in the background task (it's a vision-LLM call, same cost
+        # class as photo analysis) — only the raw bytes are read here so the
+        # acknowledgment below doesn't wait on it. (Police abstract is no
+        # longer uploaded here -- it's uploaded and OCR'd immediately,
+        # earlier in the intake wizard, right when the claimant confirms
+        # police were involved -- see /api/analysis/documents/upload.)
+        id_document_data = None
+        if id_document:
+            id_document_data = (await id_document.read(), id_document.filename)
+
         clean_narrative = ValidationUtils.sanitize_narrative(narrative)
         structured_block = build_structured_intake_block(
             third_party_involved, third_party_details, third_party_fled,
@@ -353,7 +986,8 @@ async def submit_member_claim(
         # it runs in the background — the acknowledgment below doesn't wait.
         background_tasks.add_task(
             _process_member_claim_background,
-            claim_id, enriched_narrative, photo_data, estimated_cost, location
+            claim_id, enriched_narrative, photo_data, estimated_cost, location,
+            id_document_data,
         )
 
         logger.info(f"Member submission accepted for {claim_id} — analysis running in background")
@@ -364,6 +998,7 @@ async def submit_member_claim(
             "message": "Your claim has been submitted successfully",
             "submission_details": {
                 "photos_uploaded": len(photo_data),
+                "documents_uploaded": len(db_manager.get_documents_by_claim(claim_id, party="member")) + (1 if id_document_data else 0),
                 "estimated_cost": f"KES {estimated_cost:,.2f}",
                 "location": location,
                 "incident_date": incident_date
@@ -399,7 +1034,12 @@ async def submit_assessor_report(
     damage_report: str = Form(..., description="Detailed damage assessment"),
     estimated_cost: float = Form(..., description="Assessor's estimated repair cost"),
     inspection_date: str = Form(..., description="Date of inspection"),
-    photos: List[UploadFile] = File(..., description="Photos from assessor inspection")
+    photos: List[UploadFile] = File(..., description="Photos from assessor inspection"),
+    crush_depth_mm: Optional[float] = Form(None, description="Measured crush/deformation depth in mm"),
+    approach_angle_deg: Optional[float] = Form(None, description="Assessed impact angle in degrees"),
+    third_party_vehicle_confirmed: Optional[str] = Form(None, description="Third-party vehicle details confirmed on-site"),
+    garage_quote: Optional[UploadFile] = File(None, description="Photo of a garage repair quote collected on-site — optional"),
+    id_document: Optional[UploadFile] = File(None, description="Photo of claimant/third-party ID verified on-site — optional"),
 ):
     """
     **Assessor submits damage assessment**
@@ -452,7 +1092,15 @@ async def submit_assessor_report(
                 logger.error(f"Failed to store photo {photo.filename}: {str(e)}")
  
             assessor_photo_data.append((content, photo.filename))
- 
+
+        garage_quote_data = None
+        if garage_quote:
+            garage_quote_data = (await garage_quote.read(), garage_quote.filename)
+
+        id_document_data = None
+        if id_document:
+            id_document_data = (await id_document.read(), id_document.filename)
+
         member_photos_from_db = db_manager.get_photos_by_claim_and_party(claim_id, 'member')
         member_photo_data = [(p['file_data'], p['filename']) for p in member_photos_from_db]
  
@@ -471,11 +1119,17 @@ async def submit_assessor_report(
                 logger.error(f"Error parsing analysis_result: {e}")
  
         clean_report = ValidationUtils.sanitize_narrative(damage_report)
+        measurement_block = build_assessor_measurement_block(
+            crush_depth_mm, approach_angle_deg, third_party_vehicle_confirmed
+        )
+        enriched_report = f"{measurement_block}\n\nASSESSOR REPORT:\n{clean_report}" if measurement_block else clean_report
 
         background_tasks.add_task(
             _process_assessor_analysis_background,
-            claim_id, member_narrative, member_photo_data, clean_report,
-            assessor_photo_data, estimated_cost, location
+            claim_id, member_narrative, member_photo_data, enriched_report,
+            assessor_photo_data, estimated_cost, location,
+            crush_depth_mm, approach_angle_deg, assessor_id,
+            garage_quote_data, id_document_data,
         )
 
         logger.info(f"Assessor submission accepted for {claim_id} — analysis running in background")
@@ -486,6 +1140,7 @@ async def submit_assessor_report(
             "message": "Your assessment has been submitted successfully",
             "submission_details": {
                 "photos_uploaded": len(assessor_photo_data),
+                "documents_uploaded": sum(1 for d in (garage_quote_data, id_document_data) if d),
                 "estimated_cost": f"KES {estimated_cost:,.2f}",
                 "inspection_date": inspection_date
             },
@@ -808,7 +1463,26 @@ async def get_full_fraud_analysis(
  
         timeline      = physics_summary.get('timeline') if physics_summary else None
         timeline_meta = timeline.get('simulation_metadata') if isinstance(timeline, dict) else None
- 
+
+        # Supporting documents (police abstract / ID / garage quote) + their
+        # OCR extraction — not previously surfaced anywhere in the UI.
+        documents = db_manager.get_documents_by_claim(claim_id)
+
+        # Assessor's historical measurement-discrepancy rate, if this claim
+        # has an assigned assessor — same collusion-pattern signal used to
+        # gate the pattern-risk flag in physics reconstruction, surfaced
+        # here for a human reviewer instead of only ever affecting scoring.
+        assessor_track_record = None
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT assessor_id FROM claim_assignments WHERE claim_id = ? ORDER BY assigned_at DESC LIMIT 1",
+                (claim_id,)
+            )
+            assignment_row = cursor.fetchone()
+        if assignment_row and assignment_row["assessor_id"]:
+            assessor_track_record = db_manager.get_assessor_track_record(assignment_row["assessor_id"])
+
         return {
             "claim_id":           claim_id,
             "analysis_timestamp": analysis_result.get('timestamp'),
@@ -876,7 +1550,28 @@ async def get_full_fraud_analysis(
                 "timeline_metadata":   timeline_meta,
                 "timeline":            timeline if include_timeline else None,
                 "comparison":          physics_summary.get('comparison'),
+                "measurement_flags":   physics_summary.get('measurement_flags', []),
+                "has_measurement_discrepancy": physics_summary.get('has_measurement_discrepancy', False),
             },
+            "documents": [
+                {
+                    "id":                    d.get("id"),
+                    "party":                 d.get("party"),
+                    "document_type":         d.get("document_type"),
+                    "filename":              d.get("filename"),
+                    "raw_text":              d.get("raw_text"),
+                    "parsed_fields":         d.get("parsed_fields"),
+                    "extraction_confidence": d.get("extraction_confidence"),
+                    "extraction_method":     d.get("extraction_method"),
+                    "uploaded_at":           d.get("uploaded_at"),
+                    "corrected_fields":      d.get("corrected_fields"),
+                    "corrected_by":          d.get("corrected_by"),
+                    "corrected_at":          d.get("corrected_at"),
+                }
+                for d in documents
+            ],
+            "assessor_track_record": assessor_track_record,
+            "claim_decision": db_manager.get_latest_claim_decision(claim_id),
             "detection_summary": {
                 "total_anomalies":       len(all_anomalies),
                 "critical_issues":       critical_count,
@@ -968,6 +1663,96 @@ async def record_ai_rol_action(
     except Exception as e:
         logger.error(f"Error recording AI-ROL handler action for {claim_id}: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error recording handler action: {str(e)}")
+
+
+VALID_CLAIM_DECISIONS = {"PAY", "DENY", "ESCALATE"}
+
+
+@analysis_router.get("/claim/{claim_id}/decision")
+async def get_claim_decision(claim_id: str):
+    """
+    Current (and full history of) triage decision(s) for a claim -- distinct
+    from `final_assessment.decision` in the full-report, which is a
+    recomputed AI suggestion, never persisted. This is the actual recorded
+    human call.
+    """
+    try:
+        latest = db_manager.get_latest_claim_decision(claim_id)
+        history = db_manager.get_claim_decision_history(claim_id)
+        return {"claim_id": claim_id, "current_decision": latest, "history": history}
+    except Exception as e:
+        logger.error(f"Error retrieving decision for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim/{claim_id}/decision")
+async def record_claim_decision(
+    claim_id: str,
+    decision: str = Form(..., description="PAY, DENY, or ESCALATE"),
+    decided_by: str = Form(..., description="admin_id of the reviewer recording this decision"),
+    reason: Optional[str] = Form(None, description="Required for DENY and ESCALATE"),
+    payout_amount: Optional[float] = Form(None, description="Only meaningful for PAY"),
+):
+    """
+    **Record the final triage decision on a claim: PAY / DENY / ESCALATE**
+
+    This is the human reviewer's actual, persisted business decision --
+    nothing in this system recorded that before (the "Recommended Action"
+    shown throughout the admin report is only ever a freshly recomputed AI
+    suggestion, never written to the database). A claim can be re-decided
+    later (e.g. an ESCALATE resolved afterward into a PAY or DENY); this
+    table is append-only and callers read the latest row.
+    """
+    try:
+        decision = decision.upper().strip()
+        if decision not in VALID_CLAIM_DECISIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"decision must be one of {sorted(VALID_CLAIM_DECISIONS)}"
+            )
+        if decision in ("DENY", "ESCALATE") and not (reason and reason.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"A reason is required to {decision.lower()} a claim"
+            )
+
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        decision_id = db_manager.record_claim_decision(
+            claim_id=claim_id,
+            decision=decision,
+            decided_by=decided_by,
+            reason=reason,
+            payout_amount=payout_amount if decision == "PAY" else None,
+        )
+
+        # Also logged into the AI-ROL trail as a handler action against the
+        # ai_advisory capability so it shows up in that audit view too,
+        # alongside every other reviewer action on this claim.
+        try:
+            ai_rol.record_handler_action(
+                claim_id=claim_id,
+                handler_id=decided_by,
+                action="override" if decision != "ESCALATE" else "escalate",
+                capability="ai_advisory",
+                reason=reason or f"Claim {decision.lower()}ed",
+            )
+        except Exception as e:
+            logger.warning(f"Could not mirror claim decision into AI-ROL trail for {claim_id}: {e}")
+
+        return {
+            "success": True,
+            "claim_id": claim_id,
+            "decision_id": decision_id,
+            "decision": decision,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error recording decision for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @analysis_router.get("/claim/{claim_id}/summary")
@@ -1348,6 +2133,32 @@ async def health_check():
         )
  
  
+@system_router.get("/logs")
+async def tail_backend_logs(lines: int = Query(80, ge=1, le=1000)):
+    """
+    **Tail the backend's own process log, as plain text**
+
+    For checking "is it actually processing or stuck" during a live demo
+    without needing SSH access -- just open this URL in a browser tab.
+    Reads whatever log file this process was launched with stdout/stderr
+    redirected to (see devserver run command); if that's not discoverable,
+    falls back to an explicit message rather than a stack trace.
+    """
+    log_path = os.environ.get("BACKEND_LOG_PATH", os.path.expanduser("~/debra_projects/backend_devserver.log"))
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = "".join(all_lines[-lines:])
+        return PlainTextResponse(tail or "(log file is empty)")
+    except FileNotFoundError:
+        return PlainTextResponse(
+            f"Log file not found at {log_path}. Set BACKEND_LOG_PATH if it's launched with a different redirect target.",
+            status_code=404,
+        )
+    except Exception as e:
+        return PlainTextResponse(f"Could not read log file: {str(e)}", status_code=500)
+
+
 @system_router.get("/stats", response_model=SystemStatsSchema)
 async def get_system_stats():
     """

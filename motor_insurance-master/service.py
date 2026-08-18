@@ -23,6 +23,7 @@ from schemas import PhotoAnomalySchema, NarrativeAnalysisSchema, RiskScoringSche
 from database import db_manager
 from ollama_client import generate, generate_json, OllamaError
 import ai_rol
+import business_rules
 
 # The dev GPU can only host one large model at a time — the team standardized
 # on gemma4:26b (also used for photo vision), so all text-reasoning tasks that
@@ -392,6 +393,7 @@ class PhotoAnalysisService:
                     )
  
             # 2. AI-powered damage analysis: trained YOLO model + Ollama VLM
+            photo_detections: List[Dict[str, Any]] = []
             try:
                 llm_analysis = await self._analyze_with_llm(
                     image_data, filename, claim_id, party,
@@ -400,11 +402,18 @@ class PhotoAnalysisService:
                 logger.info(f"✅ LLM analysis completed - Found {len(llm_analysis['anomalies'])} anomalies, risk: {llm_analysis['risk_score']}")
                 anomalies.extend(llm_analysis["anomalies"])
                 risk_score += llm_analysis["risk_score"]
+                photo_detections = llm_analysis.get("detections", []) or []
             except Exception as e:
                 logger.error(f"❌ LLM analysis failed: {str(e)}, falling back to rule-based")
                 fallback_analysis = await self._fallback_damage_analysis(image, filename, party)
                 anomalies.extend(fallback_analysis["anomalies"])
                 risk_score += fallback_analysis["risk_score"]
+
+            # Trained-model-only severity read, independent of the vision LLM
+            # (see `_cv_severity_from_detections` docstring for why this matters
+            # for cross-checking a party's own claimed measurements).
+            cv_severity = self._cv_severity_from_detections(photo_detections)
+            detected_classes = [d.get("class") for d in photo_detections if d.get("class")]
  
             # 3. Enhanced lighting analysis
             logger.debug("💡 Analyzing lighting conditions")
@@ -475,7 +484,9 @@ class PhotoAnalysisService:
                 hash=perceptual_hash,
                 anomalies=anomalies,
                 risk_score=final_risk_score,
-                analysis_confidence=analysis_confidence
+                analysis_confidence=analysis_confidence,
+                cv_severity=cv_severity,
+                detected_classes=detected_classes,
             )
  
             try:
@@ -731,6 +742,30 @@ AI generation indicators to check:
     }
     # Everything else (moderate-deformation, generic-dent, the part-specific
     # dents, flat-tire, wheel-damage-generic, trunk-damage, ...) -> medium.
+
+    def _cv_severity_from_detections(self, detections: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Trained-model-only severity read (low/medium/high) from raw YOLO
+        detections, regardless of whether the vision LLM ran. Used as the
+        independent anchor for cross-checking a party's claimed crush depth,
+        since it can't be talked into a different answer via prompt/narrative.
+        """
+        if not detections:
+            return None
+        tiers = set()
+        for d in detections:
+            cls = d.get("class")
+            if cls in self._CV_HIGH_SEVERITY_CLASSES:
+                tiers.add("high")
+            elif cls in self._CV_LOW_SEVERITY_CLASSES:
+                tiers.add("low")
+            else:
+                tiers.add("medium")
+        if "high" in tiers:
+            return "high"
+        if "medium" in tiers:
+            return "medium"
+        return "low"
 
     def _cv_only_analysis(self, detections: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -1132,7 +1167,15 @@ class NarrativeAnalysisService:
             return parsed
         except Exception as e:
             logger.error(f"Narrative analysis ({TEXT_REASONING_MODEL}) failed: {str(e)}")
-            return await self._fallback_narrative_analysis(narrative, claim_id, party)
+            # Re-raise rather than returning a fallback here: this function's
+            # contract is to return a raw dict (fed into _convert_gemini_to_schema,
+            # which calls .get() on it) -- the caller's own except clause
+            # already handles this by calling _get_default_narrative_analysis,
+            # which correctly returns a NarrativeAnalysisSchema object directly.
+            # Returning a Schema object from here instead used to crash with
+            # "'NarrativeAnalysisSchema' object has no attribute 'get'" on
+            # every Ollama failure.
+            raise
         
     def _parse_gemini_narrative_response(self, response_text: str) -> Dict[str, Any]:
         """Parse Gemini narrative analysis response"""
@@ -1280,18 +1323,6 @@ class NarrativeAnalysisService:
             gemini_analysis=gemini_analysis,
         )
     
-    async def _fallback_narrative_analysis(self, narrative: str, claim_id: str, party: str = "member") -> NarrativeAnalysisSchema:
-        """Fallback analysis when Gemini is not available"""
-        
-        # Use basic rule-based analysis
-        return NarrativeAnalysisSchema(
-            extracted_data={"impact_type": "unknown"},
-            inconsistencies=[],
-            narrative_quality_score=50,
-            key_entities=[],
-            sentiment="neutral"
-        )
-    
     def _get_default_narrative_analysis(self, party: str = "member") -> NarrativeAnalysisSchema:
         """Return default analysis on error"""
         return NarrativeAnalysisSchema(
@@ -1329,7 +1360,8 @@ class RiskScoringService:
         claim_amount: float,
         location: str,
         historical_data: Optional[Dict] = None,
-        claim_id: str = "unknown"
+        claim_id: str = "unknown",
+        business_rules_score: Optional[int] = None
     ) -> RiskScoringSchema:
         """Calculate comprehensive fraud risk score with database integration"""
         try:
@@ -1376,7 +1408,14 @@ class RiskScoringService:
                     "location":   0.10,
                     "historical": 0.05,
                 }
-    
+
+            # ── Business rules component (Appendix C rules engine) ─────────────────
+            # Only added when the caller actually ran the rules engine -- renormalized
+            # in with everything else below so it never changes the *shape* of the
+            # weights, just makes room for a new evidence-backed signal.
+            if business_rules_score is not None:
+                raw_weights["business_rules"] = 0.20
+
             total   = sum(raw_weights.values())
             weights = {k: round(v / total, 4) for k, v in raw_weights.items()}
     
@@ -1396,7 +1435,9 @@ class RiskScoringService:
             }
             if physics_score > 0:
                 scores_map["physics"] = physics_score
-    
+            if business_rules_score is not None:
+                scores_map["business_rules"] = business_rules_score
+
             overall_score = int(sum(scores_map[k] * weights[k] for k in weights))
             overall_score = min(max(overall_score, 0), 100)
     
@@ -1423,7 +1464,21 @@ class RiskScoringService:
                     f"(physics={physics_score}/100) for {claim_id}"
                 )
                 risk_level = physics_implied
-    
+
+            # ── Business rules floor — same pattern as physics: can only raise ─────
+            if business_rules_score is not None:
+                rules_implied = (
+                    RiskLevel.HIGH   if business_rules_score >= 70 else
+                    RiskLevel.MEDIUM if business_rules_score >= 40 else
+                    RiskLevel.LOW
+                )
+                if _level_order[rules_implied] > _level_order[risk_level]:
+                    logger.info(
+                        f"Business rules floor applied: {risk_level.value} → {rules_implied.value} "
+                        f"(business_rules={business_rules_score}/100) for {claim_id}"
+                    )
+                    risk_level = rules_implied
+
             # ── Recommendations ───────────────────────────────────────────────────
             recommendations = self._generate_recommendations(
                 overall_score,
@@ -1459,6 +1514,7 @@ class RiskScoringService:
                     "location_based":         location_score,
                     "historical_patterns":    historical_score,
                     "physics_reconstruction": physics_score,
+                    "business_rules":         business_rules_score if business_rules_score is not None else 0,
                 },
                 recommendations=recommendations,
                 explanation=explanation,
@@ -1772,7 +1828,14 @@ class ClaimOrchestrator:
         assessor_photos: Optional[List[Tuple[bytes, str]]] = None,
         repair_estimate: Optional[str] = None,
         repair_photos: Optional[List[Tuple[bytes, str]]] = None,
-        historical_data: Optional[Dict] = None
+        historical_data: Optional[Dict] = None,
+        assessor_crush_depth_mm: Optional[float] = None,
+        assessor_approach_angle_deg: Optional[float] = None,
+        assessor_id: Optional[str] = None,
+        member_id: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        claim_type: str = "motor",
+        incident_details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Multi-party claim analysis.
@@ -1790,6 +1853,8 @@ class ClaimOrchestrator:
 
         try:
             all_photos = []
+            member_cv_severities = []
+            assessor_cv_severities = []
 
             # Analyze member photos
             logger.info(f"Analyzing {len(member_photos)} member photos...")
@@ -1800,6 +1865,8 @@ class ClaimOrchestrator:
                     narrative_context=member_narrative,
                 )
                 all_photos.append(result)
+                if result.cv_severity:
+                    member_cv_severities.append(result.cv_severity)
                 await asyncio.sleep(2)
 
             # Analyze assessor photos
@@ -1812,7 +1879,19 @@ class ClaimOrchestrator:
                         narrative_context=assessor_report or "",
                     )
                     all_photos.append(result)
+                    if result.cv_severity:
+                        assessor_cv_severities.append(result.cv_severity)
                     await asyncio.sleep(2)
+
+            _severity_rank = {"low": 1, "medium": 2, "high": 3}
+            member_cv_severity = (
+                max(member_cv_severities, key=lambda s: _severity_rank.get(s, 0))
+                if member_cv_severities else None
+            )
+            assessor_cv_severity = (
+                max(assessor_cv_severities, key=lambda s: _severity_rank.get(s, 0))
+                if assessor_cv_severities else None
+            )
 
             # Analyze repair shop photos
             if repair_photos:
@@ -1928,6 +2007,11 @@ class ClaimOrchestrator:
                 estimated_cost=estimated_cost,
                 assessor_report=assessor_report,
                 narrative_analysis=member_narrative_analysis,
+                assessor_crush_depth_mm=assessor_crush_depth_mm,
+                assessor_approach_angle_deg=assessor_approach_angle_deg,
+                assessor_id=assessor_id,
+                member_cv_severity=member_cv_severity,
+                assessor_cv_severity=assessor_cv_severity,
             )
 
             # ── AI-ROL: Physics & Mathematical Consistency recommendation ──────────
@@ -1944,8 +2028,38 @@ class ClaimOrchestrator:
                     evidence={
                         "comparison": physics_summary.get("comparison"),
                         "inconsistencies": physics_summary.get("inconsistencies"),
+                        "measurement_flags": physics_summary.get("measurement_flags", []),
                     },
                 )
+
+            # ── Business Rules Engine (Appendix C §C.1 + extensions) ────────────────
+            business_rules_result = None
+            if member_id and policy_id:
+                try:
+                    business_rules_result = business_rules.BusinessRulesEngine(db_manager).evaluate(
+                        claim_id=claim_id,
+                        member_id=member_id,
+                        policy_id=policy_id,
+                        claim_type=claim_type,
+                        narrative_text=member_narrative,
+                        photo_count=len(member_photos),
+                        incident_details=incident_details,
+                    )
+                    ai_rol.record_recommendation(
+                        claim_id=claim_id,
+                        capability="business_rules",
+                        recommendation=(
+                            f"{len(business_rules_result.findings)} rule(s) triggered "
+                            f"— business rules risk {business_rules_result.risk_score}/100"
+                            if business_rules_result.findings
+                            else "No business rules triggered"
+                        ),
+                        confidence=None,
+                        evidence=business_rules_result.to_dict(),
+                    )
+                except Exception as e:
+                    logger.error(f"Business rules evaluation failed for {claim_id}: {str(e)}")
+                    business_rules_result = None
 
             # Calculate risk score — picks up physics score from DB
             logger.info("Calculating risk score...")
@@ -1956,7 +2070,8 @@ class ClaimOrchestrator:
                 estimated_cost,
                 location,
                 historical_data,
-                claim_id
+                claim_id,
+                business_rules_score=(business_rules_result.risk_score if business_rules_result else None),
             )
 
             # ── Apply cross-party adjustment then recalculate label ───────────────
@@ -1992,6 +2107,30 @@ class ClaimOrchestrator:
                     f"(physics={physics_score_val}/100) for {claim_id}"
                 )
                 risk_result.risk_level = physics_implied
+
+            # ── Business rules floor re-application ────────────────────────────────
+            # Same pattern as physics: a HIGH-severity rule finding (e.g. usage-class
+            # mismatch, driver ineligibility) shouldn't get diluted away just because
+            # the other components (photo/narrative/amount/location) happen to score
+            # low on an otherwise mundane-looking claim.
+            if business_rules_result is not None:
+                highest_severity = max(
+                    (f.severity for f in business_rules_result.findings),
+                    key=lambda s: business_rules.SEVERITY_WEIGHT.get(s, 0),
+                    default=None,
+                )
+                rules_implied = (
+                    RiskLevel.HIGH   if highest_severity in ("high", "critical") else
+                    RiskLevel.MEDIUM if highest_severity == "medium" else
+                    RiskLevel.LOW
+                )
+                if _level_order[rules_implied] > _level_order[risk_result.risk_level]:
+                    logger.info(
+                        f"Business rules floor re-applied: {risk_result.risk_level.value} → "
+                        f"{rules_implied.value} "
+                        f"(highest rule severity={highest_severity}) for {claim_id}"
+                    )
+                    risk_result.risk_level = rules_implied
 
             # Regenerate explanation with final adjusted score
             risk_result.explanation = self.risk_service._generate_explanation(
@@ -2073,6 +2212,7 @@ class ClaimOrchestrator:
                 physics_summary=physics_summary,
                 cross_party_check=cross_party_check,
                 risk_result=risk_result,
+                business_rules_result=business_rules_result,
             )
 
             # ── AI-ROL: AI Advisory recommendation ─────────────────────────────────
@@ -2154,6 +2294,7 @@ class ClaimOrchestrator:
 
                 "cross_party_verification": cross_party_check,
                 "physics_reconstruction":   physics_summary,
+                "business_rules":           business_rules_result.to_dict() if business_rules_result else None,
                 "risk_scoring":             risk_result.dict(),
                 "recommendations":          risk_result.recommendations,
 
@@ -2346,6 +2487,11 @@ physics_applicable is FALSE for:
         estimated_cost: float,
         assessor_report: Optional[str] = None,
         narrative_analysis=None,
+        assessor_crush_depth_mm: Optional[float] = None,
+        assessor_approach_angle_deg: Optional[float] = None,
+        assessor_id: Optional[str] = None,
+        member_cv_severity: Optional[str] = None,
+        assessor_cv_severity: Optional[str] = None,
     ) -> dict:
         """
         Auto-run physics reconstruction after narrative analysis.
@@ -2354,6 +2500,26 @@ physics_applicable is FALSE for:
         Generates a 5-second kinematic timeline via the multi-vehicle simulation.
         Renders timeline to MP4 video file for report attachment.
         Non-blocking — returns summary dict, never raises.
+
+        assessor_crush_depth_mm / assessor_approach_angle_deg: physical
+        measurements the assessor took on-site, if provided. These still take
+        priority over narrative-text inference for the actual reconstruction
+        run (measured beats guessed) -- but an assessor colluding with the
+        member/repairer can type in whatever number produces the outcome they
+        want, so a blind override defeats the one signal in this pipeline
+        that's supposed to be independent of what the human parties say.
+        Instead: the narrative-extracted value is kept as a baseline, and the
+        assessor's number is cross-checked against it AND against the
+        trained CV model's severity read from the *member's* independently
+        submitted photos (member_cv_severity) -- those were uploaded earlier,
+        separately, before the assessor was even assigned, so they're a much
+        harder signal for an assessor to have shaped. assessor_cv_severity
+        (from the assessor's own photos) is checked too but weighted as a
+        weaker signal, since a colluding assessor controls those photos as
+        well as the number. Any material mismatch is recorded as a warning
+        and does not silently disappear, and repeated mismatches for the same
+        assessor raise their historical flag rate for future claims (see
+        db_manager.get_assessor_track_record).
         """
         try:
             import json as _json
@@ -2385,6 +2551,11 @@ physics_applicable is FALSE for:
                 }
 
             # ── Step 2: Skip if already run for this claim ────────────────────────
+            # Exception: if the assessor has since provided real on-site
+            # measurements, that's a strictly better input than whatever ran
+            # at member-submission time -- re-run rather than silently
+            # keeping the earlier, narrative-guessed result.
+            has_assessor_override = assessor_crush_depth_mm is not None or assessor_approach_angle_deg is not None
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -2392,7 +2563,7 @@ physics_applicable is FALSE for:
                     (claim_id,)
                 )
                 row = cursor.fetchone()
-                if row and row["physics_fraud_score"] not in (None, 0):
+                if row and row["physics_fraud_score"] not in (None, 0) and not has_assessor_override:
                     logger.info(f"Physics already run for {claim_id} — skipping")
                     return {
                         "status": "already_run",
@@ -2440,12 +2611,101 @@ physics_applicable is FALSE for:
                 vehicles = ed.get("vehicles") or {}
                 damage   = ed.get("damage_physics") or {}
 
-            v1_stationary   = bool(vehicles.get("v1_stationary", False))
-            v2_stationary   = bool(vehicles.get("v2_stationary", False))
-            gemini_crush    = damage.get("crush_depth_mm")
-            gemini_angle    = damage.get("approach_angle_deg")
-            gemini_v1_speed = vehicles.get("v1_stated_speed_kmh")
-            gemini_v2_speed = vehicles.get("v2_stated_speed_kmh")
+            v1_stationary    = bool(vehicles.get("v1_stationary", False))
+            v2_stationary    = bool(vehicles.get("v2_stationary", False))
+            narrative_crush  = damage.get("crush_depth_mm")
+            narrative_angle  = damage.get("approach_angle_deg")
+            gemini_crush     = narrative_crush
+            gemini_angle     = narrative_angle
+            gemini_v1_speed  = vehicles.get("v1_stated_speed_kmh")
+            gemini_v2_speed  = vehicles.get("v2_stated_speed_kmh")
+
+            # Assessor's on-site measurements still take priority over
+            # narrative-text inference for the reconstruction run itself
+            # ("measured beats guessed"), but they are NOT blindly trusted --
+            # a colluding assessor can type in whatever number they want, so
+            # every override is cross-checked against (a) what the narrative
+            # independently described and (b) what the trained CV model sees
+            # in the photos, and any material mismatch is recorded rather
+            # than silently discarded.
+            measurement_flags: List[str] = []
+
+            CV_SEVERITY_CRUSH_RANGE_MM = {
+                "low":    (0, 50),
+                "medium": (20, 160),
+                "high":   (120, 380),
+            }
+
+            def _check_crush_vs_cv(crush_mm: float, cv_severity: Optional[str], source_label: str) -> Optional[str]:
+                if crush_mm is None or not cv_severity:
+                    return None
+                lo, hi = CV_SEVERITY_CRUSH_RANGE_MM.get(cv_severity, (0, 400))
+                tolerance = 30
+                if crush_mm < lo - tolerance or crush_mm > hi + tolerance:
+                    return (
+                        f"Claimed crush depth ({crush_mm}mm) is inconsistent with {source_label} "
+                        f"photos, whose CV-detected damage severity ('{cv_severity}') implies "
+                        f"roughly {lo}-{hi}mm"
+                    )
+                return None
+
+            if assessor_crush_depth_mm is not None:
+                logger.info(
+                    f"Crush depth for {claim_id}: assessor measured "
+                    f"{assessor_crush_depth_mm}mm (narrative-extracted: {narrative_crush})"
+                )
+                if narrative_crush:
+                    delta_pct = abs(assessor_crush_depth_mm - narrative_crush) / max(narrative_crush, 1) * 100
+                    if delta_pct > 40:
+                        measurement_flags.append(
+                            f"Assessor-measured crush depth ({assessor_crush_depth_mm}mm) differs "
+                            f"from the narrative's described damage ({narrative_crush}mm) by "
+                            f"{delta_pct:.0f}%"
+                        )
+                member_flag = _check_crush_vs_cv(
+                    assessor_crush_depth_mm, member_cv_severity,
+                    "the member's independently-submitted"
+                )
+                if member_flag:
+                    measurement_flags.append(member_flag)
+                assessor_flag = _check_crush_vs_cv(
+                    assessor_crush_depth_mm, assessor_cv_severity, "the assessor's own"
+                )
+                if assessor_flag:
+                    measurement_flags.append(assessor_flag + " (weaker signal — assessor-supplied photos)")
+                gemini_crush = assessor_crush_depth_mm
+
+            if assessor_approach_angle_deg is not None:
+                logger.info(
+                    f"Approach angle for {claim_id}: assessor measured "
+                    f"{assessor_approach_angle_deg}° (narrative-extracted: {narrative_angle})"
+                )
+                if narrative_angle is not None:
+                    delta_deg = abs(assessor_approach_angle_deg - narrative_angle)
+                    if delta_deg > 45:
+                        measurement_flags.append(
+                            f"Assessor-measured approach angle ({assessor_approach_angle_deg}°) "
+                            f"differs from the narrative's described angle ({narrative_angle}°) "
+                            f"by {delta_deg:.0f}°"
+                        )
+                gemini_angle = assessor_approach_angle_deg
+
+            # Historical pattern check: an assessor whose overrides are
+            # flagged unusually often across their claims is itself a fraud
+            # signal, independent of whether any single claim looks OK.
+            if measurement_flags and assessor_id:
+                track = db_manager.get_assessor_track_record(assessor_id)
+                if track["total_assessed_claims"] >= 3 and track["flagged_rate_pct"] >= 30:
+                    measurement_flags.append(
+                        f"Assessor {assessor_id} pattern risk: "
+                        f"{track['flagged_measurement_discrepancies']}/{track['total_assessed_claims']} "
+                        f"of their prior assessed claims ({track['flagged_rate_pct']}%) had a "
+                        f"measurement-discrepancy flag — recommend supervisor review"
+                    )
+
+            if measurement_flags:
+                for flag in measurement_flags:
+                    logger.warning(f"Measurement discrepancy for {claim_id}: {flag}")
 
             v1_speed = 0.0 if v1_stationary else float(gemini_v1_speed or 0)
             v2_speed = 0.0 if v2_stationary else float(gemini_v2_speed or 0)
@@ -2486,6 +2746,9 @@ physics_applicable is FALSE for:
                     f"(not inferred from narrative)"
                 )
 
+            for flag in measurement_flags:
+                physics_input.warnings.append(f"⚠️ MEASUREMENT DISCREPANCY: {flag}")
+
             # ── Step 5: Post-hoc overrides ────────────────────────────────────────
             if not gemini_crush:
                 physics_input.crush_depth_mm = 0.0
@@ -2495,8 +2758,9 @@ physics_applicable is FALSE for:
                     f"Assessor measurement required."
                 )
             else:
+                crush_source = "assessor measurement" if assessor_crush_depth_mm is not None else "Gemini extraction"
                 logger.info(
-                    f"Crush depth from Gemini: {gemini_crush}mm for {claim_id}"
+                    f"Crush depth from {crush_source}: {gemini_crush}mm for {claim_id}"
                 )
 
             if v2_stationary:
@@ -2531,8 +2795,9 @@ physics_applicable is FALSE for:
                     w for w in physics_input.warnings
                     if "Approach angle inferred" not in w
                 ]
+                angle_source = "assessor measurement" if assessor_approach_angle_deg is not None else "Gemini extraction"
                 physics_input.warnings.append(
-                    f"Approach angle from Gemini extraction: {gemini_angle}°"
+                    f"Approach angle from {angle_source}: {gemini_angle}°"
                 )
 
             logger.info(
@@ -2698,12 +2963,13 @@ physics_applicable is FALSE for:
                 cursor = conn.cursor()
                 cursor.execute('''
                     UPDATE claims SET
-                        physics_fraud_score    = ?,
-                        physics_verdict        = ?,
-                        physics_result         = ?,
-                        reconstruction_pathway = ?,
-                        physics_timeline       = ?,
-                        simulation_video_path  = ?
+                        physics_fraud_score         = ?,
+                        physics_verdict              = ?,
+                        physics_result               = ?,
+                        reconstruction_pathway        = ?,
+                        physics_timeline              = ?,
+                        simulation_video_path         = ?,
+                        measurement_discrepancy_flag  = ?
                     WHERE claim_id = ?
                 ''', (
                     result.physics_fraud_score,
@@ -2712,6 +2978,7 @@ physics_applicable is FALSE for:
                     result.pathway,
                     _json.dumps(timeline_output) if timeline_output else None,
                     video_path,
+                    1 if measurement_flags else 0,
                     claim_id,
                 ))
                 conn.commit()
@@ -2733,6 +3000,8 @@ physics_applicable is FALSE for:
                 "simulation_method":   result.simulation_method,
                 "inconsistencies":     result.inconsistencies,
                 "warnings":            physics_input.warnings,
+                "measurement_flags":   measurement_flags,
+                "has_measurement_discrepancy": bool(measurement_flags),
                 "timeline":            timeline_output,
                 "simulation_video_path": video_path,
                 # Claimed-vs-reconstructed comparison data -- computed by
@@ -2765,14 +3034,18 @@ physics_applicable is FALSE for:
                     "v1_speed_confidence": result.v1_speed_confidence,
                 },
                 "data_sources": {
-                    "crush_depth":    "gemini_extracted" if gemini_crush else "not_available",
+                    "crush_depth":    "assessor_measured" if assessor_crush_depth_mm is not None else (
+                                      "gemini_extracted" if gemini_crush else "not_available"
+                                      ),
                     "v1_speed":       "stationary_override" if v1_stationary else (
                                       "gemini_extracted" if gemini_v1_speed else "keyword_inferred"
                                       ),
                     "v2_speed":       "stationary_override" if v2_stationary else (
                                       "gemini_extracted" if gemini_v2_speed else "keyword_inferred"
                                       ),
-                    "approach_angle": "gemini_extracted" if gemini_angle is not None else "keyword_inferred",
+                    "approach_angle": "assessor_measured" if assessor_approach_angle_deg is not None else (
+                                      "gemini_extracted" if gemini_angle is not None else "keyword_inferred"
+                                      ),
                     "v1_vehicle":     "gemini_extracted" if vehicles.get("v1_make") else "keyword_inferred",
                     "v2_vehicle":     "gemini_extracted" if vehicles.get("v2_make") else "keyword_inferred",
                     "mchenry_ran":    gemini_crush is not None,
@@ -2978,6 +3251,7 @@ physics_applicable is FALSE for:
         physics_summary: Dict[str, Any],
         cross_party_check: Dict[str, Any],
         risk_result: RiskScoringSchema,
+        business_rules_result: Optional["business_rules.BusinessRulesResult"] = None,
     ) -> Dict[str, Any]:
         """
         Consolidates Narrative Intelligence + Computer Vision + Physics &
@@ -3009,6 +3283,10 @@ physics_applicable is FALSE for:
         physics_verdict = physics_summary.get("physics_verdict", "UNKNOWN")
         physics_score = physics_summary.get("physics_fraud_score", 0)
 
+        business_rules_section = (
+            business_rules_result.observation_text if business_rules_result else "Not evaluated."
+        )
+
         user_text = f"""CLAIM {claim_id}
 Estimated cost: KES {estimated_cost:,.0f}
 Location: {location}
@@ -3027,6 +3305,9 @@ Cross-validation & Risk Intelligence: inconsistencies_found={cross_party_check.g
 cross_party_risk_score={cross_party_check.get('cross_party_risk_score', 0)}/100, \
 inconsistency_count={cross_party_check.get('inconsistency_count', 0)}
 
+Business Rules Engine findings:
+{business_rules_section}
+
 Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result.risk_level.value})
 """
 
@@ -3037,6 +3318,7 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
                 system=self.AI_ADVISORY_SYSTEM_PROMPT, timeout=90,
             )
             advisory["source"] = "claims-advisory-v1"
+            advisory["business_rules_observation"] = business_rules_section
             logger.info(f"✅ AI Advisory generated for {claim_id}: {advisory.get('recommended_action')}")
             return advisory
         except Exception as e:
@@ -3049,6 +3331,7 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
                     f"{cross_party_check.get('inconsistency_count', 0)} cross-party inconsistencies"
                     if cross_party_check.get("inconsistencies_found") else "None"
                 ),
+                "business_rules_observation": business_rules_section,
                 "early_risk_indicator": risk_result.risk_level.value.capitalize(),
                 "confidence": 0.5,
                 "recommended_action": "Refer for Manual Review",

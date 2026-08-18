@@ -110,7 +110,132 @@ class DatabaseManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_ai_rol_claim_id ON ai_rol_records (claim_id)
             ''')
+
+            # claim_assignments predates this DatabaseManager class (created by
+            # an earlier seed/migration script) and has no inspection_location
+            # column -- the assessor's chosen inspection venue was previously
+            # only ever string-concatenated into `notes`, making it
+            # unqueryable. ALTER TABLE ADD COLUMN has no "IF NOT EXISTS" in
+            # SQLite, so this is guarded instead -- safe to run on every startup.
+            try:
+                cursor.execute('ALTER TABLE claim_assignments ADD COLUMN inspection_location TEXT')
+                conn.commit()
+                logger.info("Added inspection_location column to claim_assignments")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
+            # Marks whether physics reconstruction found an assessor's
+            # measured crush depth/angle to be materially inconsistent with
+            # the narrative-extracted value or the CV-detected photo
+            # severity -- used to build a per-assessor historical flag rate
+            # (get_assessor_track_record) as a collusion-pattern signal.
+            try:
+                cursor.execute('ALTER TABLE claims ADD COLUMN measurement_discrepancy_flag INTEGER DEFAULT 0')
+                conn.commit()
+                logger.info("Added measurement_discrepancy_flag column to claims")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
             self.create_photo_storage_table()
+            self.create_document_storage_table()
+
+            # Lets the member/assessor who uploaded a document correct fields
+            # OCR got wrong -- original raw_text/parsed_fields are never
+            # overwritten (kept as the OCR ground truth for audit), the
+            # correction is stored alongside it so admin can see both and a
+            # self-serving "correction" that changes a fraud-relevant field
+            # (e.g. an OB number) is visible, not silently trusted.
+            for column, coltype in (
+                ("corrected_fields", "TEXT"),
+                ("corrected_by", "TEXT"),
+                ("corrected_at", "TIMESTAMP"),
+            ):
+                try:
+                    cursor.execute(f'ALTER TABLE claim_documents ADD COLUMN {column} {coltype}')
+                    conn.commit()
+                    logger.info(f"Added {column} column to claim_documents")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "no such table" not in msg:
+                        raise
+
+            # Claims analysts -- Old Mutual staff who file a claim on a
+            # member's behalf (e.g. taken over the phone), as distinct from
+            # a member self-filing through their own app session.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analysts (
+                    analyst_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL UNIQUE,
+                    phone TEXT NOT NULL,
+                    department TEXT,
+                    active_status INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Traces who actually filed a claim -- a member through their
+            # own session, or a staff analyst on the member's behalf (e.g.
+            # phoned-in claims). Both filed_via values coexist with the
+            # existing member_id/policy_id columns, which always identify
+            # whose claim it is regardless of who typed it in.
+            for column, coltype in (
+                ("filed_by_analyst_id", "TEXT"),
+                ("filed_via", "TEXT DEFAULT 'member_self'"),
+            ):
+                try:
+                    cursor.execute(f'ALTER TABLE claims ADD COLUMN {column} {coltype}')
+                    conn.commit()
+                    logger.info(f"Added {column} column to claims")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "no such table" not in msg:
+                        raise
+
+            # Final human triage decision on a claim -- PAY / DENY / ESCALATE.
+            # `final_assessment.decision` in the admin full-report is a
+            # recomputed AI suggestion (never persisted); this table is the
+            # actual recorded business outcome, distinct from AI-ROL's
+            # proceed/clarify/escalate/override vocabulary (which is about
+            # how a handler treats one AI recommendation, not the claim's
+            # final disposition). One claim can be re-decided (e.g. an
+            # escalation later resolved to pay/deny), so this is append-only
+            # -- callers read the latest row per claim_id.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS claim_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    claim_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,          -- PAY, DENY, ESCALATE
+                    reason TEXT,
+                    payout_amount REAL,
+                    decided_by TEXT NOT NULL,
+                    decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (claim_id) REFERENCES claims (claim_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_claim_decisions_claim_id ON claim_decisions (claim_id)
+            ''')
+
+            # Tracks who actually uploaded a photo (member_id or analyst_id),
+            # distinct from `party` (which stays 'member' even when an
+            # analyst adds photos on a member's behalf) -- needed for the
+            # add-photos-to-an-existing-claim flow.
+            try:
+                cursor.execute('ALTER TABLE claim_photo_files ADD COLUMN uploaded_by TEXT')
+                conn.commit()
+                logger.info("Added uploaded_by column to claim_photo_files")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
+            self.populate_sample_analysts(conn)
+
             conn.commit()
             logger.info("Database initialized successfully")
     
@@ -531,6 +656,29 @@ class DatabaseManager:
             logger.error(f"Error retrieving member policies: {str(e)}")
             return []
     
+    def search_members(self, query: str, limit: int = 10) -> List[Dict]:
+        """
+        Look up members by partial name, phone, email, or exact member_id --
+        needed for an analyst filing a claim on behalf of a caller, who
+        won't know their own member_id. Self-filing members never need this
+        (they're already logged in as themselves).
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                like = f"%{query}%"
+                cursor.execute('''
+                    SELECT member_id, name, email, phone
+                    FROM members
+                    WHERE member_id = ? OR name LIKE ? OR phone LIKE ? OR email LIKE ?
+                    ORDER BY name
+                    LIMIT ?
+                ''', (query, like, like, like, limit))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error searching members for '{query}': {str(e)}")
+            return []
+
     def store_coverage_check(self, coverage_result: Dict) -> bool:
         """Store coverage check result for audit trail"""
         try:
@@ -941,6 +1089,7 @@ class DatabaseManager:
                 ca.assigned_at,
                 ca.status as assignment_status,
                 ca.inspection_date,
+                ca.inspection_location,
                 c.location,
                 c.estimated_cost,
                 c.fraud_risk_score,
@@ -967,9 +1116,48 @@ class DatabaseManager:
         claims = []
         for row in cursor.fetchall():
             claims.append(dict(row))
-        
+
         return claims
 
+    def get_assessor_track_record(self, assessor_id: str) -> Dict[str, Any]:
+        """
+        Historical measurement-discrepancy rate for an assessor, across every
+        claim they've assessed that physics has actually run on. Used as a
+        collusion-pattern signal: a single flagged claim might be a genuine
+        edge case, but an assessor whose overrides are flagged unusually
+        often, across many claims, is a fraud signal in its own right.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT c.physics_fraud_score, c.measurement_discrepancy_flag
+                    FROM claims c
+                    JOIN claim_assignments ca ON c.claim_id = ca.claim_id
+                    WHERE ca.assessor_id = ? AND c.physics_fraud_score IS NOT NULL
+                ''', (assessor_id,))
+                rows = cursor.fetchall()
+
+            total = len(rows)
+            flagged = sum(1 for r in rows if r["measurement_discrepancy_flag"])
+            avg_fraud_score = (sum(r["physics_fraud_score"] or 0 for r in rows) / total) if total else 0.0
+
+            return {
+                "assessor_id": assessor_id,
+                "total_assessed_claims": total,
+                "flagged_measurement_discrepancies": flagged,
+                "flagged_rate_pct": round(flagged / total * 100, 1) if total else 0.0,
+                "avg_physics_fraud_score": round(avg_fraud_score, 1),
+            }
+        except Exception as e:
+            logger.error(f"Error computing assessor track record for {assessor_id}: {str(e)}")
+            return {
+                "assessor_id": assessor_id,
+                "total_assessed_claims": 0,
+                "flagged_measurement_discrepancies": 0,
+                "flagged_rate_pct": 0.0,
+                "avg_physics_fraud_score": 0.0,
+            }
 
     def update_assignment_status(
         self,
@@ -977,12 +1165,13 @@ class DatabaseManager:
         assignment_id: str,
         status: str,
         inspection_date: str = None,
-        notes: str = None
+        notes: str = None,
+        inspection_location: str = None
     ):
         """Update claim assignment status"""
-        
+
         cursor = conn.cursor()
-        
+
         if status == 'completed':
             cursor.execute('''
                 UPDATE claim_assignments
@@ -991,7 +1180,7 @@ class DatabaseManager:
                     notes = ?
                 WHERE assignment_id = ?
             ''', (status, notes, assignment_id))
-            
+
             # Decrease assessor workload
             cursor.execute('''
                 UPDATE assessors
@@ -1001,15 +1190,16 @@ class DatabaseManager:
                     SELECT assessor_id FROM claim_assignments WHERE assignment_id = ?
                 )
             ''', (assignment_id,))
-            
+
         elif inspection_date:
             cursor.execute('''
                 UPDATE claim_assignments
                 SET status = ?,
                     inspection_date = ?,
-                    notes = ?
+                    notes = ?,
+                    inspection_location = ?
                 WHERE assignment_id = ?
-            ''', (status, inspection_date, notes, assignment_id))
+            ''', (status, inspection_date, notes, inspection_location, assignment_id))
         else:
             cursor.execute('''
                 UPDATE claim_assignments
@@ -1017,7 +1207,7 @@ class DatabaseManager:
                     notes = ?
                 WHERE assignment_id = ?
             ''', (status, notes, assignment_id))
-        
+
         conn.commit()
         logger.info(f"✅ Assignment {assignment_id} status → {status}")
 
@@ -1054,19 +1244,165 @@ class DatabaseManager:
             
             conn.commit()
             logger.info("✅ Photo storage table created/verified")
-    
+
+    def create_document_storage_table(self):
+        """
+        Create table for storing supporting documents (police abstracts, ID
+        documents, garage quotes) and their OCR-extracted data, uploaded by
+        either the member or the assessor.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS claim_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id TEXT NOT NULL,
+                    party TEXT NOT NULL,  -- 'member', 'assessor', 'repair_shop'
+                    document_type TEXT NOT NULL,  -- 'police_abstract', 'id_document', 'garage_quote', 'other'
+                    filename TEXT NOT NULL,
+                    file_data BLOB,
+                    content_type TEXT DEFAULT 'image/jpeg',
+                    raw_text TEXT,
+                    parsed_fields TEXT,  -- JSON string
+                    extraction_confidence REAL DEFAULT 0,
+                    extraction_method TEXT,
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (claim_id) REFERENCES claims(claim_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_document_claim
+                ON claim_documents(claim_id)
+            ''')
+
+            conn.commit()
+            logger.info("✅ Document storage table created/verified")
+
+    def store_document(
+        self,
+        claim_id: str,
+        party: str,
+        document_type: str,
+        filename: str,
+        file_data: bytes,
+        ocr_result: Dict[str, Any],
+        content_type: str = 'image/jpeg',
+    ) -> int:
+        """Store an uploaded document plus its OCR extraction result."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO claim_documents
+                    (claim_id, party, document_type, filename, file_data, content_type,
+                     raw_text, parsed_fields, extraction_confidence, extraction_method)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    claim_id, party, document_type, filename, file_data, content_type,
+                    ocr_result.get("raw_text", ""),
+                    json.dumps(ocr_result.get("parsed_fields", {}), ensure_ascii=False),
+                    ocr_result.get("extraction_confidence", 0),
+                    ocr_result.get("extraction_method", "unknown"),
+                ))
+                conn.commit()
+                doc_id = cursor.lastrowid
+                logger.info(
+                    f"💾 Stored document: {filename} ({document_type}) for {party} "
+                    f"in claim {claim_id} (ID: {doc_id}, confidence: {ocr_result.get('extraction_confidence', 0)}%)"
+                )
+                return doc_id
+        except Exception as e:
+            logger.error(f"❌ Error storing document {filename}: {str(e)}")
+            raise
+
+    def get_documents_by_claim(self, claim_id: str, party: Optional[str] = None) -> List[Dict]:
+        """Retrieve all documents (with parsed OCR data) for a claim, optionally filtered by party."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                query = '''
+                    SELECT id, claim_id, party, document_type, filename, raw_text,
+                           parsed_fields, extraction_confidence, extraction_method, uploaded_at,
+                           corrected_fields, corrected_by, corrected_at
+                    FROM claim_documents
+                    WHERE claim_id = ?
+                '''
+                params = [claim_id]
+                if party:
+                    query += ' AND party = ?'
+                    params.append(party)
+                query += ' ORDER BY uploaded_at ASC'
+
+                cursor.execute(query, params)
+                documents = []
+                for row in cursor.fetchall():
+                    doc = dict(row)
+                    try:
+                        doc['parsed_fields'] = json.loads(doc['parsed_fields']) if doc['parsed_fields'] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        doc['parsed_fields'] = {}
+                    try:
+                        doc['corrected_fields'] = json.loads(doc['corrected_fields']) if doc['corrected_fields'] else None
+                    except (json.JSONDecodeError, TypeError):
+                        doc['corrected_fields'] = None
+                    documents.append(doc)
+
+                return documents
+        except Exception as e:
+            logger.error(f"❌ Error retrieving documents for claim {claim_id}: {str(e)}")
+            return []
+
+    def get_document_by_id(self, document_id: int) -> Optional[Dict]:
+        """Fetch a single document row (for ownership checks before allowing a correction)."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT id, claim_id, party, document_type, filename FROM claim_documents WHERE id = ?',
+                    (document_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Error fetching document {document_id}: {str(e)}")
+            return None
+
+    def correct_document_fields(self, document_id: int, corrected_fields: Dict[str, Any], corrected_by: str) -> bool:
+        """
+        Store a human correction to a document's OCR-extracted fields.
+        The original raw_text/parsed_fields columns are left untouched --
+        the correction is stored separately so a reviewer can always see
+        what OCR actually read versus what the uploader says it should be.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE claim_documents
+                    SET corrected_fields = ?, corrected_by = ?, corrected_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (json.dumps(corrected_fields, ensure_ascii=False), corrected_by, document_id))
+                conn.commit()
+                logger.info(f"✏️ Document {document_id} fields corrected by {corrected_by}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"❌ Error correcting document {document_id}: {str(e)}")
+            raise
+
     def store_photo_file(
-        self, 
-        claim_id: str, 
-        filename: str, 
-        party: str, 
+        self,
+        claim_id: str,
+        filename: str,
+        party: str,
         file_data: bytes,
         file_hash: Optional[str] = None,
-        content_type: str = 'image/jpeg'
+        content_type: str = 'image/jpeg',
+        uploaded_by: Optional[str] = None,
     ) -> int:
         """
         Store photo file in database with party tracking
-        
+
         Args:
             claim_id: Claim identifier
             filename: Original filename
@@ -1074,7 +1410,12 @@ class DatabaseManager:
             file_data: Raw photo bytes
             file_hash: Optional perceptual hash (will compute if not provided)
             content_type: MIME type
-            
+            uploaded_by: member_id or analyst_id of whoever actually did the
+                upload -- distinct from `party`, since an analyst adding
+                photos on a member's behalf still counts as the member's
+                evidence (party='member') but isn't literally the member
+                doing the uploading.
+
         Returns:
             Photo ID
         """
@@ -1082,26 +1423,26 @@ class DatabaseManager:
             # Compute hash if not provided
             if not file_hash:
                 file_hash = hashlib.md5(file_data).hexdigest()
-            
+
             file_size = len(file_data)
-            
+
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 # Insert or replace (handles duplicates)
                 cursor.execute('''
-                    INSERT OR REPLACE INTO claim_photo_files 
-                    (claim_id, filename, party, file_data, file_hash, file_size, content_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (claim_id, filename, party, file_data, file_hash, file_size, content_type))
-                
+                    INSERT OR REPLACE INTO claim_photo_files
+                    (claim_id, filename, party, file_data, file_hash, file_size, content_type, uploaded_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (claim_id, filename, party, file_data, file_hash, file_size, content_type, uploaded_by))
+
                 conn.commit()
                 photo_id = cursor.lastrowid
-                
+
                 logger.info(f"💾 Stored photo: {filename} for {party} in claim {claim_id} (ID: {photo_id}, Size: {file_size:,} bytes)")
-                
+
                 return photo_id
-                
+
         except Exception as e:
             logger.error(f"❌ Error storing photo {filename}: {str(e)}")
             raise
@@ -1147,6 +1488,31 @@ class DatabaseManager:
             logger.error(f"❌ Error retrieving photos for claim {claim_id}, party {party}: {str(e)}")
             return []
     
+    def get_photos_metadata_by_claim(self, claim_id: str, party: Optional[str] = None) -> List[Dict]:
+        """
+        Lightweight photo listing (no file_data blob) for the
+        add-photos-to-an-existing-claim flow -- callers that need the raw
+        bytes should use get_all_photos_by_claim instead.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                query = '''
+                    SELECT id, claim_id, filename, party, file_size, content_type, uploaded_at, uploaded_by
+                    FROM claim_photo_files
+                    WHERE claim_id = ?
+                '''
+                params = [claim_id]
+                if party:
+                    query += ' AND party = ?'
+                    params.append(party)
+                query += ' ORDER BY uploaded_at ASC'
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching photo metadata for claim {claim_id}: {str(e)}")
+            return []
+
     def get_all_photos_by_claim(self, claim_id: str) -> Dict[str, List[Dict]]:
         """
         Retrieve ALL photos for a claim, grouped by party
@@ -1399,6 +1765,99 @@ class DatabaseManager:
         conn.commit()
         logger.info(f"✅ Populated {len(assessors)} sample assessors")
 
+    def populate_sample_analysts(self, conn: sqlite3.Connection):
+        """Populate database with sample claims analysts"""
+        analysts = [
+            {"analyst_id": "ANL001", "name": "Susan Achieng", "email": "s.achieng@oldmutual.co.ke", "phone": "0711000201", "department": "Motor Claims"},
+            {"analyst_id": "ANL002", "name": "Brian Otieno", "email": "b.otieno@oldmutual.co.ke", "phone": "0711000202", "department": "Motor Claims"},
+            {"analyst_id": "ANL003", "name": "Faith Chebet", "email": "f.chebet@oldmutual.co.ke", "phone": "0711000203", "department": "Contact Centre"},
+        ]
+        cursor = conn.cursor()
+        for a in analysts:
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO analysts (analyst_id, name, email, phone, department)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (a['analyst_id'], a['name'], a['email'], a['phone'], a['department']))
+            except Exception as e:
+                logger.error(f"Error inserting analyst {a['analyst_id']}: {str(e)}")
+        conn.commit()
+        logger.info(f"✅ Populated {len(analysts)} sample analysts")
+
+    def get_analyst_claims(self, analyst_id: str) -> List[Dict]:
+        """Claims filed by this analyst on behalf of members (phoned-in claims)."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT c.claim_id, c.member_id, c.location, c.estimated_cost,
+                           c.fraud_risk_score, c.risk_level, c.created_at,
+                           m.name as member_name, m.phone as member_phone
+                    FROM claims c
+                    LEFT JOIN members m ON c.member_id = m.member_id
+                    WHERE c.filed_by_analyst_id = ?
+                    ORDER BY c.created_at DESC
+                ''', (analyst_id,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching claims filed by analyst {analyst_id}: {str(e)}")
+            return []
+
+    def record_claim_decision(
+        self, claim_id: str, decision: str, decided_by: str,
+        reason: Optional[str] = None, payout_amount: Optional[float] = None,
+    ) -> str:
+        """
+        Record a human's final PAY/DENY/ESCALATE call on a claim. Append-only
+        -- a claim can be re-decided later (e.g. an escalation resolved
+        afterward), callers should read the latest row via
+        get_latest_claim_decision.
+        """
+        decision_id = f"DEC-{uuid.uuid4().hex[:12].upper()}"
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO claim_decisions
+                (decision_id, claim_id, decision, reason, payout_amount, decided_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (decision_id, claim_id, decision, reason, payout_amount, decided_by))
+            conn.commit()
+        logger.info(f"⚖️ Claim {claim_id} decision recorded: {decision} by {decided_by}")
+        return decision_id
+
+    def get_latest_claim_decision(self, claim_id: str) -> Optional[Dict]:
+        """Most recent triage decision for a claim, or None if never decided."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT decision_id, claim_id, decision, reason, payout_amount, decided_by, decided_at
+                    FROM claim_decisions
+                    WHERE claim_id = ?
+                    ORDER BY decided_at DESC
+                    LIMIT 1
+                ''', (claim_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error fetching decision for claim {claim_id}: {str(e)}")
+            return None
+
+    def get_claim_decision_history(self, claim_id: str) -> List[Dict]:
+        """Full decision history for a claim, oldest first."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT decision_id, claim_id, decision, reason, payout_amount, decided_by, decided_at
+                    FROM claim_decisions
+                    WHERE claim_id = ?
+                    ORDER BY decided_at ASC
+                ''', (claim_id,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching decision history for claim {claim_id}: {str(e)}")
+            return []
 
     def cleanup_old_data(self, days: int = 30):
         """Clean up old data (useful for maintenance)"""

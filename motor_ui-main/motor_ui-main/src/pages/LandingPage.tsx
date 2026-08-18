@@ -24,6 +24,9 @@ export default function LandingPage() {
           <Link to="/assessor/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-primary text-primary text-sm font-bold transition-transform hover:scale-105 hover:bg-primary/10">
             Assessor Login
           </Link>
+          <Link to="/analyst/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-border text-foreground text-sm font-bold transition-transform hover:scale-105 hover:bg-muted">
+            Analyst Desk
+          </Link>
           <Link to="/admin/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-border text-foreground text-sm font-bold transition-transform hover:scale-105 hover:bg-muted">
             Admin
           </Link>
