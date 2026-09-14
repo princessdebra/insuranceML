@@ -1,11 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import AdminLayout from "@/layouts/AdminLayout";
-import { getClaimFullReport, getSimulationStatus, getClaimDecision, recordClaimDecision, BASE_URL } from "@/lib/api";
+import { getClaimFullReport, getSimulationStatus, explainRiskScore, AiInvestigationSummary, BASE_URL } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
+import PhysicsReconstructionViewer from "@/components/reconstruction/PhysicsReconstructionViewer";
 
 export default function AdminClaimReport() {
   const { claimId } = useParams();
@@ -18,47 +19,14 @@ export default function AdminClaimReport() {
   const [simulationStatus, setSimulationStatus] = useState<any>(null);
   const [loadingSimulation, setLoadingSimulation] = useState(false);
 
-  // Final triage decision (PAY / DENY / ESCALATE) -- the human reviewer's
-  // actual, persisted business call, distinct from the AI's recomputed
-  // "Recommended Action" suggestion shown below.
-  const [decisionAction, setDecisionAction] = useState<"PAY" | "DENY" | "ESCALATE" | null>(null);
-  const [decisionReason, setDecisionReason] = useState("");
-  const [payoutAmount, setPayoutAmount] = useState("");
-  const [submittingDecision, setSubmittingDecision] = useState(false);
-  const [decisionError, setDecisionError] = useState("");
-
-  const submitDecision = async () => {
-    if (!decisionAction || !claimId) return;
-    if ((decisionAction === "DENY" || decisionAction === "ESCALATE") && !decisionReason.trim()) {
-      setDecisionError(`A reason is required to ${decisionAction.toLowerCase()} this claim.`);
-      return;
-    }
-    setSubmittingDecision(true);
-    setDecisionError("");
-    try {
-      const adminId = localStorage.getItem("adminId") || "admin";
-      const res = await recordClaimDecision({
-        claim_id: claimId,
-        decision: decisionAction,
-        decided_by: adminId,
-        reason: decisionReason.trim() || undefined,
-        payout_amount: decisionAction === "PAY" && payoutAmount ? Number(payoutAmount) : undefined,
-      });
-      if (res.success) {
-        const updated = await getClaimDecision(claimId);
-        setReport((prev: any) => ({ ...prev, claim_decision: updated.current_decision }));
-        setDecisionAction(null);
-        setDecisionReason("");
-        setPayoutAmount("");
-      } else {
-        setDecisionError(res.detail || "Could not record decision.");
-      }
-    } catch (e) {
-      setDecisionError("Could not record decision — check your connection.");
-    } finally {
-      setSubmittingDecision(false);
-    }
-  };
+  // AI Investigation Summary -- a structured, plain-English breakdown of
+  // the risk score fetched on demand. Points/impact tiers are computed
+  // deterministically server-side from the same weighted-sum numbers shown
+  // in the raw math panel; the LLM only phrases the reasoning sentences.
+  const [investigationSummary, setInvestigationSummary] = useState<AiInvestigationSummary | null>(null);
+  const [explainingRisk, setExplainingRisk] = useState(false);
+  const [explainError, setExplainError] = useState("");
+  const decisionPanelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!localStorage.getItem("adminId")) {
@@ -66,7 +34,7 @@ export default function AdminClaimReport() {
       return;
     }
     if (claimId) {
-      getClaimFullReport(claimId)
+      getClaimFullReport(claimId, true)
         .then((d) => {
           setReport(d);
           setLoading(false);
@@ -129,6 +97,72 @@ export default function AdminClaimReport() {
   const narrativeIssues = report.fraud_indicators?.narrative_inconsistencies || [];
   const crossPartyIssues = report.fraud_indicators?.cross_party_issues || [];
 
+  // Same deterministic points/impact-tier math the backend uses for the AI
+  // Investigation Summary -- shown as a static visual table immediately
+  // (no AI call needed) so an admin gets the "what mattered" breakdown even
+  // before generating the fuller reasoning.
+  // rb_field pulls the raw 0-100 component score; weightKey pulls the
+  // matching weight from rb.weights_applied -- these two use DIFFERENT
+  // naming schemes in the underlying data (weights_applied uses short keys
+  // like "photo"/"business_rules", scores use "_risk"-suffixed names), so
+  // both are mapped explicitly rather than assumed to match.
+  const RISK_FACTOR_META = [
+    { key: "photo_analysis", rbField: "photo_risk", weightKey: "photo", label: "Photo Analysis", icon: "photo_camera" },
+    { key: "narrative_analysis", rbField: "narrative_risk", weightKey: "narrative", label: "Narrative Analysis", icon: "description" },
+    { key: "business_rules", rbField: "business_rules_risk", weightKey: "business_rules", label: "Business Rules", icon: "rule" },
+    { key: "amount_based", rbField: "amount_risk", weightKey: "amount", label: "Claim Amount", icon: "payments" },
+    { key: "location_based", rbField: "location_risk", weightKey: "location", label: "Location", icon: "location_on" },
+    { key: "historical_patterns", rbField: "historical_risk", weightKey: "historical", label: "Historical Patterns", icon: "history" },
+  ];
+  const staticRiskFactors = RISK_FACTOR_META
+    .map((meta) => {
+      const weight = rb.weights_applied?.[meta.weightKey];
+      const rawScore = rb[meta.rbField];
+      if (weight == null || rawScore == null) return null;
+      const maxPoints = weight * 100;
+      const points = rawScore * weight;
+      // Impact/bar-fill previously used rawScore/100 -- that factor's OWN
+      // 0-100 sub-score, ignoring its weight entirely. A 4%-weighted factor
+      // that happened to max out its own sub-score (e.g. Historical
+      // Patterns at 100/100, worth only 4 of the 100 total points) rendered
+      // as a full-length red bar, visually identical to a 44%-weighted
+      // factor that actually drove the score -- a live claim showed 4 of 6
+      // factors as solid red/amber bars despite only 2 of them mattering.
+      // Basing both on `points` (this factor's actual contribution to the
+      // 100-point total) makes the bar lengths -- and which ones turn red --
+      // reflect what actually moved the score.
+      const impact = points >= 20 ? "high" : points >= 8 ? "medium" : "low";
+      return { key: meta.key, label: meta.label, icon: meta.icon, points, max_points: maxPoints, impact };
+    })
+    .filter((f): f is NonNullable<typeof f> => f !== null)
+    .sort((a, b) => b.points - a.points);
+
+  const explainRisk = async () => {
+    if (!claimId) return;
+    setExplainingRisk(true);
+    setExplainError("");
+    try {
+      const res = await explainRiskScore(claimId, {
+        riskBreakdown: rb,
+        riskLevel: fa.risk_level,
+        decision: fa.decision,
+        photoAnomalyCount: photoAnomalies.length,
+        narrativeIssueCount: narrativeIssues.length,
+        crossPartyIssueCount: crossPartyIssues.length,
+        businessRuleFindings: report.business_rules?.findings || [],
+      });
+      if (res.success) {
+        setInvestigationSummary(res);
+      } else {
+        setExplainError("Couldn't generate an explanation right now.");
+      }
+    } catch {
+      setExplainError("Couldn't generate an explanation right now.");
+    } finally {
+      setExplainingRisk(false);
+    }
+  };
+
   const getSeverityColor = (severity: string) => {
     switch (severity?.toLowerCase()) {
       case "critical":
@@ -147,6 +181,29 @@ export default function AdminClaimReport() {
     }
   };
 
+  // Left-accent + badge-only treatment for the "Why Flagged" reason list --
+  // a full pastel-washed card per row read as loud/alarming at a glance
+  // (everything looks equally "on fire" red/amber); a white card with a
+  // thin colored edge and a small pill keeps severity scannable without
+  // the whole list looking like a warning banner.
+  const getSeverityAccent = (severity: string) => {
+    switch (severity?.toLowerCase()) {
+      case "critical":
+        return { border: "border-l-destructive", badge: "bg-destructive/10 text-destructive" };
+      case "high":
+      case "major":
+        return { border: "border-l-amber-500", badge: "bg-amber-100 text-amber-800" };
+      case "medium":
+      case "moderate":
+        return { border: "border-l-amber-300", badge: "bg-amber-50 text-amber-700" };
+      case "low":
+      case "minor":
+        return { border: "border-l-blue-300", badge: "bg-blue-50 text-blue-700" };
+      default:
+        return { border: "border-l-border", badge: "bg-muted text-muted-foreground" };
+    }
+  };
+
   const getDecisionColor = (decision: string) => {
     switch (decision?.toUpperCase()) {
       case "APPROVE_CLAIM":
@@ -158,6 +215,25 @@ export default function AdminClaimReport() {
       case "DECLINE_CLAIM":
       case "REJECT":
         return "bg-destructive/10 text-destructive border-destructive/20";
+      default:
+        return "bg-muted text-muted-foreground border-border";
+    }
+  };
+
+  // Was previously colored by `decision` (APPROVE/INVESTIGATE/DECLINE) while
+  // labeled with `risk_level` text -- a claim could show a green "LOW RISK
+  // LEVEL" badge next to a red gauge, or vice versa, since decision and
+  // risk_level don't always move together. Color the badge by the same
+  // value it displays.
+  const getRiskLevelColor = (riskLevel: string) => {
+    switch (riskLevel?.toLowerCase()) {
+      case "critical":
+      case "high":
+        return "bg-destructive/10 text-destructive border-destructive/20";
+      case "medium":
+        return "bg-amber-500/10 text-amber-600 border-amber-500/20";
+      case "low":
+        return "bg-primary/10 text-primary border-primary/20";
       default:
         return "bg-muted text-muted-foreground border-border";
     }
@@ -225,82 +301,87 @@ export default function AdminClaimReport() {
     });
   }
 
+  // Shows every reason, not a top-N slice -- this used to cap at 5 and then
+  // get repeated in full (uncapped) further down the page as "Critical
+  // Verification Warnings", plus a third time as "Primary Engine Concerns"
+  // in the Detection Summary card. One complete, ranked list beats three
+  // overlapping partial ones.
   const rankedReasons = topReasons
-    .sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0))
-    .slice(0, 5);
+    .sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
 
   return (
     <AdminLayout>
       <div className="p-8 max-w-7xl mx-auto w-full space-y-8 pb-24">
-        {/* Header Section */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 pb-6 border-b border-border">
-          <div>
-            <nav className="flex mb-2">
+        {/* Header Section -- compact, plain-text title + a single status
+            pill (Minet-reference style: small breadcrumb, modest heading,
+            one quiet pill for state) instead of the previous oversized
+            black title plus a separate bordered "Recommended Action" card
+            and a colored "Assessment Logic" banner card. The full reasoning
+            text still lives in the AI Investigation Summary below -- this
+            header's job is just orientation, not a second findings list. */}
+        <div className="flex flex-col gap-3 pb-6 border-b border-border">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <nav className="flex">
               <ol className="flex items-center space-x-2 text-xs text-muted-foreground">
                 <li><Link to="/admin/dashboard" className="hover:text-primary transition-colors">Dashboard</Link></li>
                 <li><span className="material-symbols-outlined text-[12px]">chevron_right</span></li>
                 <li className="text-primary font-bold">{report.claim_id}</li>
               </ol>
             </nav>
-            <div className="flex items-center gap-3">
-              <h1 className="text-4xl font-black text-foreground tracking-tighter">Claims Forensic Report</h1>
-              <Badge variant="outline" className="font-mono text-xs px-2.5 py-1">
-                Timestamp: {new Date(report.analysis_timestamp).toLocaleString()}
-              </Badge>
-            </div>
-            <p className="text-muted-foreground mt-1 flex items-center gap-2">
-              <span className="material-symbols-outlined text-sm">shield</span>
-              AI Core Security & Fraud Intelligence Division
-            </p>
-          </div>
-          
-          <div className="flex items-center gap-4 bg-card border rounded-2xl p-4 shadow-sm">
-            <div className="text-right">
-              <p className="text-[10px] font-black uppercase text-muted-foreground tracking-widest">Recommended Action</p>
-              <p className="text-lg font-black text-foreground">{fa.decision?.replace(/_/g, " ")}</p>
-            </div>
-            <div className={`px-4 py-2.5 rounded-xl border font-black uppercase tracking-wider text-xs ${getDecisionColor(fa.decision)}`}>
+            <div className={`inline-flex items-center gap-2 self-start sm:self-auto px-3 py-1.5 rounded-full border text-xs font-bold ${getDecisionColor(fa.decision)}`}>
+              <span className="material-symbols-outlined text-[16px]">gavel</span>
+              {fa.decision?.replace(/_/g, " ")}
+              <span className="opacity-50">·</span>
               {fa.risk_level} risk
             </div>
           </div>
-        </div>
 
-        {/* Decision Banner Explanation */}
-        {fa.decision_reason && (
-          <div className={`p-5 rounded-2xl border flex items-start gap-4 ${fa.fraud_risk_score >= 50 ? "bg-destructive/5 border-destructive/20 text-destructive" : "bg-primary/5 border-primary/20 text-primary"}`}>
-            <span className="material-symbols-outlined text-3xl shrink-0 mt-0.5">psychology</span>
+          <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2">
             <div>
-              <p className="text-[10px] font-black uppercase tracking-widest opacity-80">Assessment Logic</p>
-              <p className="text-sm font-bold leading-relaxed mt-1 text-foreground">{fa.decision_reason}</p>
+              <h1 className="text-2xl font-bold text-foreground">Claims Forensic Report</h1>
+              <p className="text-muted-foreground mt-1 text-sm flex items-center gap-1.5">
+                <span className="material-symbols-outlined text-[16px]">shield</span>
+                AI Core Security & Fraud Intelligence Division
+              </p>
             </div>
+            <p className="text-xs text-muted-foreground font-mono">
+              {new Date(report.analysis_timestamp).toLocaleString()}
+            </p>
           </div>
-        )}
+
+          {fa.decision_reason && (
+            <p className="text-sm text-foreground/80 leading-relaxed">{fa.decision_reason}</p>
+          )}
+        </div>
 
         {/* Why This Claim Was Flagged -- consolidated top reasons, ranked by
             severity, pulled from across the report so a reviewer gets the
             headline picture without clicking through every tab. */}
         {rankedReasons.length > 0 ? (
           <Card className="overflow-hidden border-none shadow-sm w-full">
-            <CardHeader className="bg-destructive/5 border-b border-destructive/10">
-              <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-destructive">
-                <span className="material-symbols-outlined">flag</span>
-                Why This Claim Was Flagged — Top {rankedReasons.length} Reason{rankedReasons.length > 1 ? "s" : ""}
+            <CardHeader className="flex-row items-center gap-3 space-y-0 border-b border-border">
+              <span className="material-symbols-outlined text-destructive bg-destructive/10 p-2 rounded-xl text-[20px]">flag</span>
+              <CardTitle className="text-sm font-black uppercase tracking-widest text-foreground">
+                Why This Claim Was Flagged ({rankedReasons.length} Reason{rankedReasons.length > 1 ? "s" : ""})
               </CardTitle>
             </CardHeader>
             <CardContent className="pt-6">
               <div className="space-y-3">
-                {rankedReasons.map((r, idx) => (
-                  <div key={idx} className={`p-4 rounded-xl border flex gap-3 ${getSeverityColor(r.severity)}`}>
-                    <span className="text-sm font-black shrink-0 mt-0.5 opacity-60">#{idx + 1}</span>
-                    <div>
-                      <div className="flex items-center gap-2 mb-0.5">
-                        <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-black/10">{r.severity}</span>
-                        <span className="text-[9px] font-bold uppercase tracking-wide opacity-70">{r.source}</span>
+                {rankedReasons.map((r, idx) => {
+                  const accent = getSeverityAccent(r.severity);
+                  return (
+                    <div key={idx} className={`p-4 rounded-xl border border-border border-l-4 bg-card flex gap-3 ${accent.border}`}>
+                      <span className="size-6 rounded-full bg-muted text-muted-foreground text-xs font-black shrink-0 flex items-center justify-center">{idx + 1}</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full ${accent.badge}`}>{r.severity}</span>
+                          <span className="text-[9px] font-bold uppercase tracking-wide text-muted-foreground">{r.source}</span>
+                        </div>
+                        <p className="text-xs font-semibold leading-relaxed text-foreground/90">{r.message}</p>
                       </div>
-                      <p className="text-xs font-semibold leading-relaxed">{r.message}</p>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </CardContent>
           </Card>
@@ -315,10 +396,10 @@ export default function AdminClaimReport() {
             call. Distinct from `final_assessment.decision` above, which is
             only ever a freshly recomputed AI suggestion and was never
             written to the database before this. */}
-        <Card className="overflow-hidden border-none shadow-sm w-full">
-          <CardHeader className="bg-foreground/[0.03] border-b border-border">
-            <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-foreground">
-              <span className="material-symbols-outlined">gavel</span>
+        <Card ref={decisionPanelRef} className="overflow-hidden border-none shadow-sm w-full">
+          <CardHeader className="flex-row items-center gap-3 space-y-0 border-b border-border">
+            <span className="material-symbols-outlined text-foreground bg-muted p-2 rounded-xl text-[20px]">gavel</span>
+            <CardTitle className="text-sm font-black uppercase tracking-widest text-foreground">
               Final Triage Decision
             </CardTitle>
           </CardHeader>
@@ -349,79 +430,11 @@ export default function AdminClaimReport() {
                     <p className="text-xs text-foreground/80 mt-2 italic">"{report.claim_decision.reason}"</p>
                   )}
                 </div>
-                <Button size="sm" variant="outline" className="text-xs" onClick={() => setDecisionAction("PAY")}>
-                  Re-decide
-                </Button>
               </div>
             ) : (
-              <p className="text-xs text-muted-foreground">No decision has been recorded for this claim yet.</p>
-            )}
-
-            {decisionAction ? (
-              <div className="p-4 rounded-xl border border-border bg-muted/20 space-y-3">
-                <p className="text-xs font-black uppercase tracking-wide text-foreground">
-                  Recording: <span className={
-                    decisionAction === "PAY" ? "text-emerald-600" : decisionAction === "DENY" ? "text-destructive" : "text-amber-600"
-                  }>{decisionAction}</span>
-                </p>
-                {decisionAction === "PAY" && (
-                  <div>
-                    <label className="text-[10px] font-black uppercase text-muted-foreground block mb-1">Payout Amount (KES, optional)</label>
-                    <input
-                      type="number"
-                      className="w-full text-sm border border-border rounded-lg px-3 py-2 bg-card"
-                      value={payoutAmount}
-                      onChange={(e) => setPayoutAmount(e.target.value)}
-                      placeholder="e.g. 250000"
-                    />
-                  </div>
-                )}
-                <div>
-                  <label className="text-[10px] font-black uppercase text-muted-foreground block mb-1">
-                    Reason {decisionAction !== "PAY" ? "(required)" : "(optional)"}
-                  </label>
-                  <textarea
-                    className="w-full text-sm border border-border rounded-lg px-3 py-2 bg-card min-h-[70px]"
-                    value={decisionReason}
-                    onChange={(e) => setDecisionReason(e.target.value)}
-                    placeholder={decisionAction === "DENY" ? "Why is this claim being denied?" : decisionAction === "ESCALATE" ? "Why does this need investigation?" : "Any notes for the record..."}
-                  />
-                </div>
-                {decisionError && <p className="text-xs text-destructive font-semibold">{decisionError}</p>}
-                <div className="flex gap-2">
-                  <Button size="sm" disabled={submittingDecision} onClick={submitDecision} className="font-bold">
-                    {submittingDecision ? "Recording..." : `Confirm ${decisionAction}`}
-                  </Button>
-                  <Button size="sm" variant="outline" disabled={submittingDecision} onClick={() => { setDecisionAction(null); setDecisionError(""); }}>
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-wrap gap-3">
-                <Button
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center gap-2"
-                  onClick={() => setDecisionAction("PAY")}
-                >
-                  <span className="material-symbols-outlined text-[18px]">paid</span>
-                  Pay Claim
-                </Button>
-                <Button
-                  variant="destructive"
-                  className="font-bold flex items-center gap-2"
-                  onClick={() => setDecisionAction("DENY")}
-                >
-                  <span className="material-symbols-outlined text-[18px]">block</span>
-                  Deny Claim
-                </Button>
-                <Button
-                  className="bg-amber-500 hover:bg-amber-600 text-white font-bold flex items-center gap-2"
-                  onClick={() => setDecisionAction("ESCALATE")}
-                >
-                  <span className="material-symbols-outlined text-[18px]">priority_high</span>
-                  Escalate to SIU
-                </Button>
-              </div>
+              <p className="text-xs text-muted-foreground">
+                No decision has been recorded for this claim yet -- triage (PAY / DENY / ESCALATE) is recorded by the assigned claims analyst.
+              </p>
             )}
           </CardContent>
         </Card>
@@ -460,41 +473,95 @@ export default function AdminClaimReport() {
               <div className="flex flex-col gap-6 w-full">
                 
                 {/* Overall Score */}
-                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
-                  <div>
-                    <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-4 flex items-center gap-1">
-                      <span className="material-symbols-outlined text-sm">speed</span>
-                      Overall Score Index
-                    </h4>
-                    <div className="flex flex-col md:flex-row items-center gap-6 py-2">
-                      <div className="relative size-28 shrink-0">
-                        <svg className="size-full -rotate-90" viewBox="0 0 36 36">
-                          <path d="M18 2.0845a 15.9155 15.9155 0 0 1 0 31.831a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="hsl(var(--muted))" strokeWidth="3.5" />
-                          <path d="M18 2.0845a 15.9155 15.9155 0 0 1 0 31.831a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke={rb.overall_score >= 70 ? "hsl(var(--destructive))" : rb.overall_score >= 50 ? "#f59e0b" : "hsl(var(--primary))"} strokeWidth="3.5" strokeDasharray={`${rb.overall_score}, 100`} />
-                        </svg>
-                        <div className="absolute inset-0 flex flex-col items-center justify-center">
-                          <span className="text-3xl font-black text-foreground leading-none">{rb.overall_score}</span>
-                          <span className="text-[9px] font-bold text-muted-foreground uppercase mt-0.5">Risk</span>
-                        </div>
-                      </div>
-                      <div className="space-y-2 flex-1">
-                        <span className={`text-[10px] font-black uppercase px-2.5 py-1 rounded-full ${getDecisionColor(fa.decision)}`}>
-                          {fa.risk_level} RISK LEVEL
-                        </span>
-                        <p className="text-xs text-muted-foreground leading-relaxed font-medium">
-                          Calculated recursively based on photo, narrative alignment, physical rules, and historical trends.
-                        </p>
+                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-5 w-full">
+                  <div className="flex items-center gap-3">
+                    <span className="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-xl text-[20px]">speed</span>
+                    <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest">Overall Score Index</h4>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-center gap-6">
+                    <div className="relative size-28 shrink-0">
+                      <svg className="size-full -rotate-90" viewBox="0 0 36 36">
+                        <path d="M18 2.0845a 15.9155 15.9155 0 0 1 0 31.831a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="hsl(var(--muted))" strokeWidth="3" />
+                        <path d="M18 2.0845a 15.9155 15.9155 0 0 1 0 31.831a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke={rb.overall_score >= 70 ? "hsl(var(--destructive))" : rb.overall_score >= 50 ? "#f59e0b" : "hsl(var(--primary))"} strokeWidth="3" strokeLinecap="round" strokeDasharray={`${rb.overall_score}, 100`} />
+                      </svg>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center">
+                        <span className="text-3xl font-black text-foreground leading-none tabular-nums">{rb.overall_score}</span>
+                        <span className="text-[9px] font-bold text-muted-foreground uppercase mt-0.5">/ 100</span>
                       </div>
                     </div>
+                    <div className="space-y-2 flex-1 text-center sm:text-left">
+                      <span className={`inline-block text-[10px] font-black uppercase px-2.5 py-1 rounded-full border ${getRiskLevelColor(fa.risk_level)}`}>
+                        {fa.risk_level} risk level
+                      </span>
+                      <p className="text-xs text-muted-foreground leading-relaxed font-medium">
+                        Calculated from photo analysis, narrative alignment, business rules, claim amount, location, and historical patterns -- see the breakdown below for what actually drove this score.
+                      </p>
+                    </div>
                   </div>
-                  
-                  <div className="pt-4 border-t border-dashed border-border bg-muted/20 p-4 rounded-xl">
-                    <p className="text-[10px] font-black uppercase text-muted-foreground tracking-widest mb-1.5">Algorithmic Math Explanation</p>
-                    <p className="text-xs text-foreground/80 leading-relaxed font-medium italic">
+
+                  <details className="group rounded-xl border border-border/60 bg-muted/20">
+                    <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-[10px] font-black uppercase text-muted-foreground tracking-widest">
+                      Algorithmic Math Explanation
+                      <span className="material-symbols-outlined text-[16px] transition-transform group-open:rotate-180">expand_more</span>
+                    </summary>
+                    <p className="px-4 pb-4 text-xs text-foreground/80 leading-relaxed font-medium">
                       {rb.explanation}
                     </p>
+                  </details>
+
+                  <div className="pt-1">
+                    <p className="text-[10px] font-black uppercase text-muted-foreground tracking-widest mb-3">How the Risk Score Was Determined</p>
+                    <div className="space-y-3">
+                      {staticRiskFactors.map((f) => (
+                        <div key={f.key} className="flex items-center gap-3">
+                          <span className="material-symbols-outlined text-[16px] text-muted-foreground w-5 shrink-0">{f.icon}</span>
+                          <span className="text-xs font-semibold text-foreground w-32 shrink-0 truncate">{f.label}</span>
+                          <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${f.impact === "high" ? "bg-destructive" : f.impact === "medium" ? "bg-amber-500" : "bg-primary/50"}`}
+                              style={{ width: `${Math.min(100, f.points)}%` }}
+                            />
+                          </div>
+                          <span className="text-xs font-bold text-foreground tabular-nums w-20 text-right shrink-0">{f.points.toFixed(1)} pts</span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-4 pt-3 border-t border-dashed border-border font-semibold">
+                      Total Risk Score: <span className="text-foreground font-black">{rb.overall_score} / 100</span>
+                    </p>
                   </div>
+
+                  {!investigationSummary && (
+                    <div className="rounded-xl border border-primary/20 bg-primary/5 p-4">
+                      {!explainingRisk ? (
+                        <button onClick={explainRisk} className="flex items-center gap-2 text-xs font-bold text-primary hover:underline">
+                          <span className="material-symbols-outlined text-[18px]">auto_awesome</span>
+                          Generate AI Investigation Summary
+                        </button>
+                      ) : (
+                        <p className="flex items-center gap-2 text-xs font-semibold text-primary animate-pulse">
+                          <span className="material-symbols-outlined text-[18px]">auto_awesome</span>
+                          Analyzing this claim...
+                        </p>
+                      )}
+                      {explainError && <p className="text-xs text-destructive font-semibold mt-1">{explainError}</p>}
+                    </div>
+                  )}
                 </div>
+
+                {investigationSummary && (
+                  <InvestigationSummaryCard
+                    summary={investigationSummary}
+                    detailsByFactor={{
+                      photo_analysis: photoAnomalies,
+                      narrative_analysis: narrativeIssues,
+                      business_rules: report.business_rules?.findings || [],
+                    }}
+                    onStartReview={() => decisionPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })}
+                    onViewFindings={() => setActiveTab("media")}
+                  />
+                )}
 
                 {/* Detection Summary */}
                 <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
@@ -523,17 +590,11 @@ export default function AdminClaimReport() {
                     </div>
                   </div>
 
-                  {ds.primary_concerns?.length > 0 && (
-                    <div className="border-t pt-4 space-y-2">
-                      <p className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Primary Engine Concerns</p>
-                      {ds.primary_concerns.map((concern: string, idx: number) => (
-                        <div key={idx} className="flex gap-2 items-start text-xs font-semibold text-foreground/95 bg-muted/40 p-2.5 rounded-lg border border-border w-full">
-                          <span className="material-symbols-outlined text-destructive text-sm mt-0.5">report_problem</span>
-                          <span>{concern}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  {/* The individual concerns behind these counts are the
+                      same findings already listed in full, once, under
+                      "Why This Claim Was Flagged" above -- these tiles stay
+                      as a quick-glance summary, without repeating the list
+                      itself a second time. */}
                 </div>
 
                 {/* Pipeline */}
@@ -553,7 +614,7 @@ export default function AdminClaimReport() {
                             {party.replace("_", " ")}
                           </span>
                           <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full ${done ? "bg-emerald-500/10 text-emerald-600" : "bg-muted text-muted-foreground"}`}>
-                            {done ? "✓ COMPLETE" : "PENDING"}
+                            {done ?"COMPLETE":"PENDING"}
                           </span>
                         </div>
                       ))}
@@ -569,7 +630,7 @@ export default function AdminClaimReport() {
                       <div className="flex justify-between p-1">
                         <span className="text-muted-foreground font-semibold">Member Stated Estimate</span>
                         <span className="font-bold text-foreground">
-                          {report.member_submission?.estimated_cost ? `KES ${Number(report.member_submission.estimated_cost).toLocaleString()}` : "N/A"}
+                          {report.member_stated_estimate ? `KES ${Number(report.member_stated_estimate).toLocaleString()}` : "N/A"}
                         </span>
                       </div>
                       <div className="flex justify-between p-1 border-t border-dashed">
@@ -588,6 +649,20 @@ export default function AdminClaimReport() {
                             : "N/A"}
                         </span>
                       </div>
+                      <div className="flex justify-between p-1 border-t border-dashed">
+                        <span className="text-muted-foreground font-semibold flex items-center gap-1">
+                          <span className="material-symbols-outlined text-[13px]">smart_toy</span>
+                          AI Independent Estimate
+                        </span>
+                        <span className="font-bold text-foreground">
+                          {report.ai_estimated_cost
+                            ? `KES ${Number(report.ai_estimated_cost).toLocaleString()}`
+                            : "Not computed"}
+                        </span>
+                      </div>
+                      {report.ai_cost_breakdown && (
+                        <p className="text-[10px] text-muted-foreground pt-1 whitespace-pre-line font-mono">{report.ai_cost_breakdown}</p>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -633,36 +708,6 @@ export default function AdminClaimReport() {
                 </div>
               </div>
 
-              {/* Critical warnings Stacked Vertically */}
-              {warnings.length > 0 && (
-                <div className="bg-card p-6 rounded-2xl border border-destructive/20 shadow-sm w-full">
-                  <h4 className="text-xs font-black text-destructive uppercase tracking-widest mb-4 flex items-center gap-2">
-                    <span className="material-symbols-outlined text-[20px]">warning</span>
-                    Critical Verification Warnings ({warnings.length})
-                  </h4>
-                  <div className="space-y-3">
-                    {warnings.map((w: any, i: number) => (
-                      <div key={i} className={`p-4 rounded-xl border ${getSeverityColor(w.severity)} w-full`}>
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2 mb-1">
-                              <span className="text-[10px] font-black uppercase tracking-wider">{w.severity}</span>
-                              <span className="text-xs opacity-70">• Party: {w.party} • Type: {w.type?.replace(/_/g, " ")}</span>
-                            </div>
-                            <p className="text-xs font-semibold leading-relaxed">{w.message}</p>
-                          </div>
-                          {w.confidence !== undefined && (
-                            <span className="text-[10px] font-black uppercase whitespace-nowrap bg-white/20 px-2 py-0.5 rounded">
-                              {w.confidence}% conf.
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
               {/* Recommendations Stacked Vertically */}
               <div className="flex flex-col gap-6 w-full">
                 <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
@@ -673,7 +718,7 @@ export default function AdminClaimReport() {
                   <ul className="space-y-3 text-xs w-full">
                     {(report.recommendations || []).map((r: string, i: number) => (
                       <li key={i} className="text-foreground flex items-start gap-2.5 bg-muted/20 p-2.5 rounded-xl border font-bold w-full">
-                        <span className="text-primary mt-0.5">✓</span>
+                        <span className="text-primary mt-0.5"></span>
                         <span>{r}</span>
                       </li>
                     ))}
@@ -711,7 +756,7 @@ export default function AdminClaimReport() {
               
               {/* Extracted narrative metadata parameters */}
               <Card className="overflow-hidden border-none shadow-sm w-full">
-                <CardHeader className="bg-primary/5 border-b border-primary/10">
+                <CardHeader className="border-b border-border">
                   <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
                     <span className="material-symbols-outlined">person</span>
                     Stated Statement Analysis & Metadata
@@ -822,120 +867,15 @@ export default function AdminClaimReport() {
               {/* Simulator video and dashboard values Stacked Vertically */}
               {pr && pr.status ? (
                 <div className="space-y-6 w-full">
-                  <div className="flex flex-col gap-6 w-full">
-                    
-                    {/* Simulator Video Display */}
-                    <div className="w-full">
-                      {loadingSimulation ? (
-                        <div className="bg-muted/30 p-8 rounded-2xl border flex flex-col items-center justify-center min-h-[300px] text-center w-full">
-                          <div className="size-8 border-4 border-primary border-t-transparent rounded-full animate-spin mb-4"></div>
-                          <p className="text-sm font-bold text-muted-foreground">Checking collision trajectory status...</p>
-                        </div>
-                      ) : simulationStatus?.video_ready ? (
-                        <div className="overflow-hidden border border-border rounded-xl shadow-sm bg-card w-full">
-                          <div className="bg-primary/5 border-b border-primary/10 flex flex-row items-center justify-between py-3 px-4 w-full">
-                            <span className="text-xs font-black uppercase tracking-widest flex items-center gap-2 text-primary">
-                              <span className="material-symbols-outlined text-lg">videocam</span>
-                              3D Trajectory Simulation trajectory
-                            </span>
-                            <a 
-                              href={`${BASE_URL}/api/analysis/claims/${claimId}/simulation-video`}
-                              download={`collision_simulation_${claimId}.mp4`}
-                              className="flex items-center gap-1.5 text-xs font-bold text-primary hover:underline bg-primary/10 px-3 py-1.5 rounded-lg transition-all"
-                            >
-                              <span className="material-symbols-outlined text-sm">download</span>
-                              Download MP4
-                            </a>
-                          </div>
-                          <div className="p-0 w-full">
-                            <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden w-full max-h-[600px]">
-                              <video 
-                                controls 
-                                className="w-full h-full"
-                                src={`${BASE_URL}/api/analysis/claims/${claimId}/simulation-video`}
-                              >
-                                Your browser does not support HTML5 video streaming.
-                              </video>
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="bg-muted/10 p-8 rounded-2xl border text-center flex flex-col items-center justify-center min-h-[300px] border-dashed w-full">
-                          <span className="material-symbols-outlined text-muted-foreground text-5xl mb-4">video_settings</span>
-                          <h4 className="text-base font-bold text-foreground mb-1">Simulation Video Pending</h4>
-                          <p className="text-xs text-muted-foreground max-w-sm leading-relaxed mb-4">
-                            The physical trajectory simulation video is currently processing or has not been fully initiated.
-                          </p>
-                          <button 
-                            className="px-4 py-2 border border-border rounded-lg text-xs font-bold hover:bg-muted transition-all flex items-center gap-2 bg-card"
-                            onClick={() => {
-                              setLoadingSimulation(true);
-                              getSimulationStatus(claimId || "")
-                                .then((status) => {
-                                  setSimulationStatus(status);
-                                  setLoadingSimulation(false);
-                                })
-                                .catch(() => setLoadingSimulation(false));
-                            }}
-                          >
-                            <span className="material-symbols-outlined text-sm animate-spin">refresh</span>
-                            Check Status
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Simulation logs sidebar stacked below */}
-                    <div className="space-y-4 w-full">
-                      <div className="p-4 bg-muted/20 border border-border/80 rounded-xl flex flex-col justify-center text-center w-full">
-                        <p className="text-[10px] font-black text-muted-foreground uppercase tracking-widest mb-1">Simulation Trajectory Data</p>
-                        <div className="flex justify-between items-center py-2 border-b border-dashed text-xs font-semibold">
-                          <span className="text-muted-foreground">Video Status</span>
-                          <span className={`font-bold uppercase ${simulationStatus?.video_ready ? 'text-emerald-600' : 'text-amber-500'}`}>
-                            {simulationStatus?.video_ready ? 'Generated' : 'Pending'}
-                          </span>
-                        </div>
-                        <div className="flex justify-between items-center py-2 border-b border-dashed text-xs font-semibold">
-                          <span className="text-muted-foreground">Physics Verdict</span>
-                          <span className="font-bold text-foreground">{simulationStatus?.physics_verdict || "NOT_RUN"}</span>
-                        </div>
-                        <div className="flex justify-between items-center py-2 text-xs font-semibold">
-                          <span className="text-muted-foreground">Simulator Risk Penalty</span>
-                          <span className="font-bold text-primary">{simulationStatus?.physics_fraud_score ?? pr.physics_fraud_score}/100</span>
-                        </div>
-                      </div>
-
-                      {pr.warnings?.length > 0 && (
-                        <div className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-xl space-y-2 text-xs font-semibold w-full">
-                          <p className="text-[10px] font-black text-amber-800 uppercase tracking-widest flex items-center gap-1">
-                            <span className="material-symbols-outlined text-xs">info</span>
-                            Model Inference Warnings ({pr.warnings.length})
-                          </p>
-                          {pr.warnings.map((w: string, idx: number) => (
-                            <p key={idx} className="text-[10px] font-medium text-amber-900/80 leading-relaxed">• {w}</p>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Scientific McHenry calculation explanation Stacked Vertically */}
-                  <div className="flex flex-col gap-6 pt-4 border-t border-dashed w-full">
-                    <div className="w-full space-y-4">
-                      <p className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">Kinetic Forensics Report</p>
-                      <div className="p-5 bg-muted/40 rounded-2xl border italic text-xs leading-relaxed text-foreground/90 whitespace-pre-wrap">
-                        {pr.physics_explanation || "No physical reconstruction document generated."}
-                      </div>
-                    </div>
-
-                    <div className="w-full">
-                      <div className="p-4 bg-muted/25 rounded-xl border flex flex-col justify-center text-center w-full">
-                        <p className="text-[10px] font-black text-muted-foreground uppercase tracking-widest mb-1">Physics Fraud Index</p>
-                        <p className="text-3xl font-black text-foreground">{pr.physics_fraud_score}/100</p>
-                        <p className="text-xs text-muted-foreground font-semibold mt-1">{pr.verdict_reason}</p>
-                      </div>
-                    </div>
-                  </div>
+                  {/* Interactive reconstruction -- renders the real physics
+                      timeline live in the browser (Canvas2D). Covers video
+                      export, verdict, score, explanation, comparison table
+                      and warnings all in one place -- the separate video
+                      player / "Kinetic Forensics Report" / "Physics Fraud
+                      Index" panels that used to sit below this were showing
+                      the exact same information a second time and have been
+                      removed rather than kept as a duplicate. */}
+                  <PhysicsReconstructionViewer physics={pr as any} claimId={claimId!} />
 
                   {/* Assessor measurement discrepancy: a colluding assessor can type in
                       whatever crush depth/angle produces the outcome they want -- this
@@ -1054,7 +994,7 @@ export default function AdminClaimReport() {
 
               {/* Photo verification lists */}
               <Card className="overflow-hidden border-none shadow-sm w-full">
-                <CardHeader className="bg-primary/5 border-b border-primary/10">
+                <CardHeader className="border-b border-border">
                   <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
                     <span className="material-symbols-outlined">photo_library</span>
                     Image Signature & Metadata Verifications
@@ -1111,7 +1051,7 @@ export default function AdminClaimReport() {
               {/* Document Alignment control Stacked Vertically */}
               {cp && cp.verification_quality ? (
                 <Card className="overflow-hidden border-none shadow-sm w-full">
-                  <CardHeader className="bg-primary/5 border-b border-primary/10">
+                  <CardHeader className="border-b border-border">
                     <div className="flex justify-between items-center w-full">
                       <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
                         <span className="material-symbols-outlined">compare_arrows</span>
@@ -1218,7 +1158,7 @@ export default function AdminClaimReport() {
               {/* Supporting documents (police abstract / ID / garage quote) uploaded
                   by member or assessor, with their OCR-extracted data. */}
               <Card className="overflow-hidden border-none shadow-sm w-full">
-                <CardHeader className="bg-primary/5 border-b border-primary/10">
+                <CardHeader className="border-b border-border">
                   <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
                     <span className="material-symbols-outlined">document_scanner</span>
                     Supporting Documents (OCR Extraction)
@@ -1335,5 +1275,130 @@ export default function AdminClaimReport() {
         </div>
       </div>
     </AdminLayout>
+  );
+}
+
+/**
+ * The AI Investigation Summary -- a structured brief (headline, per-factor
+ * reasoning with impact tiers, a concrete "what to review" checklist, and
+ * a fixed non-hallucinatable disclaimer) instead of one free-form
+ * paragraph. Every point/impact number here came straight from the backend's
+ * deterministic math; only the reasoning sentences were AI-phrased.
+ */
+function InvestigationSummaryCard({
+  summary,
+  detailsByFactor,
+  onStartReview,
+  onViewFindings,
+}: {
+  summary: AiInvestigationSummary;
+  detailsByFactor: Record<string, any[]>;
+  onStartReview: () => void;
+  onViewFindings: () => void;
+}) {
+  const impactMeta: Record<string, { dot: string; label: string; text: string }> = {
+    high: { dot: "bg-destructive", label: "HIGH", text: "text-destructive" },
+    medium: { dot: "bg-amber-500", label: "MEDIUM", text: "text-amber-600" },
+    low: { dot: "bg-emerald-500", label: "LOW", text: "text-emerald-600" },
+  };
+  const riskColor = summary.score >= 70 ? "text-destructive" : summary.score >= 50 ? "text-amber-600" : "text-primary";
+  const [expandedFactor, setExpandedFactor] = useState<string | null>(null);
+
+  return (
+    <div className="rounded-2xl border border-primary/20 bg-gradient-to-b from-primary/[0.04] to-transparent overflow-hidden">
+      <div className="px-6 py-5 border-b border-primary/10 flex items-start justify-between gap-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className="material-symbols-outlined text-primary">auto_awesome</span>
+          <p className="text-sm font-black uppercase tracking-widest text-primary">AI Investigation Summary</p>
+        </div>
+        <span className={`text-lg font-black tabular-nums ${riskColor}`}>{summary.score} / 100</span>
+      </div>
+
+      <div className="px-6 py-5 space-y-6">
+        <p className="text-sm text-foreground leading-relaxed font-medium">{summary.headline}</p>
+
+        <div>
+          <p className="text-[10px] font-black uppercase text-muted-foreground tracking-widest mb-3">Why was this flagged? <span className="normal-case font-medium text-muted-foreground/70">(click a card for detail)</span></p>
+          <div className="space-y-3">
+            {summary.factors.map((f) => {
+              const meta = impactMeta[f.impact] || impactMeta.low;
+              const items = detailsByFactor[f.key] || [];
+              const isOpen = expandedFactor === f.key;
+              return (
+                <div key={f.key} className="rounded-xl bg-card border border-border overflow-hidden">
+                  <button
+                    onClick={() => setExpandedFactor(isOpen ? null : f.key)}
+                    className="w-full text-left flex items-start gap-3 p-3 hover:bg-muted/40 transition-colors"
+                  >
+                    <span className={`mt-1 size-2 rounded-full shrink-0 ${meta.dot}`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="material-symbols-outlined text-[16px] text-muted-foreground">{f.icon}</span>
+                        <span className="text-sm font-bold text-foreground">{f.label}</span>
+                        <span className={`text-[9px] font-black uppercase ${meta.text}`}>{meta.label}</span>
+                        <span className="text-[10px] text-muted-foreground tabular-nums ml-auto">{f.points.toFixed(1)} / {f.max_points.toFixed(0)} pts</span>
+                        <span className="material-symbols-outlined text-[16px] text-muted-foreground">{isOpen ? "expand_less" : "expand_more"}</span>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">{f.reasoning}</p>
+                    </div>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3 pb-3 pt-1 border-t border-border bg-muted/20">
+                      {items.length > 0 ? (
+                        <ul className="space-y-2 mt-2">
+                          {items.map((item, i) => (
+                            <li key={i} className="text-xs text-foreground/85 flex items-start gap-2">
+                              <span className={`mt-1 size-1.5 rounded-full shrink-0 ${
+                                item.severity === "critical" || item.severity === "high" ? "bg-destructive" :
+                                item.severity === "medium" ? "bg-amber-500" : "bg-muted-foreground"
+                              }`} />
+                              <span>
+                                {item.description}
+                                {item.confidence != null && <span className="text-muted-foreground"> (confidence: {item.confidence}%)</span>}
+                                {item.party && <span className="text-muted-foreground"> — {item.party}</span>}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-xs text-muted-foreground mt-2 italic">
+                          No individual findings recorded for this factor -- its score reflects a comparison against overall claim data rather than discrete flagged items.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[10px] font-black uppercase text-muted-foreground tracking-widest mb-2">What should you review?</p>
+          <ul className="space-y-1.5">
+            {summary.what_to_review.map((item, i) => (
+              <li key={i} className="text-sm text-foreground/80 flex items-center gap-2">
+                <span className="material-symbols-outlined text-[16px] text-primary">check_circle</span>
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-amber-500/5 border border-amber-500/20">
+          <span className="material-symbols-outlined text-amber-600 text-[18px] mt-0.5">warning</span>
+          <p className="text-xs text-foreground/80 leading-relaxed">{summary.important_note}</p>
+        </div>
+
+        <div className="flex items-center gap-3 pt-1">
+          <Button variant="outline" size="sm" className="text-xs font-bold" onClick={onViewFindings}>
+            View AI Findings
+          </Button>
+          <Button size="sm" className="text-xs font-bold" onClick={onStartReview}>
+            View Triage Status
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

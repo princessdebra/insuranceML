@@ -27,6 +27,25 @@ class PhotoAnomalySchema(BaseModel):
     # what the photos actually show.
     cv_severity: Optional[str] = None
     detected_classes: List[str] = Field(default_factory=list)
+    # Per-detection bounding boxes + repair/replace recommendation, straight
+    # from the trained YOLO model (damage_recommendation.py) -- the assessor
+    # portal's damage-detection panel draws these on the photo and lets the
+    # assessor confirm or override each one. Empty when no detections (or
+    # for photos analyzed before this field existed).
+    detections: List[Dict[str, Any]] = Field(default_factory=list)
+    # Whole-photo multi-zone scan (part_identifier.scan_all_damage_zones) --
+    # a broader vision-LLM pass that can name several distinct damaged parts
+    # per photo, complementing `detections` (which only covers regions the
+    # trained YOLO detector itself flagged). Approximate bounding boxes only
+    # (bbox_normalized, 0-1 fractions of image size), not real segmentation.
+    damage_zones: List[Dict[str, Any]] = Field(default_factory=list)
+    # Visible location clues (signage, landmarks, setting) extracted from
+    # photos classify_photo_purpose() ruled out as damage close-ups --
+    # feeds business_rules.py's location_narrative_correlation rule, which
+    # cross-checks this against the claim's stated incident location. None
+    # for damage-closeup photos (never extracted) or when nothing useful
+    # was visible.
+    location_context: Optional[str] = None
 
 
 class NarrativeAnalysisSchema(BaseModel):

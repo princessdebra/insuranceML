@@ -24,6 +24,8 @@ from database import db_manager
 from ollama_client import generate, generate_json, OllamaError
 import ai_rol
 import business_rules
+import graph_relationship
+import narrative_similarity
 
 # The dev GPU can only host one large model at a time — the team standardized
 # on gemma4:26b (also used for photo vision), so all text-reasoning tasks that
@@ -56,7 +58,7 @@ def log_performance(func):
         # Extract claim_id if available for database logging
         claim_id = kwargs.get('claim_id') or (args[2] if len(args) > 2 else 'unknown')
         
-        logger.info(f"🚀 Starting {function_name} with args count: {len(args)}, kwargs: {list(kwargs.keys())}")
+        logger.info(f"Starting {function_name} with args count: {len(args)}, kwargs: {list(kwargs.keys())}")
         
         try:
             result = await func(*args, **kwargs)
@@ -73,12 +75,12 @@ def log_performance(func):
             )
             
             # Log success metrics
-            logger.info(f"✅ {function_name} completed successfully in {execution_time:.3f}s")
+            logger.info(f"{function_name} completed successfully in {execution_time:.3f}s")
             
             # Log result summary if it's a dict
             if isinstance(result, dict):
                 summary_keys = list(result.keys())[:5]  # First 5 keys
-                logger.debug(f"📊 {function_name} result keys: {summary_keys}")
+                logger.debug(f"{function_name} result keys: {summary_keys}")
             
             return result
             
@@ -95,8 +97,8 @@ def log_performance(func):
                 details=f"Failed with error: {str(e)}"
             )
             
-            logger.error(f"❌ {function_name} failed after {execution_time:.3f}s: {str(e)}")
-            logger.debug(f"🔍 {function_name} traceback: {traceback.format_exc()}")
+            logger.error(f"{function_name} failed after {execution_time:.3f}s: {str(e)}")
+            logger.debug(f"{function_name} traceback: {traceback.format_exc()}")
             raise
     
     @functools.wraps(func)
@@ -107,7 +109,7 @@ def log_performance(func):
         # Extract claim_id if available for database logging
         claim_id = kwargs.get('claim_id') or (args[2] if len(args) > 2 else 'unknown')
         
-        logger.info(f"🚀 Starting {function_name} with args count: {len(args)}, kwargs: {list(kwargs.keys())}")
+        logger.info(f"Starting {function_name} with args count: {len(args)}, kwargs: {list(kwargs.keys())}")
         
         try:
             result = func(*args, **kwargs)
@@ -123,11 +125,11 @@ def log_performance(func):
                 details=f"Completed successfully in {execution_time:.3f}s"
             )
             
-            logger.info(f"✅ {function_name} completed successfully in {execution_time:.3f}s")
+            logger.info(f"{function_name} completed successfully in {execution_time:.3f}s")
             
             if isinstance(result, dict):
                 summary_keys = list(result.keys())[:5]
-                logger.debug(f"📊 {function_name} result keys: {summary_keys}")
+                logger.debug(f"{function_name} result keys: {summary_keys}")
             
             return result
             
@@ -144,8 +146,8 @@ def log_performance(func):
                 details=f"Failed with error: {str(e)}"
             )
             
-            logger.error(f"❌ {function_name} failed after {execution_time:.3f}s: {str(e)}")
-            logger.debug(f"🔍 {function_name} traceback: {traceback.format_exc()}")
+            logger.error(f"{function_name} failed after {execution_time:.3f}s: {str(e)}")
+            logger.debug(f"{function_name} traceback: {traceback.format_exc()}")
             raise
     
     # Return appropriate wrapper based on whether function is async
@@ -176,9 +178,9 @@ class PhotoAnalysisService:
     VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "gemma4:26b")
 
     def __init__(self):
-        logger.info("🔧 Initializing PhotoAnalysisService (YOLO + Ollama backed)")
+        logger.info("Initializing PhotoAnalysisService (YOLO + Ollama backed)")
         self.image_processor = ImageProcessor()
-        logger.info("📊 PhotoAnalysisService initialized")
+        logger.info("PhotoAnalysisService initialized")
     
     def _check_duplicate_hash(self, perceptual_hash: str, claim_id: str) -> bool:
         """Check if image hash already exists in database"""
@@ -197,13 +199,13 @@ class PhotoAnalysisService:
                 duplicate = cursor.fetchone()
                 
                 if duplicate:
-                    logger.warning(f"🚨 DUPLICATE DETECTED: Hash {perceptual_hash[:12]}... found in claim {duplicate['claim_id']}, file {duplicate['filename']}")
+                    logger.warning(f"DUPLICATE DETECTED: Hash {perceptual_hash[:12]}... found in claim {duplicate['claim_id']}, file {duplicate['filename']}")
                     return True
                 
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Error checking duplicate hash: {str(e)}")
+            logger.error(f"Error checking duplicate hash: {str(e)}")
             # Return False to allow processing if database check fails
             return False
     
@@ -333,31 +335,31 @@ class PhotoAnalysisService:
     ) -> PhotoAnomalySchema:
         """Comprehensive photo analysis for fraud detection using Gemini Vision with database integration"""
  
-        logger.info(f"📷 Starting photo analysis for claim {claim_id}, file: {filename} from party: {party}")
-        logger.debug(f"📊 Image data size: {len(image_data):,} bytes")
+        logger.info(f"Starting photo analysis for claim {claim_id}, file: {filename} from party: {party}")
+        logger.debug(f"Image data size: {len(image_data):,} bytes")
  
         analysis_start = time.time()
         anomalies = []
         risk_score = 0
  
         try:
-            logger.debug("🔄 Converting image data to PIL format")
+            logger.debug("Converting image data to PIL format")
             image = Image.open(io.BytesIO(image_data))
-            logger.info(f"🖼️ Image loaded successfully - Size: {image.size}, Mode: {image.mode}")
+            logger.info(f"Image loaded successfully - Size: {image.size}, Mode: {image.mode}")
  
-            logger.debug("🔢 Computing image hashes for duplicate detection")
+            logger.debug("Computing image hashes for duplicate detection")
             hash_start = time.time()
             file_hash = self.image_processor.compute_file_hash(image_data)
             perceptual_hash = self.image_processor.compute_perceptual_hash(image)
             hash_time = time.time() - hash_start
-            logger.debug(f"📊 Hash computation completed in {hash_time:.3f}s - Perceptual: {perceptual_hash[:12]}...")
+            logger.debug(f"Hash computation completed in {hash_time:.3f}s - Perceptual: {perceptual_hash[:12]}...")
  
             # 1. Database-powered Duplicate Detection
-            logger.info(f"🔍 Checking for duplicate photos in database (party: {party})")
+            logger.info(f"Checking for duplicate photos in database (party: {party})")
             duplicate_check = self._check_duplicate_hash_multiparty(perceptual_hash, claim_id, party)
  
             if duplicate_check['is_duplicate']:
-                logger.warning(f"🚨 DUPLICATE DETECTED: Hash {perceptual_hash[:12]}... matches {duplicate_check['matched_party']} submission")
+                logger.warning(f"DUPLICATE DETECTED: Hash {perceptual_hash[:12]}... matches {duplicate_check['matched_party']} submission")
  
                 if duplicate_check['matched_party'] != party:
                     anomalies.append({
@@ -379,7 +381,7 @@ class PhotoAnalysisService:
                     })
                     risk_score += 35
             else:
-                logger.debug("✅ No duplicate detected in database")
+                logger.debug("No duplicate detected in database")
  
             # 1b. AI generation detection (pre-Gemini, filename + EXIF checks)
             ai_check = self._detect_ai_generated(image_data, filename)
@@ -399,12 +401,12 @@ class PhotoAnalysisService:
                     image_data, filename, claim_id, party,
                     narrative_context=narrative_context,
                 )
-                logger.info(f"✅ LLM analysis completed - Found {len(llm_analysis['anomalies'])} anomalies, risk: {llm_analysis['risk_score']}")
+                logger.info(f"LLM analysis completed - Found {len(llm_analysis['anomalies'])} anomalies, risk: {llm_analysis['risk_score']}")
                 anomalies.extend(llm_analysis["anomalies"])
                 risk_score += llm_analysis["risk_score"]
                 photo_detections = llm_analysis.get("detections", []) or []
             except Exception as e:
-                logger.error(f"❌ LLM analysis failed: {str(e)}, falling back to rule-based")
+                logger.error(f"LLM analysis failed: {str(e)}, falling back to rule-based")
                 fallback_analysis = await self._fallback_damage_analysis(image, filename, party)
                 anomalies.extend(fallback_analysis["anomalies"])
                 risk_score += fallback_analysis["risk_score"]
@@ -414,14 +416,72 @@ class PhotoAnalysisService:
             # for cross-checking a party's own claimed measurements).
             cv_severity = self._cv_severity_from_detections(photo_detections)
             detected_classes = [d.get("class") for d in photo_detections if d.get("class")]
- 
+            # Low-confidence-recovery detections already had their part
+            # confirmed by the vision LLM inline (see _analyze_with_llm) --
+            # keyed by bbox so the zoom-in pass below can reuse that result
+            # instead of paying for a second identical vision call.
+            vision_confirmed_by_bbox = {
+                tuple(d["bbox"]): (d["vision_confirmed_part"], d.get("vision_confirmed_description", ""))
+                for d in photo_detections
+                if d.get("vision_confirmed_part") and d.get("bbox")
+            }
+            import damage_recommendation
+            detections_with_recommendations = damage_recommendation.build_detections_with_recommendations(photo_detections, photo_severity=cv_severity)
+
+            # ── Zoomed-in specific-part identification ──────────────────────────
+            # The YOLO class names the DAMAGE TYPE, and several classes are
+            # genuinely part-agnostic ("generic-damage") or low-confidence --
+            # for those, crop+zoom the region and ask the vision LLM to name
+            # the actual part, instead of leaving a generic "Body Panel" label.
+            import part_identifier
+            for det in detections_with_recommendations:
+                needs_part_id = (
+                    damage_recommendation.is_ambiguous_class(det.get("class", ""))
+                    or det.get("low_confidence")
+                )
+                if not needs_part_id or not det.get("bbox"):
+                    continue
+                bbox_key = tuple(det["bbox"])
+                if bbox_key in vision_confirmed_by_bbox:
+                    part, description = vision_confirmed_by_bbox[bbox_key]
+                    identified = {"part": part, "damage_description": description}
+                else:
+                    identified = await part_identifier.identify_specific_part(image_data, det["bbox"])
+                if identified:
+                    det["component"] = identified["part"]
+                    det["part_identified_via"] = "vision_llm_zoom"
+                    if identified.get("damage_description"):
+                        det["reason"] = (
+                            f"Close-up review identified this as the {identified['part']}, "
+                            f"showing {identified['damage_description']}. {det['reason']}"
+                        )
+
+            # ── Whole-photo multi-zone scan ──────────────────────────────────────
+            # Complements the YOLO-anchored detections above (which only ever
+            # cover regions the trained detector itself flagged) with a
+            # broader pass that can name several distinct damaged parts per
+            # photo -- closer to the multi-part damage-report style this was
+            # built to match, rather than one region at a time.
+            is_damage_photo = await part_identifier.classify_photo_purpose(image_data)
+            damage_zones = await part_identifier.scan_all_damage_zones(image_data, is_damage_photo=is_damage_photo)
+
+            # A photo that isn't a damage close-up is usually the member
+            # showing WHERE they were (a parking-lot/street shot submitted
+            # to corroborate their narrative) -- pull any visible location
+            # clues from exactly those photos so business_rules.py's
+            # location_narrative_correlation rule can cross-check them
+            # against the claim's stated incident location.
+            location_context = None
+            if not is_damage_photo:
+                location_context = await part_identifier.describe_location_context(image_data)
+
             # 3. Enhanced lighting analysis
-            logger.debug("💡 Analyzing lighting conditions")
+            logger.debug("Analyzing lighting conditions")
             lighting_analysis = self.image_processor.analyze_lighting_conditions(image_data)
-            logger.debug(f"📊 Lighting condition: {lighting_analysis['condition']}")
+            logger.debug(f"Lighting condition: {lighting_analysis['condition']}")
  
             if lighting_analysis["condition"] == "very_low_light":
-                logger.warning("⚠️ Very poor lighting detected")
+                logger.warning("Very poor lighting detected")
                 anomalies.append({
                     "type": "poor_lighting",
                     "severity": "medium",
@@ -432,12 +492,12 @@ class PhotoAnalysisService:
                 risk_score += 15
  
             # 4. EXIF Metadata Analysis
-            logger.debug("📋 Extracting and analyzing EXIF metadata")
+            logger.debug("Extracting and analyzing EXIF metadata")
             exif_data = self.image_processor.extract_exif_metadata(image)
-            logger.debug(f"📊 EXIF data extracted - GPS: {exif_data.get('has_gps', False)}, Timestamp: {bool(exif_data.get('timestamp'))}")
+            logger.debug(f"EXIF data extracted - GPS: {exif_data.get('has_gps', False)}, Timestamp: {bool(exif_data.get('timestamp'))}")
  
             if not exif_data["has_gps"]:
-                logger.warning("⚠️ No GPS data found in image")
+                logger.warning("No GPS data found in image")
                 anomalies.append({
                     "type": "missing_location_data",
                     "severity": "medium",
@@ -448,9 +508,9 @@ class PhotoAnalysisService:
                 risk_score += 10
  
             # 5. Enhanced file analysis
-            logger.debug("🔍 Checking for potential image editing")
+            logger.debug("Checking for potential image editing")
             if self._detect_potential_editing(image_data, filename):
-                logger.warning(f"⚠️ Potential editing detected in {filename}")
+                logger.warning(f"Potential editing detected in {filename}")
                 anomalies.append({
                     "type": "potential_editing",
                     "severity": "high",
@@ -462,10 +522,10 @@ class PhotoAnalysisService:
  
             # 6. Temporal Consistency
             if exif_data["timestamp"]:
-                logger.debug(f"⏰ Checking timestamp consistency: {exif_data['timestamp']}")
+                logger.debug(f"Checking timestamp consistency: {exif_data['timestamp']}")
                 temporal_issues = self._check_temporal_consistency(exif_data["timestamp"])
                 if temporal_issues:
-                    logger.warning(f"⚠️ Temporal inconsistency detected: {temporal_issues}")
+                    logger.warning(f"Temporal inconsistency detected: {temporal_issues}")
                     anomalies.append({
                         "type": "temporal_inconsistency",
                         "severity": "medium",
@@ -487,6 +547,9 @@ class PhotoAnalysisService:
                 analysis_confidence=analysis_confidence,
                 cv_severity=cv_severity,
                 detected_classes=detected_classes,
+                detections=detections_with_recommendations,
+                damage_zones=damage_zones,
+                location_context=location_context,
             )
  
             try:
@@ -499,21 +562,21 @@ class PhotoAnalysisService:
                     content_type="image/jpeg",
                     analysis_result=analysis_dict
                 )
-                logger.debug(f"💾 Photo analysis stored in database for {filename} (party: {party})")
+                logger.debug(f"Photo analysis stored in database for {filename} (party: {party})")
             except Exception as e:
-                logger.error(f"❌ Failed to store photo analysis in database: {str(e)}")
+                logger.error(f"Failed to store photo analysis in database: {str(e)}")
  
-            logger.info(f"📊 Photo analysis completed for {filename} ({party}):")
-            logger.info(f"   📈 Risk Score: {final_risk_score}/100")
-            logger.info(f"   🎯 Confidence: {analysis_confidence}%")
-            logger.info(f"   ⚠️ Anomalies: {len(anomalies)}")
-            logger.info(f"   ⏱️ Processing Time: {analysis_time:.3f}s")
+            logger.info(f"Photo analysis completed for {filename} ({party}):")
+            logger.info(f"Risk Score: {final_risk_score}/100")
+            logger.info(f"Confidence: {analysis_confidence}%")
+            logger.info(f"Anomalies: {len(anomalies)}")
+            logger.info(f"Processing Time: {analysis_time:.3f}s")
  
             return photo_result
  
         except Exception as e:
-            logger.error(f"💥 Photo analysis failed for {filename}: {str(e)}")
-            logger.debug(f"🔍 Full traceback: {traceback.format_exc()}")
+            logger.error(f"Photo analysis failed for {filename}: {str(e)}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
             return self._get_error_response(filename, str(e))
 
     def _check_duplicate_hash_multiparty(self, perceptual_hash: str, claim_id: str, current_party: str) -> Dict[str, Any]:
@@ -575,7 +638,7 @@ class PhotoAnalysisService:
     ) -> Dict[str, Any]:
         """Analyze image using the trained YOLO damage detector + an Ollama vision-language model"""
 
-        logger.info(f"🤖 Starting LLM analysis for {filename} from {party} (Claim: {claim_id})")
+        logger.info(f"Starting LLM analysis for {filename} from {party} (Claim: {claim_id})")
 
         try:
             # Ground the VLM's reasoning in the trained model's actual detections,
@@ -584,6 +647,35 @@ class PhotoAnalysisService:
             # CPU-bound YOLO inference — off the event loop for the same
             # reason as the Ollama calls below (see their comments).
             detections = await asyncio.to_thread(detect_damage, image_data)
+
+            # ── Low-confidence recovery ──────────────────────────────────────
+            # A wide scene photo (damaged vehicle small in frame, further
+            # away) can leave every real detection just under the normal
+            # threshold -- confirmed on a live test claim (moderate-
+            # deformation at 22.7%, cutoff 25%). Rather than lower the
+            # threshold globally (which would flood ordinary close-up photos
+            # with false positives), retry at a much lower threshold only
+            # when the normal pass found nothing, and have the vision LLM
+            # zoom into and confirm/reject each candidate before trusting it.
+            if not detections:
+                import part_identifier
+                weak_candidates = await asyncio.to_thread(detect_damage, image_data, 0.08)
+                weak_candidates = sorted(weak_candidates, key=lambda d: d["confidence"], reverse=True)[:3]
+                for candidate in weak_candidates:
+                    verified = await part_identifier.verify_and_identify_low_confidence_region(
+                        image_data, candidate.get("bbox")
+                    )
+                    if verified:
+                        detections.append({
+                            "class": "generic-damage",
+                            "confidence": candidate["confidence"],
+                            "bbox": candidate.get("bbox"),
+                            "vision_confirmed_part": verified["part"],
+                            "vision_confirmed_description": verified.get("damage_description", ""),
+                        })
+                if detections:
+                    logger.info(f"Low-confidence recovery found {len(detections)} vision-confirmed detection(s) for {filename}")
+
             if detections:
                 detected_damage_section = "DETECTED DAMAGE (from trained CV model — treat as ground truth unless the photo clearly contradicts it):\n" + "\n".join(
                     f"- {d['class']} (confidence: {d['confidence']:.2f})" for d in detections
@@ -687,7 +779,7 @@ AI generation indicators to check:
 {"Repair shop photos should show damage detail and repair areas clearly." if party == "repair_shop" else ""}
 """
  
-            logger.info("🔄 Sending request to Ollama...")
+            logger.info("Sending request to Ollama...")
             from ollama_client import generate, OllamaError
             # generate() uses the synchronous `requests` library — run it in a
             # worker thread so its blocking network I/O doesn't freeze the
@@ -698,7 +790,7 @@ AI generation indicators to check:
                 response_text = await asyncio.to_thread(
                     generate, prompt, model=self.VISION_MODEL, images=[image_data], json_mode=True, timeout=120
                 )
-                logger.info("✅ Ollama response received")
+                logger.info("Ollama response received")
                 parsed_result = self._parse_llm_response(response_text, filename)
             except OllamaError as e:
                 # The vision LLM is advisory reasoning on top of the trained
@@ -709,7 +801,7 @@ AI generation indicators to check:
                 # filename-string/random-coin-flip stub with no relation to
                 # the actual photo) threw away a working, trained result to
                 # fall back to a strictly worse one.
-                logger.warning(f"⚠️ Ollama vision call failed ({e}), using CV-only detections for {filename}")
+                logger.warning(f"Ollama vision call failed ({e}), using CV-only detections for {filename}")
                 parsed_result = self._cv_only_analysis(detections)
 
             parsed_result["detections"] = detections
@@ -717,14 +809,14 @@ AI generation indicators to check:
             for anomaly in parsed_result.get('anomalies', []):
                 anomaly['party'] = party
 
-            logger.info(f"📊 LLM analysis results for {filename} ({party}):")
-            logger.info(f"   🎯 Anomalies found: {len(parsed_result.get('anomalies', []))}")
-            logger.info(f"   📈 Risk score: {parsed_result.get('risk_score', 0)}")
+            logger.info(f"LLM analysis results for {filename} ({party}):")
+            logger.info(f"Anomalies found: {len(parsed_result.get('anomalies', []))}")
+            logger.info(f"Risk score: {parsed_result.get('risk_score', 0)}")
 
             return parsed_result
 
         except Exception as e:
-            logger.error(f"❌ LLM analysis failed for {filename}: {str(e)}")
+            logger.error(f"LLM analysis failed for {filename}: {str(e)}")
             raise
 
     # Heuristic bucketing of the 30-class merged_v2_yolov8n_seg taxonomy into
@@ -873,7 +965,7 @@ AI generation indicators to check:
                 }
             
         except Exception as e:
-            logger.error(f"❌ Error parsing Gemini response for {filename}: {str(e)}")
+            logger.error(f"Error parsing Gemini response for {filename}: {str(e)}")
         
         # Fallback parsing if JSON parsing fails
         return self._parse_gemini_text_fallback(response_text, filename)
@@ -962,12 +1054,12 @@ AI generation indicators to check:
         
         # Very small files might be heavily compressed/edited
         if file_size < 50000:  # Less than 50KB
-            logger.warning(f"⚠️ Suspiciously small file size: {file_size:,} bytes < 50KB")
+            logger.warning(f"Suspiciously small file size: {file_size:,} bytes < 50KB")
             return True
         
         # Very large files might be uncompressed/edited
         if file_size > 10000000:  # Greater than 10MB
-            logger.warning(f"⚠️ Suspiciously large file size: {file_size:,} bytes > 10MB")
+            logger.warning(f"Suspiciously large file size: {file_size:,} bytes > 10MB")
             return True
             
         # Check filename for editing indicators
@@ -977,7 +1069,7 @@ AI generation indicators to check:
         found_indicators = [indicator for indicator in editing_indicators if indicator in filename_lower]
         
         if found_indicators:
-            logger.warning(f"⚠️ Editing indicators found in filename: {found_indicators}")
+            logger.warning(f"Editing indicators found in filename: {found_indicators}")
             return True
         
         return False
@@ -1005,7 +1097,7 @@ AI generation indicators to check:
                 return "Photo taken very recently - verify incident timing"
                 
         except Exception as e:
-            logger.error(f"❌ Failed to parse timestamp '{timestamp}': {str(e)}")
+            logger.error(f"Failed to parse timestamp'{timestamp}': {str(e)}")
             return "Invalid or corrupted timestamp data"
         
         return None
@@ -1036,18 +1128,18 @@ class NarrativeAnalysisService:
         api_key = gemini_api_key or GEMINI_API_KEY
         
         try:
-            logger.info("🤖 Configuring Gemini API for narrative analysis")
+            logger.info("Configuring Gemini API for narrative analysis")
             genai.configure(api_key=api_key)
             self.gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("✅ Gemini model initialized for narrative analysis")
+            logger.info("Gemini model initialized for narrative analysis")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Gemini for narrative analysis: {str(e)}")
+            logger.error(f"Failed to initialize Gemini for narrative analysis: {str(e)}")
             self.gemini_model = None
     
     async def analyze_narrative(self, narrative: str, claim_id: str, party: str = "member") -> NarrativeAnalysisSchema:
         """Comprehensive narrative analysis using the self-hosted LLM, with database logging"""
 
-        logger.info(f"📝 Analyzing narrative from {party} for claim {claim_id}")
+        logger.info(f"Analyzing narrative from {party} for claim {claim_id}")
 
         try:
             llm_analysis = await self._analyze_narrative_with_gemini(narrative, claim_id, party)
@@ -1344,12 +1436,12 @@ class RiskScoringService:
         api_key = gemini_api_key or GEMINI_API_KEY
         
         try:
-            logger.info("🤖 Configuring Gemini API for risk scoring")
+            logger.info("Configuring Gemini API for risk scoring")
             genai.configure(api_key=api_key)
             self.gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("✅ Gemini model initialized for risk scoring")
+            logger.info("Gemini model initialized for risk scoring")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Gemini for risk scoring: {str(e)}")
+            logger.error(f"Failed to initialize Gemini for risk scoring: {str(e)}")
             self.gemini_model = None
     
     @log_performance
@@ -1370,7 +1462,23 @@ class RiskScoringService:
             )
             if historical_data:
                 enhanced_historical_data.update(historical_data)
-    
+
+            # ── AI-ROL: Operational Benchmarking recommendation (Appendix C §C.2) ──
+            if enhanced_historical_data.get("benchmark_observation"):
+                ai_rol.record_recommendation(
+                    claim_id=claim_id,
+                    capability="historical_benchmarking",
+                    recommendation=enhanced_historical_data["benchmark_observation"],
+                    confidence=None,
+                    evidence={
+                        "cost_percentile": enhanced_historical_data.get("cost_percentile"),
+                        "population_avg_cost": enhanced_historical_data.get("population_avg_cost"),
+                        "population_size": enhanced_historical_data.get("population_size"),
+                        "recent_claims_same_location": enhanced_historical_data.get("recent_claims"),
+                        "fraud_flags_same_location": enhanced_historical_data.get("fraud_flags"),
+                    },
+                )
+
             # Component scores
             photo_score      = self._calculate_photo_component_score(photo_scores)
             narrative_score  = self._calculate_narrative_component_score(narrative_analysis)
@@ -1548,44 +1656,88 @@ class RiskScoringService:
 
     
     async def _get_enhanced_historical_data(self, location: str, claim_amount: float, current_claim_id: str) -> Dict[str, Any]:
-        """Get enhanced historical data from database"""
+        """Get enhanced historical data from database, including population-level benchmarking."""
         try:
             historical_data = {"recent_claims": 0, "fraud_flags": 0, "location_risk_factor": 0}
-            
+
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 # Count recent high-risk claims in the same location
                 cursor.execute('''
-                    SELECT COUNT(*) FROM claims 
-                    WHERE location LIKE ? 
-                    AND fraud_risk_score >= 70 
+                    SELECT COUNT(*) FROM claims
+                    WHERE location LIKE ?
+                    AND fraud_risk_score >= 70
                     AND created_at >= datetime('now', '-30 days')
                     AND claim_id != ?
                 ''', (f"%{location}%", current_claim_id))
-                
+
                 location_high_risk = cursor.fetchone()[0]
                 historical_data["location_risk_factor"] = min(location_high_risk * 10, 50)
-                
+
                 # Count similar amount claims
                 amount_range_low = claim_amount * 0.8
                 amount_range_high = claim_amount * 1.2
-                
+
                 cursor.execute('''
-                    SELECT COUNT(*) FROM claims 
-                    WHERE estimated_cost BETWEEN ? AND ? 
+                    SELECT COUNT(*) FROM claims
+                    WHERE estimated_cost BETWEEN ? AND ?
                     AND fraud_risk_score >= 60
                     AND created_at >= datetime('now', '-60 days')
                     AND claim_id != ?
                 ''', (amount_range_low, amount_range_high, current_claim_id))
-                
+
                 similar_amount_claims = cursor.fetchone()[0]
                 historical_data["similar_amount_risk"] = min(similar_amount_claims * 5, 30)
-                
+
+                # ── recent_claims / fraud_flags were previously dead fields
+                # (always 0 -- _calculate_historical_component_score reads
+                # them but nothing ever set them). Now genuinely populated:
+                # any claims at this location recently, and how many of
+                # those were high-risk.
+                cursor.execute('''
+                    SELECT COUNT(*) FROM claims
+                    WHERE location LIKE ?
+                    AND created_at >= datetime('now', '-30 days')
+                    AND claim_id != ?
+                ''', (f"%{location}%", current_claim_id))
+                historical_data["recent_claims"] = cursor.fetchone()[0]
+
+                cursor.execute('''
+                    SELECT COUNT(*) FROM claims
+                    WHERE location LIKE ?
+                    AND risk_level = 'high'
+                    AND created_at >= datetime('now', '-90 days')
+                    AND claim_id != ?
+                ''', (f"%{location}%", current_claim_id))
+                historical_data["fraud_flags"] = cursor.fetchone()[0]
+
+                # ── Operational benchmarking (Appendix C §C.2) — where this
+                # claim's cost sits relative to the whole claims population,
+                # not just a 30/60-day location/amount window.
+                cursor.execute('SELECT COUNT(*) as total, AVG(estimated_cost) as avg_cost FROM claims WHERE claim_id != ?', (current_claim_id,))
+                pop_row = cursor.fetchone()
+                total_claims = pop_row["total"] or 0
+                avg_cost = pop_row["avg_cost"] or 0
+                if total_claims > 0:
+                    cursor.execute(
+                        'SELECT COUNT(*) as cnt FROM claims WHERE estimated_cost <= ? AND claim_id != ?',
+                        (claim_amount, current_claim_id),
+                    )
+                    below_or_equal = cursor.fetchone()["cnt"]
+                    percentile = round(100 * below_or_equal / total_claims)
+                    historical_data["cost_percentile"] = percentile
+                    historical_data["population_avg_cost"] = round(avg_cost, 2)
+                    historical_data["population_size"] = total_claims
+                    historical_data["benchmark_observation"] = (
+                        f"This claim's estimated cost (KES {claim_amount:,.0f}) is at the {percentile}th percentile "
+                        f"of all {total_claims} claims on record (population average: KES {avg_cost:,.0f})."
+                    )
+
             return historical_data
-            
+
         except Exception as e:
-            logger.error(f"❌ Error getting enhanced historical data: {str(e)}")
+            logger.error(f"Error getting enhanced historical data: {str(e)}")
             return {"recent_claims": 0, "fraud_flags": 0}
     
     def _calculate_photo_component_score(self, photo_scores: List[int]) -> float:
@@ -1792,7 +1944,7 @@ class ClaimOrchestrator:
         self.narrative_service = NarrativeAnalysisService(api_key)
         self.risk_service = RiskScoringService(api_key)
         
-        logger.info("🚀 ClaimOrchestrator initialized with multi-party support")
+        logger.info("ClaimOrchestrator initialized with multi-party support")
     
     @log_performance
     async def analyze_claim(
@@ -1892,6 +2044,94 @@ class ClaimOrchestrator:
                 max(assessor_cv_severities, key=lambda s: _severity_rank.get(s, 0))
                 if assessor_cv_severities else None
             )
+
+            # AI's own independent repair-cost estimate from everything
+            # detected so far (member + assessor photos) -- lets the
+            # cost-reasonableness business rule flag a human-entered figure
+            # that looks off, instead of trusting estimated_cost blindly.
+            # Advisory only: a failed/empty estimate just means the rule
+            # skips, never blocks the claim.
+            ai_cost_estimate = None
+            # Dedup by photo hash before merging damage zones -- the same
+            # physical photo can legitimately end up analyzed twice under
+            # different party labels (e.g. an assessor's upload happens to
+            # be identical to one the member already submitted, or a test
+            # artifact like this), and without this its damage gets counted
+            # once per party label instead of once, inflating the estimate.
+            seen_photo_hashes = set()
+            deduped_photos = []
+            for p in all_photos:
+                if p.hash and p.hash in seen_photo_hashes:
+                    continue
+                if p.hash:
+                    seen_photo_hashes.add(p.hash)
+                deduped_photos.append(p)
+            # Flat-concatenating zones across photos double(triple)-counts
+            # cost whenever the same physical part shows up in more than one
+            # photo -- normal and expected, since a claim's photo set is
+            # usually several angles of ONE car, not one photo per part.
+            # Keep one entry per (part, vehicle), preferring the
+            # highest-confidence read of that part across all the photos.
+            all_zones = [z for p in deduped_photos for z in (p.damage_zones or [])]
+            best_zone_by_part: Dict[tuple, Dict[str, Any]] = {}
+            for z in all_zones:
+                key = ((z.get("part") or "").lower(), (z.get("vehicle") or "").lower())
+                existing = best_zone_by_part.get(key)
+                if existing is None or (z.get("confidence") or 0) > (existing.get("confidence") or 0):
+                    best_zone_by_part[key] = z
+            merged_damage_zones = list(best_zone_by_part.values())
+            if merged_damage_zones:
+                try:
+                    import part_identifier
+
+                    policy_vehicle_make, policy_vehicle_model, policy_vehicle_year = None, None, None
+                    with db_manager.get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            """
+                            SELECT m.vehicle_make, m.vehicle_model, m.vehicle_year
+                            FROM claims c
+                            LEFT JOIN motor_policy_details m ON m.policy_id = c.policy_id
+                            WHERE c.claim_id = ?
+                            """,
+                            (claim_id,)
+                        )
+                        row = cursor.fetchone()
+                        if row:
+                            policy_vehicle_make = row["vehicle_make"]
+                            policy_vehicle_model = row["vehicle_model"]
+                            policy_vehicle_year = row["vehicle_year"]
+
+                    ai_cost_estimate = await part_identifier.estimate_damage_cost(
+                        merged_damage_zones,
+                        vehicle_make=policy_vehicle_make or "",
+                        vehicle_model=policy_vehicle_model or "",
+                        vehicle_year=str(policy_vehicle_year or ""),
+                    )
+                    if ai_cost_estimate:
+                        logger.info(
+                            f"AI damage cost estimate for {claim_id}: "
+                            f"KES {ai_cost_estimate['estimated_cost_kes']:,.0f} "
+                            f"(quoted: KES {estimated_cost:,.0f})"
+                        )
+                        # Written immediately (not deferred to the usual
+                        # post-store_claim() persistence step, unlike
+                        # simulation_video_path below) -- the
+                        # cost_reasonableness business rule reads this
+                        # straight from the DB via BusinessRulesEngine.evaluate()
+                        # further down in this same function call, before
+                        # store_claim() ever runs. store_claim()'s own
+                        # UPSERT doesn't touch this column, so this write is
+                        # never at risk of being clobbered the way
+                        # simulation_video_path is.
+                        with db_manager.get_connection() as conn:
+                            conn.execute(
+                                "UPDATE claims SET ai_estimated_cost = ? WHERE claim_id = ?",
+                                (ai_cost_estimate["estimated_cost_kes"], claim_id)
+                            )
+                            conn.commit()
+                except Exception as e:
+                    logger.warning(f"AI cost estimation step failed for {claim_id}: {e}")
 
             # Analyze repair shop photos
             if repair_photos:
@@ -2061,6 +2301,67 @@ class ClaimOrchestrator:
                     logger.error(f"Business rules evaluation failed for {claim_id}: {str(e)}")
                     business_rules_result = None
 
+            # ── Graph-based relationship analysis (Appendix C §C.2) ─────────────────
+            relationship_result = None
+            if member_id:
+                try:
+                    claim_row_for_graph = db_manager.get_claim(claim_id) or {}
+                    relationship_result = graph_relationship.analyze_relationships(
+                        db_manager, claim_id=claim_id, member_id=member_id,
+                        repair_shop_id=claim_row_for_graph.get("repair_shop_id"),
+                    )
+                    ai_rol.record_recommendation(
+                        claim_id=claim_id,
+                        capability="graph_relationship_analysis",
+                        recommendation=(
+                            f"{len(relationship_result.findings)} relationship(s) flagged"
+                            if relationship_result.findings
+                            else "No hidden relationships identified"
+                        ),
+                        confidence=None,
+                        evidence=relationship_result.to_dict(),
+                    )
+                except Exception as e:
+                    logger.error(f"Relationship analysis failed for {claim_id}: {str(e)}")
+                    relationship_result = None
+
+            # ── Narrative-similarity search (Appendix C §C.2) ───────────────────────
+            similarity_result = None
+            try:
+                corpus = db_manager.get_historical_narrative_corpus()
+                similarity_result = narrative_similarity.find_similar_narratives(member_narrative, corpus)
+                ai_rol.record_recommendation(
+                    claim_id=claim_id,
+                    capability="narrative_similarity",
+                    recommendation=(
+                        f"{len(similarity_result.matches)} similar historical narrative(s) found"
+                        if similarity_result.matches
+                        else "No similar historical narrative patterns found"
+                    ),
+                    confidence=(similarity_result.matches[0].similarity if similarity_result.matches else None),
+                    evidence=similarity_result.to_dict(),
+                )
+            except Exception as e:
+                logger.error(f"Narrative similarity search failed for {claim_id}: {str(e)}")
+                similarity_result = None
+
+            # ── Combine business-rules, relationship, and similarity signals ────────
+            # These three all produce "evidence" findings rather than continuous
+            # scores, so they're blended into one figure and fed into the risk
+            # model as a single "business_rules" component rather than adding
+            # three more weighted slots to calculate_risk_score's signature.
+            combined_evidence_score = None
+            if business_rules_result is not None or relationship_result is not None or similarity_result is not None:
+                combined_evidence_score = business_rules_result.risk_score if business_rules_result else 0
+                if relationship_result:
+                    combined_evidence_score += sum(
+                        business_rules.SEVERITY_WEIGHT.get(f.severity, 0) for f in relationship_result.findings
+                    )
+                if similarity_result and similarity_result.matches:
+                    top_match = similarity_result.matches[0]
+                    combined_evidence_score += int(top_match.similarity * top_match.fraud_score)
+                combined_evidence_score = min(100, combined_evidence_score)
+
             # Calculate risk score — picks up physics score from DB
             logger.info("Calculating risk score...")
             photo_scores = [photo.risk_score for photo in all_photos]
@@ -2071,7 +2372,7 @@ class ClaimOrchestrator:
                 location,
                 historical_data,
                 claim_id,
-                business_rules_score=(business_rules_result.risk_score if business_rules_result else None),
+                business_rules_score=combined_evidence_score,
             )
 
             # ── Apply cross-party adjustment then recalculate label ───────────────
@@ -2110,12 +2411,16 @@ class ClaimOrchestrator:
 
             # ── Business rules floor re-application ────────────────────────────────
             # Same pattern as physics: a HIGH-severity rule finding (e.g. usage-class
-            # mismatch, driver ineligibility) shouldn't get diluted away just because
-            # the other components (photo/narrative/amount/location) happen to score
-            # low on an otherwise mundane-looking claim.
-            if business_rules_result is not None:
+            # mismatch, driver ineligibility, a shared bank account across claimants)
+            # shouldn't get diluted away just because the other components
+            # (photo/narrative/amount/location) happen to score low on an otherwise
+            # mundane-looking claim. Business-rules and relationship findings share
+            # the same severity vocabulary, so they're floored together.
+            if business_rules_result is not None or relationship_result is not None:
+                all_findings = list(business_rules_result.findings if business_rules_result else []) + \
+                    list(relationship_result.findings if relationship_result else [])
                 highest_severity = max(
-                    (f.severity for f in business_rules_result.findings),
+                    (f.severity for f in all_findings),
                     key=lambda s: business_rules.SEVERITY_WEIGHT.get(s, 0),
                     default=None,
                 )
@@ -2213,6 +2518,8 @@ class ClaimOrchestrator:
                 cross_party_check=cross_party_check,
                 risk_result=risk_result,
                 business_rules_result=business_rules_result,
+                relationship_result=relationship_result,
+                similarity_result=similarity_result,
             )
 
             # ── AI-ROL: AI Advisory recommendation ─────────────────────────────────
@@ -2295,10 +2602,14 @@ class ClaimOrchestrator:
                 "cross_party_verification": cross_party_check,
                 "physics_reconstruction":   physics_summary,
                 "business_rules":           business_rules_result.to_dict() if business_rules_result else None,
+                "relationship_analysis":    relationship_result.to_dict() if relationship_result else None,
+                "narrative_similarity":     similarity_result.to_dict() if similarity_result else None,
                 "risk_scoring":             risk_result.dict(),
                 "recommendations":          risk_result.recommendations,
 
                 "estimated_cost":     estimated_cost,
+                "ai_estimated_cost":  ai_cost_estimate["estimated_cost_kes"] if ai_cost_estimate else None,
+                "ai_cost_breakdown":  ai_cost_estimate["breakdown"] if ai_cost_estimate else None,
                 "location":           location,
                 "processing_time_ms": processing_time,
                 "timestamp":          datetime.now().isoformat(),
@@ -2372,34 +2683,35 @@ Narrative:
 Respond in JSON only — no explanation outside the JSON:
 {{
     "is_collision": true/false,
-    "claim_category": "collision / fire / theft / flood / vandalism / mechanical / other",
+    "claim_category": "collision / single_vehicle_fixed_object / fire / theft / flood / vandalism / mechanical / other",
     "physics_applicable": true/false,
+    "impacts_fixed_object": true/false,
     "reason": "one sentence explanation"
 }}
- 
-physics_applicable is TRUE only when:
-- Two or more vehicles physically impacted each other, AND
-- Velocity and crush depth analysis would produce meaningful fraud signals
- 
+
+physics_applicable is TRUE when:
+- Two or more vehicles physically impacted each other (crush/velocity analysis applies to both), OR
+- ONE vehicle struck a rigid, effectively immovable fixed object -- a wall, concrete pillar/barrier, curb, or similar structure solid enough that the vehicle's own crush depth against it is physically meaningful (set claim_category to "single_vehicle_fixed_object" and impacts_fixed_object to true in this case; leave it false for the two-vehicle case)
+
 physics_applicable is FALSE for:
 - Fire (including arson)
 - Theft or attempted theft
 - Flood or weather damage
 - Vandalism with no collision
 - Mechanical breakdown
-- Single vehicle incidents with no impact (e.g. fell into ditch, tyre burst)
+- Single vehicle incidents with genuinely no measurable impact (e.g. fell into a ditch with no crush damage, tyre burst, rolled with no described contact) -- but a described impact against a wall/pillar/barrier with actual crush damage IS physics_applicable (see above)
 """
         try:
             result = await asyncio.to_thread(
                 generate_json, prompt, model=TEXT_REASONING_MODEL, retries=1, timeout=60,
             )
             logger.info(
-                f"🤖 Physics classification: {result.get('claim_category')} — "
+                f"Physics classification: {result.get('claim_category')} —"
                 f"applicable={result.get('physics_applicable')} — {result.get('reason')}"
             )
             return result
         except Exception as e:
-            logger.warning(f"⚠️ Physics classification failed: {str(e)} — defaulting to run physics")
+            logger.warning(f"Physics classification failed: {str(e)} — defaulting to run physics")
  
         return {
             "is_collision": True,
@@ -2460,7 +2772,7 @@ physics_applicable is FALSE for:
                 generate, prompt, model=TEXT_REASONING_MODEL, timeout=90,
             )
             explanation = explanation.strip()
-            logger.info(f"✅ Physics explanation generated for {result.claim_id} (model={TEXT_REASONING_MODEL})")
+            logger.info(f"Physics explanation generated for {result.claim_id} (model={TEXT_REASONING_MODEL})")
             return explanation
 
         except Exception as e:
@@ -2523,6 +2835,7 @@ physics_applicable is FALSE for:
         """
         try:
             import json as _json
+            import part_identifier
             from pipeline_bridge import get_bridge
             from physics_engine import get_engine
             from terrain_service import get_terrain
@@ -2620,6 +2933,104 @@ physics_applicable is FALSE for:
             gemini_v1_speed  = vehicles.get("v1_stated_speed_kmh")
             gemini_v2_speed  = vehicles.get("v2_stated_speed_kmh")
 
+            # ── Step 3.4: Find the actual CV-detected damage location ─────────────
+            # Previously the reconstruction's impact zone/angle only ever came
+            # from narrative text (infer_impact_zone/infer_approach_angle in
+            # pipeline_bridge.py), completely disconnected from what the
+            # member's own photos actually show -- a claim whose narrative
+            # said "front-end collision" but whose photo clearly shows door
+            # damage got animated as a head-on impact regardless. This finds
+            # the highest-confidence damage_zones[] entry already produced by
+            # part_identifier.py for this claim's photos (same data source
+            # DamagePhotoOverlay uses) so the physics input -- and therefore
+            # the rendered animation -- reflects the real damaged part rather
+            # than a narrative guess. Used below for crush depth (existing
+            # vision fallback), impact_zone_v1, and approach_angle_deg.
+            best_photo_zone, best_photo_filename, best_photo_party = None, None, None
+            try:
+                with db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT filename, analysis_result FROM claim_photos WHERE claim_id = ?",
+                        (claim_id,),
+                    )
+                    for row in cursor.fetchall():
+                        try:
+                            row_result = _json.loads(row["analysis_result"]) if row["analysis_result"] else {}
+                        except Exception:
+                            continue
+                        for zone in (row_result.get("damage_zones") or []):
+                            if best_photo_zone is None or (zone.get("confidence") or 0) > (best_photo_zone.get("confidence") or 0):
+                                best_photo_zone, best_photo_filename, best_photo_party = zone, row["filename"], row_result.get("party")
+            except Exception as e:
+                logger.warning(f"Could not look up detected damage zone for {claim_id}: {e}")
+
+            # part_identifier.py's part vocabulary (e.g. "Front Left Door")
+            # is much finer-grained than physics_engine's structural zone map
+            # (front_bumper/rear_bumper/driver_door/passenger_door/etc) --
+            # this collapses one onto the other. "Left"/"Right" maps to
+            # driver_door/passenger_door in the SAME direction pipeline_bridge.py's
+            # own narrative-keyword inference already uses (that mapping predates
+            # this change and isn't altered here, just matched for consistency).
+            _PART_TO_ZONE = {
+                "front bumper": "front_bumper", "bonnet/hood": "front_bumper", "front grille": "front_bumper",
+                "windscreen": "front_bumper", "left headlamp": "front_bumper", "right headlamp": "front_bumper",
+                "rear bumper": "rear_bumper", "boot/trunk": "rear_bumper", "rear windscreen": "rear_bumper",
+                "left taillamp": "rear_bumper", "right taillamp": "rear_bumper",
+                "front left door": "driver_door", "front left fender": "driver_door", "left pillar": "driver_door",
+                "left running board": "driver_door", "left front wing mirror": "driver_door", "left window": "driver_door",
+                "front left wheel": "driver_door",
+                "front right door": "passenger_door", "front right fender": "passenger_door", "right pillar": "passenger_door",
+                "right running board": "passenger_door", "right front wing mirror": "passenger_door", "right window": "passenger_door",
+                "front right wheel": "passenger_door",
+                "rear left door": "rear_driver", "rear left fender": "rear_driver", "rear left wheel": "rear_driver",
+                "rear right door": "rear_passenger", "rear right fender": "rear_passenger", "rear right wheel": "rear_passenger",
+                "roof": "roof",
+            }
+            photo_impact_zone = _PART_TO_ZONE.get((best_photo_zone or {}).get("part", "").lower()) if best_photo_zone else None
+            # Only zones the animation's fixed junction geometry can actually
+            # distinguish visually: a front/rear hit stays a 180°/0° approach,
+            # anything on a door/fender/pillar/wheel is a side impact (90°) --
+            # matches the same coarse angle buckets infer_approach_angle()
+            # already uses for narrative keywords, just sourced from the photo.
+            photo_impact_angle = (
+                180.0 if photo_impact_zone == "front_bumper" else
+                0.0 if photo_impact_zone == "rear_bumper" else
+                90.0 if photo_impact_zone else None
+            )
+            if photo_impact_zone:
+                logger.info(
+                    f"Impact zone for {claim_id}: CV-detected '{best_photo_zone.get('part')}' "
+                    f"on '{best_photo_filename}' (confidence {best_photo_zone.get('confidence')}) "
+                    f"-> {photo_impact_zone}, angle {photo_impact_angle}° -- overriding narrative-inferred zone/angle"
+                )
+
+            # Claimant-confirmed position (FNOL "where was the other vehicle"
+            # question) -- a STATED input, same tier as stated speed/crush
+            # depth: used as the geometry when nothing stronger exists, but
+            # cross-checked against CV-detected damage location (harder for a
+            # colluding claimant to fake, since photos were uploaded
+            # separately) rather than trusted blindly. Precedence: CV-detected
+            # > claimant-stated > narrative keyword guess.
+            from pipeline_bridge import infer_stated_collision_geometry
+            stated_geometry = infer_stated_collision_geometry(source_narrative)
+            geometry_source = "cv_detected" if photo_impact_zone else "narrative_inferred"
+            if stated_geometry:
+                stated_zone, stated_angle = stated_geometry
+                if photo_impact_zone and photo_impact_zone != stated_zone:
+                    measurement_flags.append(
+                        f"Claimant said the other vehicle struck their {stated_zone.replace('_', ' ')}, "
+                        f"but the uploaded photos show damage consistent with {photo_impact_zone.replace('_', ' ')} -- "
+                        f"using the photo-detected location for reconstruction"
+                    )
+                elif not photo_impact_zone:
+                    photo_impact_zone, photo_impact_angle = stated_zone, stated_angle
+                    geometry_source = "claimant_stated"
+                    logger.info(
+                        f"Impact zone for {claim_id}: claimant-stated '{stated_zone}', "
+                        f"angle {stated_angle}° -- overriding narrative-inferred zone/angle"
+                    )
+
             # Assessor's on-site measurements still take priority over
             # narrative-text inference for the reconstruction run itself
             # ("measured beats guessed"), but they are NOT blindly trusted --
@@ -2674,6 +3085,50 @@ physics_applicable is FALSE for:
                 if assessor_flag:
                     measurement_flags.append(assessor_flag + " (weaker signal — assessor-supplied photos)")
                 gemini_crush = assessor_crush_depth_mm
+                crush_source = "assessor_measured"
+            elif narrative_crush:
+                crush_source = "llm_extracted"
+            else:
+                # Neither the narrative nor an assessor gave a crush-depth
+                # number -- previously this meant physics ran with
+                # crush_depth_mm=0 (no independent speed-vs-damage check at
+                # all, just echoing the stated speed back). Try a vision-
+                # based estimate from the claim's own damage photos first,
+                # so the reconstruction doesn't depend on a human having
+                # typed a number in. Genuinely a rough single-photo
+                # estimate, not a measurement -- tagged as such in
+                # data_sources below, never presented as "measured".
+                crush_source = "not_available"
+                try:
+                    v1_make_for_lookup = policy_vehicle_make or vehicles.get("v1_make") or ""
+                    v1_model_for_lookup = policy_vehicle_model or vehicles.get("v1_model") or ""
+                    v1_profile, _ = get_vehicle_profile(v1_make_for_lookup, v1_model_for_lookup, vehicles.get("v1_body_type"))
+
+                    # Reuses best_photo_zone/best_photo_filename/best_photo_party
+                    # from the CV-detected-damage-location lookup above (Step
+                    # 3.4) instead of re-querying the same table a second time.
+                    if best_photo_zone and best_photo_filename:
+                        with db_manager.get_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT file_data FROM claim_photo_files WHERE claim_id = ? AND filename = ? AND party = ?",
+                                (claim_id, best_photo_filename, best_photo_party or "member"),
+                            )
+                            file_row = cursor.fetchone()
+                        if file_row and file_row["file_data"]:
+                            vision_estimate = await part_identifier.estimate_crush_depth_mm(
+                                file_row["file_data"], best_photo_zone.get("part", "damaged panel"), v1_profile.width_mm,
+                            )
+                            if vision_estimate and vision_estimate["confidence"] >= 30:
+                                gemini_crush = vision_estimate["crush_depth_mm"]
+                                crush_source = "vision_estimated"
+                                logger.info(
+                                    f"Crush depth for {claim_id}: vision-estimated {gemini_crush}mm "
+                                    f"(confidence {vision_estimate['confidence']}%, from '{best_photo_filename}') "
+                                    f"-- no narrative or assessor figure was available"
+                                )
+                except Exception as e:
+                    logger.warning(f"Vision crush-depth fallback failed for {claim_id}: {e}")
 
             if assessor_approach_angle_deg is not None:
                 logger.info(
@@ -2719,6 +3174,35 @@ physics_applicable is FALSE for:
                     f"V2 stationary at impact for {claim_id} — speed set to 0 km/h"
                 )
 
+            # ── Step 3.5: Single-vehicle-vs-fixed-object impacts ───────────────────
+            # A single vehicle hitting a wall/pillar/barrier previously got
+            # skipped entirely -- there's no second vehicle, but there IS a
+            # real physical impact whose crush depth still says something
+            # about impact speed (the McHenry crush-energy math in
+            # physics_engine.py never actually needed a second vehicle for
+            # V1's own speed-vs-crush check; only the momentum/ΔV step does,
+            # and a barrier's momentum contribution is trivial once treated
+            # as effectively immovable). Route these through the same
+            # reconstruct() call with a synthetic 50-tonne "fixed_object"
+            # profile as V2 instead of skipping -- see vehicle_registry.py's
+            # FALLBACK_PROFILES["fixed_object"] for why that mass value.
+            impacts_fixed_object = bool(classification.get("impacts_fixed_object"))
+            if impacts_fixed_object:
+                vehicles = dict(vehicles)
+                vehicles["v2_make"] = "Fixed Object"
+                vehicles["v2_model"] = "Barrier"
+                vehicles["v2_body_type"] = "fixed_object"
+                v2_speed = 0.0
+                logger.info(f"Physics for {claim_id}: single-vehicle-vs-fixed-object impact — reconstructing against a synthetic immovable barrier instead of skipping")
+
+            # The CV-detected damage location (Step 3.4) beats a narrative-
+            # text angle guess the same way it beats narrative crush depth --
+            # but an assessor's own on-site angle measurement still wins over
+            # either (assessor_approach_angle_deg, applied earlier above,
+            # already sits in gemini_angle by this point when present).
+            if photo_impact_zone and assessor_approach_angle_deg is None:
+                gemini_angle = photo_impact_angle
+
             # ── Step 4: Run reconstruction ────────────────────────────────────────
             bridge = get_bridge()
             engine = get_engine()
@@ -2738,6 +3222,7 @@ physics_applicable is FALSE for:
                 v2_stated_speed_kmh=v2_speed,
                 crush_depth_mm=float(gemini_crush or 0),
                 approach_angle_deg=float(gemini_angle) if gemini_angle is not None else 0.0,
+                impact_zone_v1=photo_impact_zone or "",
             )
 
             if policy_vehicle_make:
@@ -2747,7 +3232,7 @@ physics_applicable is FALSE for:
                 )
 
             for flag in measurement_flags:
-                physics_input.warnings.append(f"⚠️ MEASUREMENT DISCREPANCY: {flag}")
+                physics_input.warnings.append(f"MEASUREMENT DISCREPANCY: {flag}")
 
             # ── Step 5: Post-hoc overrides ────────────────────────────────────────
             if not gemini_crush:
@@ -2758,9 +3243,15 @@ physics_applicable is FALSE for:
                     f"Assessor measurement required."
                 )
             else:
-                crush_source = "assessor measurement" if assessor_crush_depth_mm is not None else "Gemini extraction"
+                # NOTE: deliberately NOT named crush_source -- that name is
+                # already used above (Step 3) to build data_sources["crush_depth"],
+                # and Python has no block scoping, so reusing it here silently
+                # overwrote the real value (e.g. "vision_estimated") right
+                # before the final dict was built. This is a log-message-only
+                # label, unrelated to data_sources.
+                crush_log_label = "assessor measurement" if assessor_crush_depth_mm is not None else "LLM extraction"
                 logger.info(
-                    f"Crush depth from {crush_source}: {gemini_crush}mm for {claim_id}"
+                    f"Crush depth from {crush_log_label}: {gemini_crush}mm for {claim_id}"
                 )
 
             if v2_stationary:
@@ -2795,9 +3286,9 @@ physics_applicable is FALSE for:
                     w for w in physics_input.warnings
                     if "Approach angle inferred" not in w
                 ]
-                angle_source = "assessor measurement" if assessor_approach_angle_deg is not None else "Gemini extraction"
+                angle_log_label = "assessor measurement" if assessor_approach_angle_deg is not None else "LLM extraction"
                 physics_input.warnings.append(
-                    f"Approach angle from {angle_source}: {gemini_angle}°"
+                    f"Approach angle from {angle_log_label}: {gemini_angle}°"
                 )
 
             logger.info(
@@ -2850,15 +3341,76 @@ physics_applicable is FALSE for:
                     }
                 })
 
+                # `or` chains here previously treated a genuine 0 km/h as
+                # "no value, use the fallback" (Python's `or` can't tell
+                # "explicitly zero" from "unset") -- for a fixed-object
+                # barrier reconstruction (see the single-vehicle-vs-object
+                # path above), v2's speed is deliberately 0 everywhere, so
+                # this silently fell through to a hardcoded "50.0" and
+                # animated the barrier as a moving vehicle, which is
+                # physically nonsensical (fixed objects don't move). Explicit
+                # None-checks, plus a hard lock to 0 for a fixed_object V2
+                # regardless of anything computed upstream.
+                # Mirrors v2_sim_speed's existing precedence below -- prefer
+                # the physics-reconstructed speed (the same number shown as
+                # "V1 physics-derived" in the Evidence Panel) over the raw
+                # claimed speed, so the animation's HUD can't show a
+                # different V1 speed than the evidence sitting right next to
+                # it. Previously this always used the stated speed while V2
+                # already used the reconstructed one -- that asymmetry, plus
+                # multi_vehicle_simulation.py separately re-deriving V1's
+                # speed from a disconnected momentum formula, is what let
+                # the Live Reconstruction HUD show 87 km/h while Speed
+                # Analysis showed 33.5 km/h for the same claim.
+                if result.computed_speed_v1_kmh is not None:
+                    v1_sim_speed = result.computed_speed_v1_kmh
+                elif physics_input.v1_stated_speed_kmh is not None:
+                    v1_sim_speed = physics_input.v1_stated_speed_kmh
+                else:
+                    v1_sim_speed = 0.0
+                if physics_input.v2_body_type == "fixed_object":
+                    v2_sim_speed = 0.0
+                elif result.computed_speed_v2_kmh is not None:
+                    v2_sim_speed = result.computed_speed_v2_kmh
+                elif physics_input.v2_stated_speed_kmh is not None:
+                    v2_sim_speed = physics_input.v2_stated_speed_kmh
+                else:
+                    v2_sim_speed = 50.0
+
+                # Real collision geometry, not the old fixed 90-degree T-bone
+                # crossing every claim rendered as regardless of what
+                # actually happened. impact_zone_v1 already carries a
+                # left/right side signal (driver_door/rear_driver = left,
+                # passenger_door/rear_passenger = right) via the same
+                # zone that was resolved above -- CV-detected-from-photos
+                # when available, claimant-confirmed via the FNOL
+                # "other vehicle position" question when narrative-inferred,
+                # narrative keyword guess otherwise. front_bumper/rear_bumper/
+                # roof carry no side information (angle alone, near-parallel,
+                # is symmetric either way), so default to "right" there --
+                # preserves the old hardcoded visual for every claim that
+                # doesn't have a real side signal, rather than silently
+                # changing already-correct-looking simulations.
+                _side_zones_left = ("driver_door", "rear_driver")
+                _side_zones_right = ("passenger_door", "rear_passenger")
+                if physics_input.impact_zone_v1 in _side_zones_left:
+                    impact_side = "left"
+                elif physics_input.impact_zone_v1 in _side_zones_right:
+                    impact_side = "right"
+                else:
+                    impact_side = "right"
+
                 sim_payload = {
                     "claim_id": claim_id,
+                    "approach_angle_deg": physics_input.approach_angle_deg,
+                    "impact_side": impact_side,
                     "environment_snapshot": {
                         "resolved_friction_mu": terrain.friction_coefficient,
                     },
                     "vehicles": [
                         {
                             "model_identity": physics_input.v1_model.lower().replace(" ", "_"),
-                            "stated_speed_kmh": physics_input.v1_stated_speed_kmh or 0.0,
+                            "stated_speed_kmh": v1_sim_speed,
                             "damage": {
                                 "depth_meters": (physics_input.crush_depth_mm or 30.0) / 1000,
                                 "width_meters": (profile_v1.width_mm / 1000) * 0.4,
@@ -2866,11 +3418,7 @@ physics_applicable is FALSE for:
                         },
                         {
                             "model_identity": physics_input.v2_model.lower().replace(" ", "_"),
-                            "stated_speed_kmh": (
-                                result.computed_speed_v2_kmh
-                                or physics_input.v2_stated_speed_kmh
-                                or 50.0
-                            ),
+                            "stated_speed_kmh": v2_sim_speed,
                             "damage": {
                                 "depth_meters": 0.05,
                                 "width_meters": 0.80,
@@ -2881,6 +3429,42 @@ physics_applicable is FALSE for:
 
                 sim_engine = ConfigurableMultiVehicleEngine(registry_json)
                 timeline_output = sim_engine.generate_simulation_timeline(sim_payload)
+
+                # ConfigurableMultiVehicleEngine models a generic two-BODY
+                # collision, where both sides get a post-impact recoil
+                # velocity from their own crush energy (delta_v2 above) --
+                # correct for two real vehicles, but physically wrong for a
+                # fixed barrier/pillar/wall, which cannot move no matter what
+                # the crush-energy math says. Rather than special-case the
+                # shared two-vehicle engine, force V2's entire telemetry
+                # stationary here whenever it's the synthetic fixed_object
+                # profile -- position pinned at the impact point, velocity
+                # 0 for every frame, pre- and post-impact alike.
+                if physics_input.v2_body_type == "fixed_object" and timeline_output:
+                    for frame in timeline_output["v2_third_party_telemetry"]:
+                        frame["position"] = [0.0, 0.0, 0.0]
+                        frame["velocity_kmh"] = 0.0
+                    timeline_output["simulation_metadata"]["v2_pre_impact_speed_kmh"] = 0.0
+                    timeline_output["simulation_metadata"]["delta_v2_kmh"] = 0.0
+
+                    # The generic engine's post-impact formula (v1_pos_y =
+                    # v1_speed * t for t>0) assumes V1 separates from a V2
+                    # that also moves out of the way -- against a rigid,
+                    # immovable barrier that's physically wrong: unless
+                    # delta_v1 fully removes V1's forward momentum, it kept
+                    # advancing PAST the origin, visually driving straight
+                    # through the wall for the rest of the clip (this is
+                    # almost certainly what looked like "hitting the barrier
+                    # twice" -- the car overlapping the barrier's drawn
+                    # footprint again after the initial impact frame, rather
+                    # than stopping at it). Clamp V1 to never cross y=0 --
+                    # a car crumples against a wall and stops, it doesn't
+                    # pass through it.
+                    for frame in timeline_output["v1_insured_telemetry"]:
+                        if frame["time_sec"] > 0 and frame["position"][1] > 0:
+                            frame["position"] = [0.0, 0.0, 0.0]
+                            frame["velocity_kmh"] = 0.0
+
                 logger.info(
                     f"Timeline generated for {claim_id}: "
                     f"{timeline_output['simulation_metadata']['total_frames_generated']} frames"
@@ -2992,6 +3576,15 @@ physics_applicable is FALSE for:
                 "status":              "complete",
                 "claim_category":      classification.get("claim_category"),
                 "pathway":             result.pathway,
+                "vehicle_1_key":       result.vehicle_1_key,
+                "vehicle_2_key":       result.vehicle_2_key,
+                # vehicle_2_key is a human-readable string ("Fixed Object
+                # Barrier (body_type_fallback)"), not a structured field --
+                # the frontend has no reliable way to parse "is V2 actually a
+                # barrier, not a car" back out of it. Send the real
+                # body_type directly so the reconstruction canvas can render
+                # a wall instead of a car silhouette for V2 without guessing.
+                "v2_body_type":        physics_input.v2_body_type,
                 "physics_fraud_score": result.physics_fraud_score,
                 "physics_verdict":     result.physics_verdict,
                 "confidence":          result.confidence,
@@ -3004,6 +3597,31 @@ physics_applicable is FALSE for:
                 "has_measurement_discrepancy": bool(measurement_flags),
                 "timeline":            timeline_output,
                 "simulation_video_path": video_path,
+                # ΔV/energy/impact-force numbers the reconstruction UI's
+                # Impact Analysis panel needs -- previously computed on
+                # PhysicsResult but never surfaced past this function.
+                # impact_force/vertex are ONLY populated on Pathway 1
+                # (telemetry) claims -- None on Pathway 2, which the UI must
+                # show as an honest "unavailable" state rather than a
+                # fabricated value.
+                "delta_v_kmh":         result.delta_v_kmh,
+                "kinetic_energy_j":    result.kinetic_energy_j,
+                "crush_energy_j":      result.crush_energy_j,
+                "energy_consistent":   result.energy_consistent,
+                "impact_force_magnitude_n": result.impact_force_magnitude_n,
+                "impact_force_is_estimated": result.impact_force_is_estimated,
+                "v1_impact_vertex_xyz": result.v1_impact_vertex_xyz,
+                "terrain_adjusted":    result.terrain_adjusted,
+                "slope_adjustment_kmh": result.slope_adjustment_kmh,
+                # The actual structural zone used for this reconstruction
+                # (front_bumper/rear_bumper/driver_door/etc) plus, when it
+                # came from a real photo rather than a narrative guess, the
+                # CV-detected part name/confidence -- lets the reconstruction
+                # UI orient the animation/highlight toward where the vehicle
+                # was actually damaged instead of a generic head-on default.
+                "impact_zone_v1": physics_input.impact_zone_v1,
+                "impact_zone_v1_source": geometry_source,
+                "impact_zone_v1_detected_part": (best_photo_zone or {}).get("part") if geometry_source == "cv_detected" else None,
                 # Claimed-vs-reconstructed comparison data -- computed by
                 # PhysicsResult already, but previously only written to the
                 # DB's standalone `physics_result` column (never read back by
@@ -3032,22 +3650,33 @@ physics_applicable is FALSE for:
                     "impact_consistency_score": result.impact_consistency_score,
                     "v1_speed_is_inferred": result.v1_speed_is_inferred,
                     "v1_speed_confidence": result.v1_speed_confidence,
+                    # approach_angle_deg is only ever an INPUT to reconstruct()
+                    # (physics_engine.py) -- never carried onto PhysicsResult
+                    # itself, so it was previously invisible to every consumer
+                    # of this dict. Echoing the resolved input value here (not
+                    # a physics calculation) lets the UI show the real angle
+                    # instead of omitting it or inventing one.
+                    "approach_angle_deg": physics_input.approach_angle_deg,
+                    "data_quality_score": physics_input.data_quality_score,
                 },
                 "data_sources": {
-                    "crush_depth":    "assessor_measured" if assessor_crush_depth_mm is not None else (
-                                      "gemini_extracted" if gemini_crush else "not_available"
-                                      ),
+                    # crush_source is tracked explicitly above (assessor /
+                    # narrative / vision-estimated / unavailable) rather than
+                    # re-derived here, since "gemini_crush is truthy" alone
+                    # can no longer distinguish a narrative figure from a
+                    # vision estimate -- both populate the same variable.
+                    "crush_depth":    crush_source,
                     "v1_speed":       "stationary_override" if v1_stationary else (
-                                      "gemini_extracted" if gemini_v1_speed else "keyword_inferred"
+                                      "llm_extracted" if gemini_v1_speed else "keyword_inferred"
                                       ),
                     "v2_speed":       "stationary_override" if v2_stationary else (
-                                      "gemini_extracted" if gemini_v2_speed else "keyword_inferred"
+                                      "llm_extracted" if gemini_v2_speed else "keyword_inferred"
                                       ),
                     "approach_angle": "assessor_measured" if assessor_approach_angle_deg is not None else (
-                                      "gemini_extracted" if gemini_angle is not None else "keyword_inferred"
+                                      "llm_extracted" if gemini_angle is not None else "keyword_inferred"
                                       ),
-                    "v1_vehicle":     "gemini_extracted" if vehicles.get("v1_make") else "keyword_inferred",
-                    "v2_vehicle":     "gemini_extracted" if vehicles.get("v2_make") else "keyword_inferred",
+                    "v1_vehicle":     "llm_extracted" if vehicles.get("v1_make") else "keyword_inferred",
+                    "v2_vehicle":     "llm_extracted" if vehicles.get("v2_make") else "keyword_inferred",
                     "mchenry_ran":    gemini_crush is not None,
                 },
             }
@@ -3068,7 +3697,7 @@ physics_applicable is FALSE for:
         Uses Gemini AI to identify inconsistencies between parties
         """
         
-        logger.info("🔍 Starting enhanced cross-party consistency verification")
+        logger.info("Starting enhanced cross-party consistency verification")
         
         inconsistencies = []
         
@@ -3092,7 +3721,7 @@ physics_applicable is FALSE for:
         for party, hashes in photo_hashes_by_party.items():
             for h in hashes:
                 if h in all_hashes:
-                    logger.warning(f"🚨 Cross-party duplicate: {party} and {all_hashes[h]} share photo {h[:12]}...")
+                    logger.warning(f"Cross-party duplicate: {party} and {all_hashes[h]} share photo {h[:12]}...")
                     inconsistencies.append({
                         "type": "duplicate_photo_cross_party",
                         "severity": "critical",
@@ -3103,7 +3732,7 @@ physics_applicable is FALSE for:
         
         # 2. AI-Powered narrative consistency check using Gemini
         if self.narrative_service.gemini_model and assessor_analysis:
-            logger.info("🤖 Running AI-powered cross-party narrative verification")
+            logger.info("Running AI-powered cross-party narrative verification")
             try:
                 ai_verification = await self._ai_verify_narratives(
                     member_analysis,
@@ -3112,11 +3741,11 @@ physics_applicable is FALSE for:
                 )
                 
                 if ai_verification.get("inconsistencies"):
-                    logger.warning(f"⚠️ AI detected {len(ai_verification['inconsistencies'])} cross-party inconsistencies")
+                    logger.warning(f"AI detected {len(ai_verification['inconsistencies'])} cross-party inconsistencies")
                     inconsistencies.extend(ai_verification["inconsistencies"])
                 
             except Exception as e:
-                logger.error(f"❌ AI verification failed: {str(e)}")
+                logger.error(f"AI verification failed: {str(e)}")
         
         # 3. Check basic credibility score differences
         if assessor_analysis:
@@ -3167,7 +3796,7 @@ physics_applicable is FALSE for:
                 
                 # If difference is more than 1 level (e.g., minor vs severe)
                 if abs(member_idx - assessor_idx) > 1:
-                    logger.warning(f"⚠️ Damage severity mismatch: Member '{member_sev}' vs Assessor '{assessor_sev}'")
+                    logger.warning(f"Damage severity mismatch: Member'{member_sev}'vs Assessor'{assessor_sev}'")
                     inconsistencies.append({
                         "type": "damage_severity_mismatch",
                         "severity": "high",
@@ -3209,9 +3838,9 @@ physics_applicable is FALSE for:
         
         cross_party_risk = min(cross_party_risk, 100)
         
-        logger.info(f"✅ Cross-party verification complete:")
-        logger.info(f"   🚨 Inconsistencies found: {len(inconsistencies)}")
-        logger.info(f"   📈 Cross-party risk score: {cross_party_risk}/100")
+        logger.info(f"Cross-party verification complete:")
+        logger.info(f"Inconsistencies found: {len(inconsistencies)}")
+        logger.info(f"Cross-party risk score: {cross_party_risk}/100")
         
         return {
             "inconsistencies_found": len(inconsistencies) > 0,
@@ -3252,6 +3881,8 @@ physics_applicable is FALSE for:
         cross_party_check: Dict[str, Any],
         risk_result: RiskScoringSchema,
         business_rules_result: Optional["business_rules.BusinessRulesResult"] = None,
+        relationship_result: Optional["graph_relationship.RelationshipResult"] = None,
+        similarity_result: Optional["narrative_similarity.SimilarityResult"] = None,
     ) -> Dict[str, Any]:
         """
         Consolidates Narrative Intelligence + Computer Vision + Physics &
@@ -3286,6 +3917,12 @@ physics_applicable is FALSE for:
         business_rules_section = (
             business_rules_result.observation_text if business_rules_result else "Not evaluated."
         )
+        relationship_section = (
+            relationship_result.observation_text if relationship_result else "Not evaluated."
+        )
+        similarity_section = (
+            similarity_result.observation_text if similarity_result else "Not evaluated."
+        )
 
         user_text = f"""CLAIM {claim_id}
 Estimated cost: KES {estimated_cost:,.0f}
@@ -3308,6 +3945,12 @@ inconsistency_count={cross_party_check.get('inconsistency_count', 0)}
 Business Rules Engine findings:
 {business_rules_section}
 
+Graph-based relationship analysis (shared phone/bank/repair-shop across claimants):
+{relationship_section}
+
+Narrative-similarity search against historical claims:
+{similarity_section}
+
 Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result.risk_level.value})
 """
 
@@ -3319,10 +3962,12 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
             )
             advisory["source"] = "claims-advisory-v1"
             advisory["business_rules_observation"] = business_rules_section
-            logger.info(f"✅ AI Advisory generated for {claim_id}: {advisory.get('recommended_action')}")
+            advisory["relationship_analysis_observation"] = relationship_section
+            advisory["narrative_similarity_observation"] = similarity_section
+            logger.info(f"AI Advisory generated for {claim_id}: {advisory.get('recommended_action')}")
             return advisory
         except Exception as e:
-            logger.error(f"❌ AI Advisory consolidation failed for {claim_id}: {e}, using rule-based fallback")
+            logger.error(f"AI Advisory consolidation failed for {claim_id}: {e}, using rule-based fallback")
             return {
                 "narrative_intelligence_observation": narrative_section if inconsistency_lines else "None",
                 "computer_vision_observation": photo_section if photo_anomaly_lines else "None",
@@ -3332,6 +3977,8 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
                     if cross_party_check.get("inconsistencies_found") else "None"
                 ),
                 "business_rules_observation": business_rules_section,
+                "relationship_analysis_observation": relationship_section,
+                "narrative_similarity_observation": similarity_section,
                 "early_risk_indicator": risk_result.risk_level.value.capitalize(),
                 "confidence": 0.5,
                 "recommended_action": "Refer for Manual Review",
@@ -3404,17 +4051,17 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
             Flag only SUBSTANTIVE inconsistencies that indicate potential fraud or confusion.
             """
             
-            logger.info(f"🤖 Sending cross-party verification request to {TEXT_REASONING_MODEL}...")
+            logger.info(f"Sending cross-party verification request to {TEXT_REASONING_MODEL}...")
             result = await asyncio.to_thread(
                 generate_json, prompt, model=TEXT_REASONING_MODEL, retries=1, timeout=120,
             )
 
-            logger.info(f"✅ AI verification complete - Consistency: {result.get('overall_consistency_score', 0)}%")
+            logger.info(f"AI verification complete - Consistency: {result.get('overall_consistency_score', 0)}%")
             
             return result
             
         except Exception as e:
-            logger.error(f"❌ AI narrative verification failed: {str(e)}")
+            logger.error(f"AI narrative verification failed: {str(e)}")
             return {"inconsistencies": []}
     
     def _parse_ai_verification_response(self, response_text: str) -> Dict[str, Any]:
@@ -3434,7 +4081,7 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
                     return parsed
             
         except Exception as e:
-            logger.error(f"❌ Error parsing AI verification response: {str(e)}")
+            logger.error(f"Error parsing AI verification response: {str(e)}")
         
         # Fallback
         return {
@@ -3449,5 +4096,5 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
 def create_claim_orchestrator(gemini_api_key: str = None) -> ClaimOrchestrator:
     """Create ClaimOrchestrator with API key"""
     api_key = gemini_api_key or GEMINI_API_KEY
-    logger.info(f"✅ Creating ClaimOrchestrator with API key: ***{api_key[-4:]}")
+    logger.info(f"Creating ClaimOrchestrator with API key: ***{api_key[-4:]}")
     return ClaimOrchestrator(api_key)

@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { ReactNode, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 interface MemberLayoutProps {
@@ -18,11 +18,25 @@ export default function MemberLayout({ children, memberName, memberId }: MemberL
   const navigate = useNavigate();
   const name = memberName || localStorage.getItem("memberName") || "Member";
   const id = memberId || localStorage.getItem("memberId") || "";
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
-      {/* Sidebar */}
-      <aside className="w-64 flex-shrink-0 border-r border-primary/10 bg-card flex flex-col justify-between p-4">
+      {/* Mobile backdrop */}
+      {mobileMenuOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 z-40 md:hidden"
+          onClick={() => setMobileMenuOpen(false)}
+        />
+      )}
+
+      {/* Sidebar -- off-canvas drawer below md, static column at md+ */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 w-64 flex-shrink-0 border-r border-primary/10 bg-card flex flex-col justify-between p-4
+          transform transition-transform duration-200 ease-out
+          md:static md:translate-x-0
+          ${mobileMenuOpen ? "translate-x-0" : "-translate-x-full"}`}
+      >
         <div className="flex flex-col gap-8">
           {/* Branding */}
           <div className="flex items-center gap-3 px-2">
@@ -49,6 +63,7 @@ export default function MemberLayout({ children, memberName, memberId }: MemberL
                 <Link
                   key={item.label}
                   to={item.path}
+                  onClick={() => setMobileMenuOpen(false)}
                   className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${
                     isActive
                       ? "bg-primary text-primary-foreground"
@@ -80,13 +95,21 @@ export default function MemberLayout({ children, memberName, memberId }: MemberL
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-y-auto">
         {/* Header */}
-        <header className="h-16 border-b border-primary/10 bg-card/80 backdrop-blur-md flex items-center justify-between px-8 sticky top-0 z-10">
-          <div className="flex items-center gap-4 flex-1 max-w-xl">
-            <button onClick={() => navigate(-1)} className="flex items-center gap-1 text-muted-foreground hover:text-primary transition-colors text-sm font-medium">
+        <header className="h-16 border-b border-primary/10 bg-card/80 backdrop-blur-md flex items-center justify-between px-4 sm:px-8 sticky top-0 z-10 gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 flex-1 min-w-0">
+            <button
+              type="button"
+              className="md:hidden flex items-center justify-center size-9 rounded-lg border border-border text-foreground shrink-0"
+              aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
+              onClick={() => setMobileMenuOpen((v) => !v)}
+            >
+              <span className="material-symbols-outlined">{mobileMenuOpen ? "close" : "menu"}</span>
+            </button>
+            <button onClick={() => navigate(-1)} className="hidden sm:flex items-center gap-1 text-muted-foreground hover:text-primary transition-colors text-sm font-medium shrink-0">
               <span className="material-symbols-outlined text-[20px]">chevron_left</span>
               Back
             </button>
-            <div className="relative w-full">
+            <div className="relative w-full hidden sm:block max-w-xl">
               <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-[20px]">search</span>
               <input
                 className="w-full pl-10 pr-4 py-2 bg-background border-none rounded-lg focus:ring-2 focus:ring-primary/50 text-sm"

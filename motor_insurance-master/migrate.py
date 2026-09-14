@@ -199,7 +199,7 @@ def create_tables(conn):
     ''')
 
     conn.commit()
-    print("✅ All tables created/verified")
+    print("All tables created/verified")
 
 
 # ─────────────────────────────────────────────
@@ -223,7 +223,7 @@ def seed_members(conn):
             "INSERT OR IGNORE INTO members (member_id, name, email, phone) VALUES (?,?,?,?)", m
         )
     conn.commit()
-    print(f"✅ Seeded {len(MEMBERS)} members")
+    print(f"Seeded {len(MEMBERS)} members")
 
 
 # ─────────────────────────────────────────────
@@ -275,7 +275,7 @@ def seed_policies(conn):
         policies.append(pid)
 
     conn.commit()
-    print(f"✅ Seeded {len(policies)} policies + motor details")
+    print(f"Seeded {len(policies)} policies + motor details")
     return policies
 
 
@@ -302,7 +302,7 @@ def seed_assessors(conn):
             VALUES (?,?,?,?,?,?,?,?,?)
         """, a)
     conn.commit()
-    print(f"✅ Seeded {len(ASSESSORS)} assessors")
+    print(f"Seeded {len(ASSESSORS)} assessors")
 
 
 # ─────────────────────────────────────────────
@@ -326,7 +326,7 @@ def seed_repair_shops(conn):
             VALUES (?,?,?,?,?,?,?,?)
         """, s)
     conn.commit()
-    print(f"✅ Seeded {len(SHOPS)} repair shops")
+    print(f"Seeded {len(SHOPS)} repair shops")
 
 
 # ─────────────────────────────────────────────
@@ -403,7 +403,7 @@ def seed_claims(conn):
         claim_ids.append((claim_id, member_id, policy_id, location, risk_level))
 
     conn.commit()
-    print(f"✅ Seeded {len(claim_ids)} claims")
+    print(f"Seeded {len(claim_ids)} claims")
     return claim_ids
 
 
@@ -450,7 +450,7 @@ def seed_assignments(conn, claim_ids):
             """, (claim_id, "assessment_complete", assessor_id, "Report submitted"))
 
     conn.commit()
-    print(f"✅ Seeded assignments and status history for {len(claim_ids)} claims")
+    print(f"Seeded assignments and status history for {len(claim_ids)} claims")
 
 
 # ─────────────────────────────────────────────
@@ -471,14 +471,14 @@ def seed_metrics(conn):
             (name, value)
         )
     conn.commit()
-    print(f"✅ Seeded {len(metrics)} system metrics")
+    print(f"Seeded {len(metrics)} system metrics")
 
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n🌱 Seeding Old Mutual Underwriting AI database...\n")
+    print("\n Seeding Old Mutual Underwriting AI database...\n")
     conn = get_conn()
 
     create_tables(conn)
@@ -491,7 +491,7 @@ if __name__ == "__main__":
     seed_metrics(conn)
 
     conn.close()
-    print("\n✅ Database seeding complete!")
+    print("\n Database seeding complete!")
     print(f"   Members: {len(MEMBERS)}")
     print(f"   Policies: {len(MEMBERS)}")
     print(f"   Assessors: {len(ASSESSORS)}")

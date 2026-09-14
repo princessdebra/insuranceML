@@ -34,11 +34,11 @@ const RESPONSES = {
     "Is there anything else the claims team should know? (Type 'none' if not applicable)"
   ],
   SCHEDULING: [
-    "Updating assignment status and notifying the member... ⏳",
-    "Syncing schedule with the claims management system... 📡",
-    "Transmitting inspection data to the dispatch team... ⚙️",
-    "Finalizing the calendar entry and triggering notifications... ✍️",
-    "Registering the inspection details in the central database... 📂"
+    "Updating assignment status and notifying the member...",
+    "Syncing schedule with the claims management system...",
+    "Transmitting inspection data to the dispatch team...",
+    "Finalizing the calendar entry and triggering notifications...",
+    "Registering the inspection details in the central database..."
   ],
   CONFIRM_PROMPT: [
     "Please confirm the inspection schedule:",
@@ -272,7 +272,7 @@ export default function ScheduleInspectionChatbot() {
         );
         setStep("FINISHED");
       } else {
-        await addBotMessage(`❌ Error: ${result.message}`);
+        await addBotMessage(`Error: ${result.message}`);
         setStep("ASK_NOTES");
       }
     } catch (e) {

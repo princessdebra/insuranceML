@@ -34,8 +34,8 @@ const RESPONSES = {
     "Technical summary needed: Describe the nature of the damage and integrity of the vehicle:"
   ],
   ANALYZING_REPORT: [
-    "Reviewing your findings for completeness... 🔍",
-    "Checking whether this has enough technical detail... 🧠",
+    "Reviewing your findings for completeness...",
+    "Checking whether this has enough technical detail...",
   ],
   ASK_CRUSH_DEPTH: [
     "What is the measured crush/deformation depth in mm? (Enter your best on-site measurement, or 'unknown')",
@@ -57,11 +57,11 @@ const RESPONSES = {
     "Visual verification needed: Upload your assessment photos to wrap up this report:"
   ],
   SUBMITTING: [
-    "Synchronizing assessment data with the claims engine... 🚀",
-    "Transmitting technical forensics to the head office... 📡",
-    "Uploading digital assets and finalized valuation... ⚙️",
-    "Encrypting report data and pushing to the central database... 📂",
-    "Finalizing diagnostic transmission. Please wait... ⏳"
+    "Synchronizing assessment data with the claims engine...",
+    "Transmitting technical forensics to the head office...",
+    "Uploading digital assets and finalized valuation...",
+    "Encrypting report data and pushing to the central database...",
+    "Finalizing diagnostic transmission. Please wait..."
   ]
 };
 
@@ -400,12 +400,12 @@ export default function StartInspectionChatbot() {
                     <div>
                       <label className="text-[10px] text-muted-foreground mb-1 block">Garage Quote photo</label>
                       <Input type="file" accept="image/*" className="text-xs cursor-pointer" onChange={(e) => setGarageQuote(e.target.files?.[0] || null)} />
-                      {garageQuote && <p className="text-[10px] text-emerald-600 mt-1">✓ {garageQuote.name}</p>}
+                      {garageQuote && <p className="text-[10px] text-emerald-600 mt-1"> {garageQuote.name}</p>}
                     </div>
                     <div>
                       <label className="text-[10px] text-muted-foreground mb-1 block">ID / Licence photo (on-site verification)</label>
                       <Input type="file" accept="image/*" className="text-xs cursor-pointer" onChange={(e) => setIdDocument(e.target.files?.[0] || null)} />
-                      {idDocument && <p className="text-[10px] text-emerald-600 mt-1">✓ {idDocument.name}</p>}
+                      {idDocument && <p className="text-[10px] text-emerald-600 mt-1"> {idDocument.name}</p>}
                     </div>
                   </div>
 

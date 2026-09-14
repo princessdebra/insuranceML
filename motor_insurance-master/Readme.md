@@ -206,7 +206,7 @@ The main FastAPI application router, covering three routers: `claims_router` (`/
 
 `GET /api/analysis/claim/{claim_id}/full-report` — the primary investigator endpoint. Returns the complete fraud picture: cross-party verification, all photo anomalies and narrative inconsistencies, risk breakdown by component, physics reconstruction summary, final decision (APPROVE / INVESTIGATE / DECLINE) with reasoning, and next-action steps. Accepts `include_timeline=true` to embed the full 39-frame simulation data.
 
-`GET /api/analysis/claim/{claim_id}/summary` — condensed one-screen summary for a claim dashboard: decision icon (🟢/🟡/🔴), fraud score, cross-party issues, duplicate photo count, party completion status.
+`GET /api/analysis/claim/{claim_id}/summary` — condensed one-screen summary for a claim dashboard: decision status, fraud score, cross-party issues, duplicate photo count, party completion status.
 
 `GET /api/analysis/claims/all` — paginated list of all claims with the same full-report detail level. Supports filtering by `risk_level`, `physics_verdict`, and `decision`.
 

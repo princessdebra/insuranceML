@@ -69,13 +69,45 @@ class ConfigurableMultiVehicleEngine:
         delta_v1 = np.sqrt((2 * e1) / m1)
         delta_v2 = np.sqrt((2 * e2) / m2)
 
-        restitution_e = 0.1
+        # V1's pre-impact speed used to come from a momentum/restitution
+        # formula derived purely from crush energy and V2's speed --
+        # completely disconnected from (and could diverge wildly from) the
+        # speed CrashReconstructionEngine already computed via its own
+        # McHenry crush-energy analysis, which is what the Evidence Panel's
+        # "V1 physics-derived" figure actually shows. That produced the
+        # animation/HUD displaying one speed (e.g. 87 km/h) while the
+        # evidence panel showed a different one (e.g. 33.5 km/h) for the
+        # same claim. Now both V1 and V2 simply use whatever speed the
+        # caller decided is authoritative (service.py passes the same
+        # reconstructed value used everywhere else), so the animation can't
+        # contradict the numbers shown beside it.
         v2_pre_impact_mps = v2_data.get("stated_speed_kmh", 50.0) / 3.6
-        v1_pre_impact_mps = v2_pre_impact_mps + ((delta_v1 + delta_v2) / (1 + restitution_e))
+        v1_pre_impact_mps = v1_data.get("stated_speed_kmh", 50.0) / 3.6
 
         a_braking          = self.g * mu
         human_prt_seconds  = 1.5
         braking_duration_s = 1.0
+
+        # Collision geometry -- previously hardcoded (V1 always along world
+        # Y, V2 always along world X, a fixed 90-degree T-bone crossing
+        # regardless of the actual claim). approach_angle_deg is the angle
+        # between the two vehicles' directions of travel (0=rear-end/same
+        # direction, 90=T-bone/perpendicular, 180=head-on/opposite), the
+        # same convention pipeline_bridge.py's infer_approach_angle already
+        # uses. impact_side ("left"/"right") picks which way V2 approaches
+        # from, since the angle alone is symmetric. V1's own heading is kept
+        # fixed along world +Y as the scene's reference axis -- only V2's
+        # direction is derived relative to it, so a T-bone-from-the-right
+        # claim with no better data reproduces the old default exactly.
+        approach_angle_deg = payload.get("approach_angle_deg", 90.0)
+        impact_side = payload.get("impact_side", "right")
+        v1_dir = np.array([0.0, 1.0])
+        phi = np.radians(approach_angle_deg) * (-1.0 if impact_side == "left" else 1.0)
+        cos_phi, sin_phi = np.cos(phi), np.sin(phi)
+        v2_dir = np.array([
+            v1_dir[0] * cos_phi - v1_dir[1] * sin_phi,
+            v1_dir[0] * sin_phi + v1_dir[1] * cos_phi,
+        ])
 
         time_steps = []
         t = -float(pre_crash_duration_seconds)
@@ -97,37 +129,40 @@ class ConfigurableMultiVehicleEngine:
 
                 if abs_t <= braking_duration_s:
                     v1_speed = max(0.0, v1_pre_impact_mps - (a_braking * abs_t))
-                    v1_pos_y = -((v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (abs_t ** 2)))
+                    m1 = (v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (abs_t ** 2))
                 elif abs_t <= (braking_duration_s + human_prt_seconds):
                     v1_speed = v1_pre_impact_mps
                     brake_start_dist = (
                         (v1_pre_impact_mps * braking_duration_s) -
                         (0.5 * a_braking * (braking_duration_s ** 2))
                     )
-                    v1_pos_y = -(brake_start_dist + (v1_pre_impact_mps * (abs_t - braking_duration_s)))
+                    m1 = brake_start_dist + (v1_pre_impact_mps * (abs_t - braking_duration_s))
                 else:
                     v1_speed = v1_pre_impact_mps
-                    v1_pos_y = -((v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (braking_duration_s ** 2)))
+                    m1 = (v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (braking_duration_s ** 2))
 
                 v2_speed = v2_pre_impact_mps
-                v2_pos_x = v2_pre_impact_mps * abs_t
+                m2 = v2_pre_impact_mps * abs_t
+
+                v1_pos = -v1_dir * m1
+                v2_pos = -v2_dir * m2
 
             else:
                 is_colliding = (t == 0.00)
                 v1_speed = max(0.0, v1_pre_impact_mps - delta_v1 - (a_braking * t))
-                v1_pos_y = 0.0 + (v1_speed * t)
                 v2_speed = max(0.0, v2_pre_impact_mps + delta_v2 - (a_braking * t))
-                v2_pos_x = 0.0 - (v2_speed * t)
+                v1_pos = v1_dir * (v1_speed * t)
+                v2_pos = v2_dir * (v2_speed * t)
 
             v1_timeline.append({
                 "time_sec":     t,
-                "position":     [0.0, round(float(v1_pos_y), 3), 0.0],
+                "position":     [round(float(v1_pos[0]), 3), round(float(v1_pos[1]), 3), 0.0],
                 "velocity_kmh": round(float(v1_speed * 3.6), 1),
                 "is_colliding": is_colliding,
             })
             v2_timeline.append({
                 "time_sec":     t,
-                "position":     [round(float(v2_pos_x), 3), 0.0, 0.0],
+                "position":     [round(float(v2_pos[0]), 3), round(float(v2_pos[1]), 3), 0.0],
                 "velocity_kmh": round(float(v2_speed * 3.6), 1),
                 "is_colliding": is_colliding,
             })

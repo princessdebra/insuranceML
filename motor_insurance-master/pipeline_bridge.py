@@ -183,6 +183,38 @@ def infer_crush_depth_from_narrative(narrative: str) -> tuple[float, float]:
     return 50.0, 0.2
 
 
+STATED_OTHER_VEHICLE_POSITION_PATTERN = re.compile(
+    r"Position of other vehicle at moment of impact \(claimant-confirmed\):\s*(.+)"
+)
+
+
+def infer_stated_collision_geometry(narrative: str) -> Optional[tuple[str, float]]:
+    """Claimant-confirmed collision geometry from the FNOL "where was the
+    other vehicle" question (build_structured_intake_block in routes.py),
+    when present -- claims filed before that question existed simply won't
+    match. Returns (impact_zone_v1, approach_angle_deg) or None when absent
+    or the claimant said "not sure" (in which case narrative/CV inference is
+    the only signal available, same as before this question existed).
+
+    Treated as a STATED input, same tier as stated speed/crush depth -- not
+    ground truth. A colluding claimant could describe a false position, so
+    this is meant to be cross-checked against CV-detected damage location
+    when photos are available (see service.py), not trusted blindly."""
+    match = STATED_OTHER_VEHICLE_POSITION_PATTERN.search(narrative)
+    if not match:
+        return None
+    stated = match.group(1).strip().lower()
+    if stated.startswith("behind"):
+        return "rear_bumper", 0.0
+    if stated.startswith("in front") or "oncoming" in stated:
+        return "front_bumper", 180.0
+    if "left" in stated:
+        return "driver_door", 90.0
+    if "right" in stated:
+        return "passenger_door", 90.0
+    return None
+
+
 def infer_impact_zone(narrative: str) -> tuple[str, str]:
     narrative_lower = narrative.lower()
     zone_v1 = "front_bumper"
@@ -624,6 +656,7 @@ class PipelineBridge:
         v2_stated_speed_kmh: float = 0.0,
         crush_depth_mm: float = 0.0,
         approach_angle_deg: float = 0.0,
+        impact_zone_v1: str = "",
         location_text: str = "",
         latitude: float = 0.0,
         longitude: float = 0.0,
@@ -678,7 +711,19 @@ class PipelineBridge:
                 f"~{inferred_speed} km/h (confidence {speed_conf:.0%})"
             )
 
-        if v2_stated_speed_kmh > 0:
+        # A fixed-object V2 (wall/pillar/barrier -- see service.py's single-
+        # vehicle-vs-fixed-object reconstruction path) is 0 km/h by
+        # definition, not "no value given". The `v2_stated_speed_kmh > 0`
+        # check below can't distinguish "caller explicitly passed 0.0
+        # because it's a barrier" from "caller passed nothing" -- without
+        # this branch it fell through to inferring a speed from the
+        # narrative text (which isn't even describing V2 at all in this
+        # case) and silently animated a barrier moving at highway speed.
+        if physics_input.v2_body_type == "fixed_object":
+            physics_input.v2_stated_speed_kmh = 0.0
+            physics_input.v2_speed_is_inferred = False
+            physics_input.v2_speed_confidence = 1.0
+        elif v2_stated_speed_kmh > 0:
             physics_input.v2_stated_speed_kmh = v2_stated_speed_kmh
             physics_input.v2_speed_is_inferred = False
             physics_input.v2_speed_confidence = 1.0
@@ -702,9 +747,18 @@ class PipelineBridge:
                 f"(confidence {depth_conf:.0%})"
             )
 
-        zone_v1, zone_v2 = infer_impact_zone(narrative)
-        physics_input.impact_zone_v1 = zone_v1
-        physics_input.impact_zone_v2 = zone_v2
+        # CV-detected damage location from the claim's own photos (passed by
+        # service.py, sourced from part_identifier.py's damage_zones) beats
+        # a narrative-text guess -- same "measured/observed beats inferred"
+        # principle as speed and crush depth above.
+        if impact_zone_v1:
+            physics_input.impact_zone_v1 = impact_zone_v1
+            _, zone_v2 = infer_impact_zone(narrative)
+            physics_input.impact_zone_v2 = zone_v2
+        else:
+            zone_v1, zone_v2 = infer_impact_zone(narrative)
+            physics_input.impact_zone_v1 = zone_v1
+            physics_input.impact_zone_v2 = zone_v2
 
         if approach_angle_deg > 0:
             physics_input.approach_angle_deg = approach_angle_deg

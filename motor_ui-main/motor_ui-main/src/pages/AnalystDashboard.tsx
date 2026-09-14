@@ -1,45 +1,25 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AnalystLayout from "@/layouts/AnalystLayout";
-import { getAnalystClaims, lookupClaim } from "@/lib/api";
+import { getAnalystClaims, listAllClaims, ClaimListEntry } from "@/lib/api";
 
 export default function AnalystDashboard() {
   const navigate = useNavigate();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
-  // Look up ANY claim by ID, not just ones this analyst personally filed --
-  // a colleague picking up a follow-up call about someone else's claim has
-  // no other way to find it, since the table below only lists this
-  // analyst's own filings.
-  const [lookupQuery, setLookupQuery] = useState("");
-  const [lookupResult, setLookupResult] = useState<any>(null);
-  const [lookupError, setLookupError] = useState("");
-  const [lookingUp, setLookingUp] = useState(false);
-
-  const handleLookup = async () => {
-    if (!lookupQuery.trim()) return;
-    setLookingUp(true);
-    setLookupError("");
-    setLookupResult(null);
-    try {
-      const res = await lookupClaim(lookupQuery.trim().toUpperCase());
-      if (res.success) {
-        setLookupResult(res);
-      } else {
-        setLookupError(res.detail || "Claim not found.");
-      }
-    } catch (e) {
-      setLookupError("Could not look up claim — check your connection.");
-    } finally {
-      setLookingUp(false);
-    }
-  };
+  // Every claim in the system, not just ones this analyst personally filed
+  // -- a colleague picking up a follow-up call about someone else's claim
+  // has no other way to find it, since the table below only lists this
+  // analyst's own filings. A dropdown instead of typing an exact claim ID.
+  const [allClaims, setAllClaims] = useState<ClaimListEntry[]>([]);
+  const [selectedClaimId, setSelectedClaimId] = useState("");
 
   useEffect(() => {
     const analystId = localStorage.getItem("analystId");
     if (!analystId) { navigate("/analyst/login"); return; }
     getAnalystClaims(analystId).then((d) => { setData(d); setLoading(false); }).catch(() => setLoading(false));
+    listAllClaims().then((d) => setAllClaims(d.claims || [])).catch(() => {});
   }, [navigate]);
 
   // Same "auto-refresh while anything is still analyzing" pattern used on
@@ -118,50 +98,51 @@ export default function AnalystDashboard() {
           </div>
         </div>
 
-        {/* Look up any claim -- not just ones this analyst filed */}
+        {/* Jump to any claim -- not just ones this analyst filed */}
         <div className="bg-card p-6 rounded-2xl border border-border shadow-sm mb-8">
-          <p className="text-sm font-bold text-foreground mb-1">Look Up Any Claim</p>
+          <p className="text-sm font-bold text-foreground mb-1">Jump to Any Claim</p>
           <p className="text-xs text-muted-foreground mb-4">
-            Picking up a follow-up call about a claim a colleague filed? Find it by claim ID to add photos.
+            Picking up a follow-up call about a claim a colleague filed? Pick it from the full list below.
           </p>
-          <div className="flex gap-2 max-w-md">
-            <input
-              type="text"
-              placeholder="e.g. CLM-2026-000028"
-              className="flex-1 h-11 px-4 rounded-lg border border-border bg-background text-sm focus:border-primary focus:ring-1 focus:ring-primary outline-none"
-              value={lookupQuery}
-              onChange={(e) => setLookupQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleLookup()}
-            />
-            <button
-              onClick={handleLookup}
-              disabled={lookingUp || !lookupQuery.trim()}
-              className="h-11 px-5 bg-primary text-primary-foreground rounded-lg text-sm font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
+          <div className="flex gap-2 max-w-xl flex-wrap">
+            <select
+              value={selectedClaimId}
+              onChange={(e) => setSelectedClaimId(e.target.value)}
+              className="flex-1 min-w-[280px] h-11 px-4 rounded-lg border border-border bg-background text-sm focus:border-primary focus:ring-1 focus:ring-primary outline-none"
             >
-              {lookingUp ? "Searching..." : "Find"}
-            </button>
+              <option value="">
+                {allClaims.length === 0 ? "Loading claims..." : `Select a claim (${allClaims.length})`}
+              </option>
+              {allClaims.map((c) => (
+                <option key={c.claim_id} value={c.claim_id}>
+                  {c.claim_id} — {c.member_name || c.member_id || "Unknown member"}
+                  {c.location ? ` — ${c.location}` : ""}
+                </option>
+              ))}
+            </select>
+            <Link
+              to={selectedClaimId ? `/analyst/claim/${selectedClaimId}` : "#"}
+              aria-disabled={!selectedClaimId}
+              onClick={(e) => { if (!selectedClaimId) e.preventDefault(); }}
+              className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold transition-colors ${
+                selectedClaimId ? "bg-primary text-primary-foreground hover:bg-primary/90" : "bg-muted text-muted-foreground cursor-not-allowed"
+              }`}
+            >
+              <span className="material-symbols-outlined text-[16px]">gavel</span>
+              View &amp; Triage
+            </Link>
+            <Link
+              to={selectedClaimId ? `/analyst/claim/${selectedClaimId}/photos` : "#"}
+              aria-disabled={!selectedClaimId}
+              onClick={(e) => { if (!selectedClaimId) e.preventDefault(); }}
+              className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold border transition-colors ${
+                selectedClaimId ? "border-primary/30 text-primary hover:bg-primary/5" : "border-border text-muted-foreground cursor-not-allowed"
+              }`}
+            >
+              <span className="material-symbols-outlined text-[16px]">add_a_photo</span>
+              Add Photos
+            </Link>
           </div>
-          {lookupError && (
-            <p className="text-xs text-destructive font-semibold mt-3">{lookupError}</p>
-          )}
-          {lookupResult && (
-            <div className="mt-4 p-4 rounded-xl border border-primary/20 bg-primary/5 flex items-center justify-between flex-wrap gap-3">
-              <div>
-                <p className="text-sm font-black text-primary">{lookupResult.claim_id}</p>
-                <p className="text-xs text-muted-foreground">
-                  {lookupResult.member_name || lookupResult.member_id} • {lookupResult.location} •{" "}
-                  {lookupResult.estimated_cost ? `KES ${Number(lookupResult.estimated_cost).toLocaleString()}` : "cost pending"}
-                </p>
-              </div>
-              <Link
-                to={`/analyst/claim/${lookupResult.claim_id}/photos`}
-                className="inline-flex items-center gap-1.5 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-xs font-bold hover:bg-primary/90 transition-colors"
-              >
-                <span className="material-symbols-outlined text-[16px]">add_a_photo</span>
-                Add Photos
-              </Link>
-            </div>
-          )}
         </div>
 
         {/* Stats */}
@@ -258,13 +239,22 @@ export default function AnalystDashboard() {
                         )}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <Link
-                          to={`/analyst/claim/${claim.claim_id}/photos`}
-                          className="inline-flex items-center gap-1 text-xs font-bold text-primary hover:underline"
-                        >
-                          <span className="material-symbols-outlined text-[16px]">add_a_photo</span>
-                          Add Photos
-                        </Link>
+                        <div className="flex items-center justify-end gap-4">
+                          <Link
+                            to={`/analyst/claim/${claim.claim_id}`}
+                            className="inline-flex items-center gap-1 text-xs font-bold text-primary hover:underline"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">gavel</span>
+                            View &amp; Triage
+                          </Link>
+                          <Link
+                            to={`/analyst/claim/${claim.claim_id}/photos`}
+                            className="inline-flex items-center gap-1 text-xs font-bold text-primary hover:underline"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">add_a_photo</span>
+                            Add Photos
+                          </Link>
+                        </div>
                       </td>
                     </tr>
                   ))}

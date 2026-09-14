@@ -1,6 +1,36 @@
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
+const PORTAL_LINKS = [
+  { to: "/member/login", label: "Member Login" },
+  { to: "/assessor/login", label: "Assessor Login" },
+  { to: "/analyst/login", label: "Analyst Desk" },
+  { to: "/admin/login", label: "Admin" },
+];
+
+// Everything besides Member Login -- these are internal/professional
+// portals, not something most visitors need front-and-center. Grouping
+// them under one "Staff Login" dropdown cuts the header from 4 full-width
+// buttons (plus 4 nav links) down to 2, which is what was making it feel
+// cluttered/cramped at normal window widths.
+const STAFF_LINKS = PORTAL_LINKS.slice(1);
+
 export default function LandingPage() {
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [staffMenuOpen, setStaffMenuOpen] = useState(false);
+  const staffMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!staffMenuOpen) return;
+    const onClickOutside = (e: MouseEvent) => {
+      if (staffMenuRef.current && !staffMenuRef.current.contains(e.target as Node)) {
+        setStaffMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, [staffMenuOpen]);
+
   return (
     <div className="relative flex min-h-screen w-full flex-col overflow-x-hidden bg-background">
       {/* Navigation */}
@@ -17,21 +47,62 @@ export default function LandingPage() {
           <a className="text-sm font-medium text-foreground hover:text-primary transition-colors" href="#">Heritage</a>
           <a className="text-sm font-medium text-foreground hover:text-primary transition-colors" href="#">Claims</a>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
           <Link to="/member/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 bg-primary text-primary-foreground text-sm font-bold transition-transform hover:scale-105">
             Member Login
           </Link>
-          <Link to="/assessor/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-primary text-primary text-sm font-bold transition-transform hover:scale-105 hover:bg-primary/10">
-            Assessor Login
-          </Link>
-          <Link to="/analyst/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-border text-foreground text-sm font-bold transition-transform hover:scale-105 hover:bg-muted">
-            Analyst Desk
-          </Link>
-          <Link to="/admin/login" className="hidden sm:flex min-w-[120px] cursor-pointer items-center justify-center rounded-lg h-10 px-4 border border-border text-foreground text-sm font-bold transition-transform hover:scale-105 hover:bg-muted">
-            Admin
-          </Link>
+          <div className="hidden sm:block relative" ref={staffMenuRef}>
+            <button
+              type="button"
+              onClick={() => setStaffMenuOpen((v) => !v)}
+              aria-haspopup="true"
+              aria-expanded={staffMenuOpen}
+              className="flex items-center gap-1.5 cursor-pointer rounded-lg h-10 px-4 border border-border text-foreground text-sm font-bold transition-colors hover:bg-muted"
+            >
+              Staff Login
+              <span className="material-symbols-outlined text-[18px]" style={{ transform: staffMenuOpen ? "rotate(180deg)" : "none" }}>expand_more</span>
+            </button>
+            {staffMenuOpen && (
+              <div className="absolute right-0 top-[calc(100%+8px)] w-48 rounded-lg border border-border bg-card shadow-lg py-1.5 z-50">
+                {STAFF_LINKS.map((link) => (
+                  <Link
+                    key={link.to}
+                    to={link.to}
+                    onClick={() => setStaffMenuOpen(false)}
+                    className="block px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors"
+                  >
+                    {link.label}
+                  </Link>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="sm:hidden flex items-center justify-center size-10 rounded-lg border border-border text-foreground"
+            aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
+            aria-expanded={mobileMenuOpen}
+            onClick={() => setMobileMenuOpen((v) => !v)}
+          >
+            <span className="material-symbols-outlined">{mobileMenuOpen ? "close" : "menu"}</span>
+          </button>
         </div>
       </header>
+
+      {mobileMenuOpen && (
+        <div className="sm:hidden sticky top-[65px] z-40 bg-card border-b border-primary/10 px-6 py-4 flex flex-col gap-2">
+          {PORTAL_LINKS.map((link) => (
+            <Link
+              key={link.to}
+              to={link.to}
+              className="flex items-center justify-center rounded-lg h-11 px-4 border border-border text-foreground text-sm font-bold hover:bg-muted transition-colors"
+              onClick={() => setMobileMenuOpen(false)}
+            >
+              {link.label}
+            </Link>
+          ))}
+        </div>
+      )}
 
       <main className="flex flex-col">
         {/* Hero Section */}

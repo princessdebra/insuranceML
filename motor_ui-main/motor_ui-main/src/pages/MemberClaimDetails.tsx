@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams, Link } from "react-router-dom";
 import MemberLayout from "@/layouts/MemberLayout";
-import { getMemberClaimDetails } from "@/lib/api";
+import { getMemberClaimDetails, submitMemberFieldAnswers, MEMBER_FIELD_LABELS } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import DocumentsPanel from "@/components/DocumentsPanel";
@@ -13,6 +13,9 @@ export default function MemberClaimDetails() {
   const navigate = useNavigate();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [pendingAnswers, setPendingAnswers] = useState<Record<string, string>>({});
+  const [savingAnswers, setSavingAnswers] = useState(false);
+  const [answersError, setAnswersError] = useState("");
 
   const refetch = () => {
     const memberId = localStorage.getItem("memberId");
@@ -73,6 +76,40 @@ export default function MemberClaimDetails() {
 
   const claim = data.claim_details || {};
 
+  let pendingFields: string[] = [];
+  try {
+    pendingFields = claim.pending_member_fields ? JSON.parse(claim.pending_member_fields) : [];
+  } catch {
+    pendingFields = [];
+  }
+
+  const submitPendingAnswers = async () => {
+    const memberId = localStorage.getItem("memberId") || "";
+    const toSend: Record<string, string> = {};
+    for (const key of pendingFields) {
+      if (pendingAnswers[key]?.trim()) toSend[key] = pendingAnswers[key].trim();
+    }
+    if (Object.keys(toSend).length === 0) {
+      setAnswersError("Fill in at least one field before submitting.");
+      return;
+    }
+    setSavingAnswers(true);
+    setAnswersError("");
+    try {
+      const res = await submitMemberFieldAnswers(claimId || "", memberId, toSend);
+      if (!res.success) {
+        setAnswersError(res.detail || "Couldn't save your answers -- please try again.");
+        return;
+      }
+      setPendingAnswers({});
+      refetch();
+    } catch {
+      setAnswersError("Couldn't save your answers -- please try again.");
+    } finally {
+      setSavingAnswers(false);
+    }
+  };
+
   return (
     <MemberLayout>
       <div className="p-6 md:p-10 space-y-8 max-w-4xl mx-auto">
@@ -83,6 +120,49 @@ export default function MemberClaimDetails() {
           </div>
           <Badge variant="outline" className="capitalize font-bold">{claim.risk_level ? `${claim.risk_level} priority` : "Under review"}</Badge>
         </div>
+
+        {pendingFields.length > 0 && (
+          <Card className="overflow-hidden border-none shadow-sm border border-amber-500/30">
+            <CardHeader className="bg-amber-500/10 border-b border-amber-500/20">
+              <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-amber-700">
+                <span className="material-symbols-outlined">edit_note</span>
+                A Few Things Were Left Blank on Your Form
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pt-6 space-y-3">
+              <p className="text-xs text-muted-foreground">Please fill in what you can below.</p>
+              {pendingFields.map((key) => (
+                <div key={key}>
+                  <p className="text-[10px] font-black uppercase text-muted-foreground mb-1">{MEMBER_FIELD_LABELS[key] || key}</p>
+                  {key === "narrative" ? (
+                    <textarea
+                      value={pendingAnswers[key] || ""}
+                      onChange={(e) => setPendingAnswers({ ...pendingAnswers, [key]: e.target.value })}
+                      rows={3}
+                      className="w-full text-sm px-3 py-2 border border-border rounded-lg bg-background outline-none resize-y"
+                    />
+                  ) : (
+                    <input
+                      type={key === "estimated_cost" ? "number" : "text"}
+                      value={pendingAnswers[key] || ""}
+                      onChange={(e) => setPendingAnswers({ ...pendingAnswers, [key]: e.target.value })}
+                      className="w-full text-sm px-3 py-2 border border-border rounded-lg bg-background outline-none"
+                    />
+                  )}
+                </div>
+              ))}
+              {answersError && <p className="text-sm text-destructive font-semibold">{answersError}</p>}
+              <button
+                type="button"
+                onClick={submitPendingAnswers}
+                disabled={savingAnswers}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-lg text-sm font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
+              >
+                {savingAnswers ? "Saving..." : "Save Answers"}
+              </button>
+            </CardContent>
+          </Card>
+        )}
 
         <Card className="overflow-hidden border-none shadow-sm">
           <CardHeader className="bg-primary/5 border-b border-primary/10">

@@ -38,9 +38,9 @@ def _get_model():
         if not MODEL_PATH.exists():
             raise FileNotFoundError(f"Damage detection checkpoint not found at {MODEL_PATH}")
 
-        logger.info(f"🔧 Loading damage detection model from {MODEL_PATH}")
+        logger.info(f"Loading damage detection model from {MODEL_PATH}")
         _model = YOLO(str(MODEL_PATH))
-        logger.info(f"✅ Damage detection model loaded — {len(_model.names)} classes")
+        logger.info(f"Damage detection model loaded — {len(_model.names)} classes")
 
     return _model
 
@@ -50,7 +50,12 @@ def detect_damage(image_data: bytes, conf_threshold: float = CONF_THRESHOLD) -> 
     Run damage detection on raw image bytes.
 
     Returns a list of detections:
-        [{"class": "bumper-dent-front", "confidence": 0.81, "bbox": [x1,y1,x2,y2]}, ...]
+        [{"class": "bumper-dent-front", "confidence": 0.81, "bbox": [x1,y1,x2,y2],
+          "polygon": [[x,y], [x,y], ...]}, ...]
+    `polygon` traces the actual damage shape (this is a segmentation model,
+    not just a box detector) in original-image pixel coordinates -- omitted
+    for a given detection only if the model produced no mask for it, in
+    which case callers should fall back to the bbox rectangle.
     Empty list if the model finds nothing above threshold, or if inference fails
     (caller should treat that as "no signal", not fail the whole photo analysis).
     """
@@ -66,15 +71,23 @@ def detect_damage(image_data: bytes, conf_threshold: float = CONF_THRESHOLD) -> 
 
         detections = []
         if r.boxes is not None and len(r.boxes) > 0:
-            for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
-                detections.append({
+            # r.masks.xy (when present) is already scaled to original-image
+            # pixel coordinates and in the same per-detection order as
+            # r.boxes -- one polygon (numpy array of [x,y] points) per box.
+            mask_polygons = r.masks.xy if r.masks is not None else None
+
+            for i, (box, cls, conf) in enumerate(zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf)):
+                detection = {
                     "class": model.names[int(cls)],
                     "confidence": round(float(conf), 3),
                     "bbox": [round(float(v), 1) for v in box.tolist()],
-                })
+                }
+                if mask_polygons is not None and i < len(mask_polygons) and len(mask_polygons[i]) >= 3:
+                    detection["polygon"] = [[round(float(x), 1), round(float(y), 1)] for x, y in mask_polygons[i]]
+                detections.append(detection)
 
         return detections
 
     except Exception as e:
-        logger.error(f"❌ Damage detection failed: {str(e)}")
+        logger.error(f"Damage detection failed: {str(e)}")
         return []

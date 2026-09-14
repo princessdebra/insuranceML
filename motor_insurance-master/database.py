@@ -143,6 +143,22 @@ class DatabaseManager:
             self.create_photo_storage_table()
             self.create_document_storage_table()
 
+            # Admin-configurable overrides for business_rules.py's numeric
+            # thresholds (e.g. the photo-metadata GPS variance distance, the
+            # cost-to-sum-insured ratio bands) -- a simple key/value store
+            # rather than one column per threshold, since business_rules.py
+            # owns the actual set of keys and their defaults; this table just
+            # persists whichever ones an admin has overridden. Missing keys
+            # fall back to BusinessRulesEngine's DEFAULT_CONFIG.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_config (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_by TEXT
+                )
+            ''')
+
             # Lets the member/assessor who uploaded a document correct fields
             # OCR got wrong -- original raw_text/parsed_fields are never
             # overwritten (kept as the OCR ground truth for audit), the
@@ -234,7 +250,145 @@ class DatabaseManager:
                 if "duplicate column" not in msg and "no such table" not in msg:
                     raise
 
+            # Claim field keys the paper form left blank that the member is
+            # being asked to fill in themselves (JSON list, e.g.
+            # '["estimated_cost"]') -- set when an analyst's claim-form
+            # upload notifies the member, cleared field-by-field as they
+            # answer via update_claim_member_fields().
+            try:
+                cursor.execute('ALTER TABLE claims ADD COLUMN pending_member_fields TEXT')
+                conn.commit()
+                logger.info("Added pending_member_fields column to claims")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
+            # AI's own independent repair-cost estimate from detected damage
+            # zones (see part_identifier.estimate_damage_cost / the
+            # cost_reasonableness business rule) -- kept separate from the
+            # human-entered estimated_cost so the two can be compared.
+            try:
+                cursor.execute('ALTER TABLE claims ADD COLUMN ai_estimated_cost REAL')
+                conn.commit()
+                logger.info("Added ai_estimated_cost column to claims")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
             self.populate_sample_analysts(conn)
+
+            # ── Enrichment: gives the stalled business rules (repair-shop
+            # identity, cost revision, driver eligibility) and the new
+            # relationship/benchmarking capabilities real synthetic data to
+            # check against, instead of skipping themselves on every claim.
+            for table, coltype in (
+                ("claims", "repair_shop_id TEXT"),
+                ("claims", "initial_estimated_cost REAL"),
+                ("claims", "assessor_estimated_cost REAL"),
+                ("claim_assignments", "return_reason TEXT"),
+            ):
+                try:
+                    cursor.execute(f'ALTER TABLE {table} ADD COLUMN {coltype}')
+                    conn.commit()
+                    logger.info(f"Added {coltype.split()[0]} column to {table}")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "no such table" not in msg:
+                        raise
+            try:
+                cursor.execute('ALTER TABLE members ADD COLUMN bank_account TEXT')
+                conn.commit()
+                logger.info("Added bank_account column to members")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" not in msg and "no such table" not in msg:
+                    raise
+
+            # PoC blueprint stress-test rule support: licence expiry
+            # (BR-DRV-004), cover-upgrade timing (BR-UPG-006), and photo/
+            # incident capture metadata for location+time variance
+            # (BR-MET-008) -- none of these had a data source before.
+            for table, coltype in (
+                ("policy_drivers", "licence_expiry DATE"),
+                ("motor_policy_details", "cover_upgrade_date DATE"),
+                ("claim_photo_files", "capture_lat REAL"),
+                ("claim_photo_files", "capture_lon REAL"),
+                ("claim_photo_files", "capture_time TIMESTAMP"),
+                ("claims", "incident_lat REAL"),
+                ("claims", "incident_lon REAL"),
+            ):
+                try:
+                    cursor.execute(f'ALTER TABLE {table} ADD COLUMN {coltype}')
+                    conn.commit()
+                    logger.info(f"Added {coltype.split()[0]} column to {table}")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "no such table" not in msg:
+                        raise
+
+            # Structured authorised-driver data (age, licence class) --
+            # motor_policy_details.authorised_drivers is just a free-text
+            # string ("Policy Holder and Spouse"), not enough for the
+            # driver-eligibility rule to check anything against.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS policy_drivers (
+                    driver_id TEXT PRIMARY KEY,
+                    policy_id TEXT NOT NULL,
+                    driver_name TEXT NOT NULL,
+                    age INTEGER,
+                    licence_class TEXT,
+                    min_permitted_age INTEGER DEFAULT 18,
+                    FOREIGN KEY (policy_id) REFERENCES policies (policy_id)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_drivers_policy_id ON policy_drivers (policy_id)')
+
+            # Reference corpus for narrative-similarity search -- deliberately
+            # separate from the live `claims` table so it never shows up on
+            # dashboards/claim lists, just as comparison material.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS historical_narrative_corpus (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    narrative TEXT NOT NULL,
+                    fraud_score INTEGER NOT NULL,
+                    pattern_label TEXT,
+                    claim_type TEXT DEFAULT 'motor'
+                )
+            ''')
+
+            # Assessor's own repair/replace call per AI-detected damage
+            # component -- "AI recommends, assessor decides." One row per
+            # (claim, photo, detection); upserted so re-deciding overwrites
+            # rather than accumulating duplicate rows.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS photo_damage_decisions (
+                    claim_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    detection_index INTEGER NOT NULL,
+                    component TEXT,
+                    ai_recommendation TEXT,
+                    assessor_decision TEXT NOT NULL,
+                    assessor_id TEXT NOT NULL,
+                    decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (claim_id, filename, detection_index)
+                )
+            ''')
+
+            # These depend on `policies`/`members` existing, which are only
+            # created by the separate migrate.py seeding script, not by
+            # init_database() itself -- guard so a fresh/unusual DB state
+            # doesn't crash the whole startup.
+            for enrich_fn in (
+                self.populate_policy_drivers,
+                self.populate_member_bank_accounts,
+                self.populate_historical_narrative_corpus,
+            ):
+                try:
+                    enrich_fn(conn)
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Skipped {enrich_fn.__name__} — {e}")
 
             conn.commit()
             logger.info("Database initialized successfully")
@@ -301,15 +455,24 @@ class DatabaseManager:
                 # other column (physics_fraud_score, physics_verdict, member_id,
                 # simulation_video_path, etc.) back to NULL. ON CONFLICT DO UPDATE
                 # only ever touches the columns actually listed below.
+                #
+                # narrative/estimated_cost/location additionally CASE-guard against
+                # overwriting a real value with a blank one: the background
+                # analysis pipeline captures these at submission time and can take
+                # minutes (physics reconstruction), so if a member answers a
+                # pending_member_fields question (update_claim_member_fields)
+                # WHILE it's still running, this upsert landing afterward would
+                # otherwise silently clobber that answer back to blank/0 using its
+                # now-stale in-memory copy.
                 cursor.execute('''
                     INSERT INTO claims
                     (claim_id, narrative, estimated_cost, location, accident_time,
                      fraud_risk_score, risk_level, processing_time_ms, analysis_result, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(claim_id) DO UPDATE SET
-                        narrative           = excluded.narrative,
-                        estimated_cost      = excluded.estimated_cost,
-                        location            = excluded.location,
+                        narrative           = CASE WHEN excluded.narrative != '' THEN excluded.narrative ELSE claims.narrative END,
+                        estimated_cost      = CASE WHEN excluded.estimated_cost > 0 THEN excluded.estimated_cost ELSE claims.estimated_cost END,
+                        location            = CASE WHEN excluded.location != '' THEN excluded.location ELSE claims.location END,
                         accident_time       = excluded.accident_time,
                         fraud_risk_score    = excluded.fraud_risk_score,
                         risk_level          = excluded.risk_level,
@@ -428,28 +591,14 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # ✅ MUST include analysis_result in SELECT
-                cursor.execute('''
-                    SELECT 
-                        claim_id,
-                        member_id,
-                        policy_id,
-                        narrative,
-                        estimated_cost,
-                        location,
-                        accident_time,
-                        fraud_risk_score,
-                        risk_level,
-                        processing_time_ms,
-                        analysis_result,          -- ← ADD THIS LINE!
-                        created_at,
-                        updated_at,
-                        timestamp,
-                        parties_analyzed,
-                        cross_party_verification
-                    FROM claims
-                    WHERE claim_id = ?
-                ''', (claim_id,))
+                # SELECT * rather than an explicit column list -- the
+                # explicit list silently dropped every column added to
+                # `claims` after it was written (repair_shop_id,
+                # assessor_estimated_cost, initial_estimated_cost,
+                # filed_by_analyst_id, filed_via, the physics columns...),
+                # so every caller of get_claim() got None back for those
+                # fields even when the database genuinely had a value.
+                cursor.execute('SELECT * FROM claims WHERE claim_id = ?', (claim_id,))
                 
                 row = cursor.fetchone()
                 
@@ -461,7 +610,87 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error retrieving claim: {str(e)}")
             return None
-    
+
+    def get_system_config_overrides(self) -> Dict[str, Any]:
+        """
+        Raw admin-set overrides for business_rules.py's thresholds -- just
+        the keys an admin has actually changed, not merged with defaults
+        (BusinessRulesEngine does that merge itself, since it owns the
+        default values). Values are stored as JSON so both numbers and
+        strings round-trip without extra parsing here.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT config_key, config_value FROM system_config")
+                return {row["config_key"]: json.loads(row["config_value"]) for row in cursor.fetchall()}
+        except Exception as e:
+            logger.error(f"Error retrieving system config overrides: {str(e)}")
+            return {}
+
+    def set_system_config_overrides(self, updates: Dict[str, Any], updated_by: Optional[str] = None) -> None:
+        """Upserts one or more business-rule threshold overrides -- called
+        from the admin settings page. A value of None removes that key's
+        override, reverting it back to BusinessRulesEngine's default."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for key, value in updates.items():
+                if value is None:
+                    cursor.execute("DELETE FROM system_config WHERE config_key = ?", (key,))
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO system_config (config_key, config_value, updated_at, updated_by)
+                        VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                        ON CONFLICT(config_key) DO UPDATE SET
+                            config_value = excluded.config_value,
+                            updated_at = excluded.updated_at,
+                            updated_by = excluded.updated_by
+                        """,
+                        (key, json.dumps(value), updated_by),
+                    )
+            conn.commit()
+
+    MEMBER_EDITABLE_CLAIM_FIELDS = {"estimated_cost", "location", "narrative"}
+
+    def update_claim_member_fields(self, claim_id: str, member_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Member answers questions the paper claim form left blank (e.g.
+        Estimated Repair Cost). Restricted to MEMBER_EDITABLE_CLAIM_FIELDS --
+        the same columns notify_member_to_add_photos can flag as pending --
+        so this can't be used to rewrite arbitrary claim state.
+        """
+        claim = self.get_claim(claim_id)
+        if not claim:
+            raise ValueError(f"Claim {claim_id} not found")
+        if claim.get("member_id") != member_id:
+            raise PermissionError("This claim does not belong to you")
+
+        updates = {
+            k: v for k, v in fields.items()
+            if k in self.MEMBER_EDITABLE_CLAIM_FIELDS and v not in (None, "")
+        }
+
+        try:
+            pending = json.loads(claim.get("pending_member_fields") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            pending = []
+        remaining = [f for f in pending if f not in updates]
+
+        if not updates:
+            return {"updated": [], "pending_member_fields": remaining}
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            cursor.execute(
+                f'UPDATE claims SET {set_clause}, pending_member_fields = ?, updated_at = CURRENT_TIMESTAMP WHERE claim_id = ?',
+                (*updates.values(), json.dumps(remaining), claim_id),
+            )
+            conn.commit()
+
+        return {"updated": list(updates.keys()), "pending_member_fields": remaining}
+
     def list_claims(self, limit: int = 10, offset: int = 0, risk_level: Optional[str] = None) -> Dict[str, Any]:
         """List claims with pagination and filtering"""
         try:
@@ -830,10 +1059,10 @@ class DatabaseManager:
                 ''')
                 
                 conn.commit()
-                logger.info("✅ Multi-line insurance tables created successfully")
+                logger.info("Multi-line insurance tables created successfully")
                 
         except Exception as e:
-            logger.error(f"❌ Error creating multi-line tables: {str(e)}")
+            logger.error(f"Error creating multi-line tables: {str(e)}")
 
     
     def create_lifecycle_tables(self, conn: sqlite3.Connection):
@@ -901,7 +1130,7 @@ class DatabaseManager:
         ''')
         
         conn.commit()
-        logger.info("✅ Lifecycle tables created successfully")
+        logger.info("Lifecycle tables created successfully")
 
     def generate_claim_id(self, conn: sqlite3.Connection) -> str:
         """
@@ -922,7 +1151,7 @@ class DatabaseManager:
         
         claim_id = f"CLM-{current_year}-{sequence:06d}"
         
-        logger.info(f"📋 Generated claim ID: {claim_id}")
+        logger.info(f"Generated claim ID: {claim_id}")
         return claim_id
 
 
@@ -953,7 +1182,7 @@ class DatabaseManager:
         ))
         
         conn.commit()
-        logger.info(f"✅ Coverage check stored: {check_id}")
+        logger.info(f"Coverage check stored: {check_id}")
 
 
     def link_coverage_to_claim(
@@ -991,7 +1220,7 @@ class DatabaseManager:
         ''', (claim_id, status, changed_by, notes))
         
         conn.commit()
-        logger.info(f"📊 Claim {claim_id} status → {status}")
+        logger.info(f"Claim {claim_id} status → {status}")
 
 
     def assign_assessor_to_claim(
@@ -1029,7 +1258,7 @@ class DatabaseManager:
         assessor = cursor.fetchone()
         
         if not assessor:
-            logger.warning(f"⚠️ No available assessors for {claim_type} in {city}")
+            logger.warning(f"No available assessors for {claim_type} in {city}")
             return {
                 "assigned": False,
                 "reason": f"No available {claim_type} assessors in {city}"
@@ -1061,7 +1290,7 @@ class DatabaseManager:
         
         conn.commit()
         
-        logger.info(f"✅ Claim {claim_id} assigned to {assessor_name} ({assessor_id})")
+        logger.info(f"Claim {claim_id} assigned to {assessor_name} ({assessor_id})")
         
         return {
             "assigned": True,
@@ -1118,6 +1347,113 @@ class DatabaseManager:
             claims.append(dict(row))
 
         return claims
+
+    def get_assessor_dashboard_overview(self, assessor_id: str) -> Dict[str, Any]:
+        """
+        Operational widgets for the assessor's own dashboard -- deliberately
+        no fraud/risk figures (those stay out of the assessor's view). Status
+        model in use: 'pending' (not yet reported on) -> 'completed' (report
+        submitted), with 'returned_for_review' as a side-branch an admin can
+        send a submitted report back into. inspection_date is free text set
+        by the assessor when scheduling, so "awaiting submission"/"overdue"
+        are derived by comparing it to today rather than a strict status.
+        """
+        def _parse_dt(s):
+            if not s:
+                return None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt)
+                except (ValueError, TypeError):
+                    continue
+            try:
+                return datetime.strptime(str(s)[:10], "%Y-%m-%d")
+            except Exception:
+                return None
+
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT ca.status, ca.assigned_at, ca.inspection_date, ca.report_submitted_at,
+                           c.estimated_cost
+                    FROM claim_assignments ca
+                    JOIN claims c ON ca.claim_id = c.claim_id
+                    WHERE ca.assessor_id = ?
+                ''', (assessor_id,))
+                rows = [dict(r) for r in cursor.fetchall()]
+
+            today = datetime.now().date()
+            pending_inspections = 0
+            scheduled_today = 0
+            awaiting_submission = 0
+            overdue = 0
+            completed = 0
+            returned_for_review = 0
+            turnaround_hours = []
+            claims_by_status: Dict[str, int] = {}
+            total_value = 0.0
+
+            for r in rows:
+                status = r["status"] or "pending"
+                claims_by_status[status] = claims_by_status.get(status, 0) + 1
+                total_value += r["estimated_cost"] or 0
+                insp_dt = _parse_dt(r["inspection_date"])
+
+                if status == "completed":
+                    completed += 1
+                    assigned_dt = _parse_dt(r["assigned_at"])
+                    submitted_dt = _parse_dt(r["report_submitted_at"])
+                    if assigned_dt and submitted_dt:
+                        turnaround_hours.append((submitted_dt - assigned_dt).total_seconds() / 3600)
+                elif status == "returned_for_review":
+                    returned_for_review += 1
+                elif status in ("pending", "in_progress"):
+                    if insp_dt is None or insp_dt.date() > today:
+                        pending_inspections += 1
+                    elif insp_dt.date() == today:
+                        scheduled_today += 1
+                    else:
+                        awaiting_submission += 1
+                        if (today - insp_dt.date()).days >= 2:
+                            overdue += 1
+
+            avg_turnaround = round(sum(turnaround_hours) / len(turnaround_hours), 1) if turnaround_hours else None
+
+            return {
+                "success": True,
+                "total_claims": len(rows),
+                "pending_inspections": pending_inspections,
+                "inspections_scheduled_today": scheduled_today,
+                "reports_awaiting_submission": awaiting_submission,
+                "reports_returned_for_review": returned_for_review,
+                "completed_assessments": completed,
+                "overdue_assessments": overdue,
+                "avg_turnaround_hours": avg_turnaround,
+                "estimated_claim_value_total": round(total_value, 2),
+                "estimated_claim_value_avg": round(total_value / len(rows), 2) if rows else 0.0,
+                "claims_by_status": claims_by_status,
+            }
+        except Exception as e:
+            logger.error(f"Error computing assessor dashboard overview for {assessor_id}: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+    def return_assignment_for_review(self, assignment_id: str, reason: str, returned_by: str) -> bool:
+        """Admin sends a submitted report back to the assessor for revision."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE claim_assignments
+                    SET status = 'returned_for_review', return_reason = ?
+                    WHERE assignment_id = ?
+                ''', (reason, assignment_id))
+                conn.commit()
+                logger.info(f"Assignment {assignment_id} returned for review by {returned_by}: {reason}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error returning assignment {assignment_id} for review: {str(e)}")
+            return False
 
     def get_assessor_track_record(self, assessor_id: str) -> Dict[str, Any]:
         """
@@ -1209,7 +1545,7 @@ class DatabaseManager:
             ''', (status, notes, assignment_id))
 
         conn.commit()
-        logger.info(f"✅ Assignment {assignment_id} status → {status}")
+        logger.info(f"Assignment {assignment_id} status → {status}")
 
     def create_photo_storage_table(self):
         """Create table for storing photo files with party tracking"""
@@ -1243,7 +1579,7 @@ class DatabaseManager:
             ''')
             
             conn.commit()
-            logger.info("✅ Photo storage table created/verified")
+            logger.info("Photo storage table created/verified")
 
     def create_document_storage_table(self):
         """
@@ -1277,7 +1613,7 @@ class DatabaseManager:
             ''')
 
             conn.commit()
-            logger.info("✅ Document storage table created/verified")
+            logger.info("Document storage table created/verified")
 
     def store_document(
         self,
@@ -1308,12 +1644,12 @@ class DatabaseManager:
                 conn.commit()
                 doc_id = cursor.lastrowid
                 logger.info(
-                    f"💾 Stored document: {filename} ({document_type}) for {party} "
+                    f"Stored document: {filename} ({document_type}) for {party}"
                     f"in claim {claim_id} (ID: {doc_id}, confidence: {ocr_result.get('extraction_confidence', 0)}%)"
                 )
                 return doc_id
         except Exception as e:
-            logger.error(f"❌ Error storing document {filename}: {str(e)}")
+            logger.error(f"Error storing document {filename}: {str(e)}")
             raise
 
     def get_documents_by_claim(self, claim_id: str, party: Optional[str] = None) -> List[Dict]:
@@ -1350,7 +1686,7 @@ class DatabaseManager:
 
                 return documents
         except Exception as e:
-            logger.error(f"❌ Error retrieving documents for claim {claim_id}: {str(e)}")
+            logger.error(f"Error retrieving documents for claim {claim_id}: {str(e)}")
             return []
 
     def get_document_by_id(self, document_id: int) -> Optional[Dict]:
@@ -1365,7 +1701,7 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 return dict(row) if row else None
         except Exception as e:
-            logger.error(f"❌ Error fetching document {document_id}: {str(e)}")
+            logger.error(f"Error fetching document {document_id}: {str(e)}")
             return None
 
     def correct_document_fields(self, document_id: int, corrected_fields: Dict[str, Any], corrected_by: str) -> bool:
@@ -1384,10 +1720,10 @@ class DatabaseManager:
                     WHERE id = ?
                 ''', (json.dumps(corrected_fields, ensure_ascii=False), corrected_by, document_id))
                 conn.commit()
-                logger.info(f"✏️ Document {document_id} fields corrected by {corrected_by}")
+                logger.info(f"Document {document_id} fields corrected by {corrected_by}")
                 return cursor.rowcount > 0
         except Exception as e:
-            logger.error(f"❌ Error correcting document {document_id}: {str(e)}")
+            logger.error(f"Error correcting document {document_id}: {str(e)}")
             raise
 
     def store_photo_file(
@@ -1439,12 +1775,12 @@ class DatabaseManager:
                 conn.commit()
                 photo_id = cursor.lastrowid
 
-                logger.info(f"💾 Stored photo: {filename} for {party} in claim {claim_id} (ID: {photo_id}, Size: {file_size:,} bytes)")
+                logger.info(f"Stored photo: {filename} for {party} in claim {claim_id} (ID: {photo_id}, Size: {file_size:,} bytes)")
 
                 return photo_id
 
         except Exception as e:
-            logger.error(f"❌ Error storing photo {filename}: {str(e)}")
+            logger.error(f"Error storing photo {filename}: {str(e)}")
             raise
     
     def get_photos_by_claim_and_party(self, claim_id: str, party: str) -> List[Dict]:
@@ -1480,12 +1816,12 @@ class DatabaseManager:
                         'uploaded_at': row['uploaded_at']
                     })
                 
-                logger.info(f"📸 Retrieved {len(photos)} photos for {party} in claim {claim_id}")
+                logger.info(f"Retrieved {len(photos)} photos for {party} in claim {claim_id}")
                 
                 return photos
                 
         except Exception as e:
-            logger.error(f"❌ Error retrieving photos for claim {claim_id}, party {party}: {str(e)}")
+            logger.error(f"Error retrieving photos for claim {claim_id}, party {party}: {str(e)}")
             return []
     
     def get_photos_metadata_by_claim(self, claim_id: str, party: Optional[str] = None) -> List[Dict]:
@@ -1553,12 +1889,12 @@ class DatabaseManager:
                         })
                 
                 total = sum(len(photos) for photos in photos_by_party.values())
-                logger.info(f"📸 Retrieved {total} total photos for claim {claim_id} across all parties")
+                logger.info(f"Retrieved {total} total photos for claim {claim_id} across all parties")
                 
                 return photos_by_party
                 
         except Exception as e:
-            logger.error(f"❌ Error retrieving all photos for claim {claim_id}: {str(e)}")
+            logger.error(f"Error retrieving all photos for claim {claim_id}: {str(e)}")
             return {'member': [], 'assessor': [], 'repair_shop': []}
     
     def check_duplicate_photo_across_parties(self, claim_id: str, file_hash: str, current_party: str) -> Optional[Dict]:
@@ -1586,7 +1922,7 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 
                 if row:
-                    logger.warning(f"🚨 DUPLICATE PHOTO DETECTED: Hash {file_hash[:12]}... from {current_party} matches {row['party']}")
+                    logger.warning(f"DUPLICATE PHOTO DETECTED: Hash {file_hash[:12]}... from {current_party} matches {row['party']}")
                     return {
                         'duplicate_found': True,
                         'original_party': row['party'],
@@ -1597,7 +1933,7 @@ class DatabaseManager:
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Error checking duplicate photo: {str(e)}")
+            logger.error(f"Error checking duplicate photo: {str(e)}")
             return None
     
     def get_photo_count_by_party(self, claim_id: str) -> Dict[str, int]:
@@ -1628,7 +1964,7 @@ class DatabaseManager:
                 return counts
                 
         except Exception as e:
-            logger.error(f"❌ Error getting photo counts: {str(e)}")
+            logger.error(f"Error getting photo counts: {str(e)}")
             return {'member': 0, 'assessor': 0, 'repair_shop': 0}
     
     def delete_photos_by_claim(self, claim_id: str) -> int:
@@ -1648,12 +1984,12 @@ class DatabaseManager:
                 deleted_count = cursor.rowcount
                 conn.commit()
                 
-                logger.info(f"🗑️ Deleted {deleted_count} photos for claim {claim_id}")
+                logger.info(f"Deleted {deleted_count} photos for claim {claim_id}")
                 
                 return deleted_count
                 
         except Exception as e:
-            logger.error(f"❌ Error deleting photos for claim {claim_id}: {str(e)}")
+            logger.error(f"Error deleting photos for claim {claim_id}: {str(e)}")
             return 0
 
     def get_claim_status_history(
@@ -1763,7 +2099,7 @@ class DatabaseManager:
                 logger.error(f"Error inserting assessor {assessor['assessor_id']}: {str(e)}")
         
         conn.commit()
-        logger.info(f"✅ Populated {len(assessors)} sample assessors")
+        logger.info(f"Populated {len(assessors)} sample assessors")
 
     def populate_sample_analysts(self, conn: sqlite3.Connection):
         """Populate database with sample claims analysts"""
@@ -1782,7 +2118,202 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"Error inserting analyst {a['analyst_id']}: {str(e)}")
         conn.commit()
-        logger.info(f"✅ Populated {len(analysts)} sample analysts")
+        logger.info(f"Populated {len(analysts)} sample analysts")
+
+    def populate_policy_drivers(self, conn: sqlite3.Connection):
+        """
+        Structured authorised-driver data (age, licence class) for the
+        driver-eligibility business rule to check against. The existing
+        motor_policy_details.authorised_drivers is just the free-text
+        string "Policy Holder and Spouse" on every policy -- this gives
+        each policy real named drivers, deliberately including a couple
+        of scenarios (under-age, mismatched licence class) the rule
+        should actually catch.
+        """
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as cnt FROM policy_drivers')
+        if cursor.fetchone()['cnt'] > 0:
+            return
+
+        drivers = [
+            ("POL001", "James Mwangi", 41, "BCE"),
+            ("POL001", "Grace Mwangi", 38, "BCE"),
+            ("POL002", "Esther Akinyi", 34, "BCE"),
+            ("POL003", "Brian Otieno", 29, "BCE"),
+            # Deliberately under the standard 18-year minimum -- exercises
+            # the driver_eligibility rule's age check.
+            ("POL003", "Kevin Otieno", 17, "F"),
+            ("POL004", "Caroline Njeri", 45, "BCE"),
+            ("POL005", "Samuel Kipkemoi", 52, "BCE"),
+            # Licence class F is provisional/learner -- not a class that
+            # should be driving unsupervised; mismatched against a policy
+            # that only permits BCE.
+            ("POL006", "Faith Wambua", 22, "F"),
+            ("POL007", "Kevin Odhiambo", 31, "BCE"),
+            ("POL008", "Lydia Chebet", 27, "BCE"),
+        ]
+        for policy_id, name, age, licence_class in drivers:
+            driver_id = f"DRV-{uuid.uuid4().hex[:10].upper()}"
+            try:
+                cursor.execute('''
+                    INSERT INTO policy_drivers (driver_id, policy_id, driver_name, age, licence_class, min_permitted_age)
+                    VALUES (?, ?, ?, ?, ?, 18)
+                ''', (driver_id, policy_id, name, age, licence_class))
+            except Exception as e:
+                logger.error(f"Error inserting policy driver {name} on {policy_id}: {str(e)}")
+        conn.commit()
+        logger.info(f"Populated {len(drivers)} policy drivers")
+
+    def save_photo_damage_decision(
+        self, claim_id: str, filename: str, detection_index: int,
+        component: str, ai_recommendation: str, assessor_decision: str, assessor_id: str,
+    ) -> bool:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO photo_damage_decisions
+                    (claim_id, filename, detection_index, component, ai_recommendation, assessor_decision, assessor_id, decided_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(claim_id, filename, detection_index) DO UPDATE SET
+                        assessor_decision = excluded.assessor_decision,
+                        assessor_id       = excluded.assessor_id,
+                        decided_at        = excluded.decided_at
+                ''', (claim_id, filename, detection_index, component, ai_recommendation, assessor_decision, assessor_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error saving photo damage decision for {claim_id}/{filename}#{detection_index}: {str(e)}")
+            return False
+
+    def get_photo_damage_decisions(self, claim_id: str) -> List[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT filename, detection_index, component, ai_recommendation, assessor_decision, assessor_id, decided_at
+                    FROM photo_damage_decisions WHERE claim_id = ?
+                ''', (claim_id,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching photo damage decisions for {claim_id}: {str(e)}")
+            return []
+
+    def get_policy_drivers(self, policy_id: str) -> List[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM policy_drivers WHERE policy_id = ?', (policy_id,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching policy drivers for {policy_id}: {str(e)}")
+            return []
+
+    def populate_member_bank_accounts(self, conn: sqlite3.Connection):
+        """
+        Synthetic bank account numbers for the graph/relationship-analysis
+        capability (shared bank account across different policyholders).
+        Deliberately gives MEM003 and MEM007 the SAME account number --
+        a demo-able "hidden relationship" finding -- everyone else gets a
+        distinct one.
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM members WHERE bank_account IS NOT NULL")
+        if cursor.fetchone()['cnt'] > 0:
+            return
+
+        shared_account = "KE-EQTY-0041882201"
+        accounts = {
+            "MEM001": "KE-KCB-0019283746",
+            "MEM002": "KE-COOP-0055621190",
+            "MEM003": shared_account,
+            "MEM004": "KE-NCBA-0072819345",
+            "MEM005": "KE-ABSA-0038475620",
+            "MEM006": "KE-DTB-0091827364",
+            "MEM007": shared_account,   # shared with MEM003, deliberately
+            "MEM008": "KE-STANCHART-0064738291",
+        }
+        for member_id, account in accounts.items():
+            try:
+                cursor.execute('UPDATE members SET bank_account = ? WHERE member_id = ?', (account, member_id))
+            except Exception as e:
+                logger.error(f"Error setting bank_account for {member_id}: {str(e)}")
+        conn.commit()
+        logger.info(f"Populated bank accounts for {len(accounts)} members (1 deliberately shared pair)")
+
+    def find_members_sharing_bank_account(self, bank_account: str, exclude_member_id: str) -> List[Dict]:
+        if not bank_account:
+            return []
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT member_id, name FROM members
+                    WHERE bank_account = ? AND member_id != ?
+                ''', (bank_account, exclude_member_id))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error finding members sharing bank account: {str(e)}")
+            return []
+
+    def populate_historical_narrative_corpus(self, conn: sqlite3.Connection):
+        """
+        Reference corpus for narrative-similarity search. Expands well
+        beyond the ~12 narratives seeded onto live sample claims (migrate.py)
+        so similarity comparisons have enough variety to be meaningful, and
+        keeps them in a separate table so this reference data never shows
+        up as a real claim on any dashboard.
+        """
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as cnt FROM historical_narrative_corpus')
+        if cursor.fetchone()['cnt'] > 0:
+            return
+
+        corpus = [
+            ("I was driving along Thika Road when a matatu suddenly cut in front of me. I braked hard but couldn't avoid the collision. The front bumper and bonnet were damaged.", 35, "genuine_collision"),
+            ("Vehicle was parked outside my office in Upper Hill. Returned to find the side mirror broken and a deep scratch along the driver's door. No witnesses.", 45, "unwitnessed_parking_damage"),
+            ("Rear-ended at a traffic light on Mombasa Road. The other driver initially stopped but drove off before we could exchange details. Rear bumper badly damaged.", 55, "hit_and_run"),
+            ("My vehicle was broken into at night while parked at home. The stereo system and two tyres were stolen. Gate was not forced so the watchman may be involved.", 72, "insider_theft_suspicion"),
+            ("Flooding caused water to enter the engine bay while driving through a flooded section of Jogoo Road during the rains. Engine seized shortly after.", 48, "weather_damage"),
+            ("A lorry reversed into my vehicle at a loading bay in Industrial Area. The lorry driver gave me his number but is now unresponsive. Front left wing crumpled.", 40, "genuine_collision"),
+            ("Tyre blowout on the highway caused loss of control. Vehicle swerved off the road and hit a road sign. Front axle and two rims damaged.", 30, "single_vehicle_mechanical"),
+            ("Vehicle caught fire in the parking lot. Cause undetermined. Extensive damage to the interior and wiring. Fire brigade report attached.", 85, "suspicious_fire"),
+            ("Collision at the Westlands roundabout. Both vehicles sustained damage. Third party has admitted liability. Police abstract obtained.", 38, "genuine_collision"),
+            ("Vehicle was involved in a hit and run near Karen. CCTV footage from a nearby petrol station shows the incident. Rear end heavily damaged.", 50, "hit_and_run"),
+            ("Driver hit a pothole on Ngong Road that damaged the front suspension and two alloy rims. Workshop assessment confirms impact damage.", 28, "single_vehicle_mechanical"),
+            ("Vehicle stolen from a shopping mall car park. Recovered by police three days later with engine removed and airbags deployed.", 91, "suspicious_theft_recovery"),
+            # Additional patterns not covered above -- broadens what
+            # similarity search can actually match against.
+            ("Two vehicles collided at low speed at a junction, both drivers claim significant whiplash injuries despite minimal visible vehicle damage. No independent witnesses.", 68, "exaggerated_injury_claim"),
+            ("The vehicle was reversed into another car in an empty car park with no other vehicles nearby. Both drivers are acquainted with each other.", 75, "staged_low_speed_collision"),
+            ("Vehicle sustained water damage claimed to be from flooding, but the incident occurred during a week with no recorded rainfall in the area.", 80, "weather_damage_inconsistent"),
+            ("A passenger in the vehicle at the time of the accident is now claiming a separate injury payout, but was not listed on the original incident report.", 70, "phantom_passenger"),
+            ("The vehicle was declared stolen but was found abandoned undamaged two streets away with no signs of forced entry or hot-wiring.", 78, "suspicious_theft_recovery"),
+            ("Claim submitted for hail damage across the entire vehicle body, but the region has no record of a hailstorm in the claimed period.", 82, "weather_damage_inconsistent"),
+            ("Vehicle was allegedly hit by an unknown third party who fled the scene; the described damage pattern is inconsistent with the claimed direction of impact.", 66, "hit_and_run"),
+            ("Repair estimate for the claimed damage significantly exceeds typical costs for the described collision type, per garage cross-checks.", 60, "inflated_repair_estimate"),
+            ("Multiple claims filed by the same policyholder for similar low-speed parking damage within a short time span, each involving a different but nearby location.", 74, "repeat_similar_claims"),
+        ]
+        for narrative, fraud_score, pattern_label in corpus:
+            try:
+                cursor.execute('''
+                    INSERT INTO historical_narrative_corpus (narrative, fraud_score, pattern_label, claim_type)
+                    VALUES (?, ?, ?, 'motor')
+                ''', (narrative, fraud_score, pattern_label))
+            except Exception as e:
+                logger.error(f"Error inserting historical narrative corpus row: {str(e)}")
+        conn.commit()
+        logger.info(f"Populated {len(corpus)} historical narrative corpus entries")
+
+    def get_historical_narrative_corpus(self) -> List[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT narrative, fraud_score, pattern_label, claim_type FROM historical_narrative_corpus')
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error fetching historical narrative corpus: {str(e)}")
+            return []
 
     def get_analyst_claims(self, analyst_id: str) -> List[Dict]:
         """Claims filed by this analyst on behalf of members (phoned-in claims)."""
@@ -1822,7 +2353,7 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (decision_id, claim_id, decision, reason, payout_amount, decided_by))
             conn.commit()
-        logger.info(f"⚖️ Claim {claim_id} decision recorded: {decision} by {decided_by}")
+        logger.info(f"Claim {claim_id} decision recorded: {decision} by {decided_by}")
         return decision_id
 
     def get_latest_claim_decision(self, claim_id: str) -> Optional[Dict]:

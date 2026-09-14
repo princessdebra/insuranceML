@@ -34,7 +34,7 @@ class PolicyCoverageChecker:
         # Load policy wordings (these are static - just store as dict/files)
         self.policy_wordings = self._load_policy_wordings()
 
-        logger.info("✅ PolicyCoverageChecker initialized (Ollama-backed)")
+        logger.info("PolicyCoverageChecker initialized (Ollama-backed)")
     
     def _load_policy_wordings(self) -> Dict[str, str]:
         """Load the specimen policy wordings - for now using hardcoded strings"""
@@ -142,7 +142,7 @@ class PolicyCoverageChecker:
             Coverage analysis with decision and reasoning
         """
         
-        logger.info(f"🔍 Checking coverage for member {member_id}, claim type: {claim_type}")
+        logger.info(f"Checking coverage for member {member_id}, claim type: {claim_type}")
         
         # 1. Retrieve member's active policy from DB
         policy = self._get_member_policy(member_id, claim_type)
@@ -176,7 +176,7 @@ class PolicyCoverageChecker:
         # 5. Store coverage check for audit
         db_manager.store_coverage_check(coverage_analysis)
         
-        logger.info(f"✅ Coverage check completed - Decision: {coverage_analysis.get('coverage_decision')}")
+        logger.info(f"Coverage check completed - Decision: {coverage_analysis.get('coverage_decision')}")
         
         return coverage_analysis
     
@@ -210,7 +210,7 @@ class PolicyCoverageChecker:
                 policy_row = cursor.fetchone()
                 
                 if not policy_row:
-                    logger.warning(f"⚠️ No active {claim_type} policy found for member {member_id}")
+                    logger.warning(f"No active {claim_type} policy found for member {member_id}")
                     return None
                 
                 policy = dict(policy_row)
@@ -243,11 +243,11 @@ class PolicyCoverageChecker:
                     if domestic_details:
                         policy.update(dict(domestic_details))
                 
-                logger.info(f"📋 Found policy: {policy['policy_number']} - Cover: {policy.get('cover_type', 'N/A')}")
+                logger.info(f"Found policy: {policy['policy_number']} - Cover: {policy.get('cover_type','N/A')}")
                 return policy
                 
         except Exception as e:
-            logger.error(f"❌ Error retrieving policy: {str(e)}")
+            logger.error(f"Error retrieving policy: {str(e)}")
             return None
     
     def _check_policy_conditions_db(
@@ -266,8 +266,16 @@ class PolicyCoverageChecker:
         
         if claim_type == 'motor':
             # Check driver authorization
-            driver = incident_details.get('driver_name', '').strip()
-            authorised_drivers_json = policy.get('authorised_drivers', '[]')
+            # `dict.get(key, default)` only substitutes `default` when the
+            # KEY is absent -- a NULL DB column (or a caller that stores an
+            # explicit None) still returns None here, which crashes every
+            # `.strip()`/`.lower()` below with "'NoneType' object has no
+            # attribute ...". Confirmed live: a policy row created before a
+            # class_of_use fix landed hit exactly this on real traffic (a
+            # 500 that surfaced to the user as a misleading "not covered").
+            # `or` catches both cases -- missing key AND explicit None/empty.
+            driver = (incident_details.get('driver_name') or '').strip()
+            authorised_drivers_json = policy.get('authorised_drivers') or '[]'
             
             # Parse authorized drivers list
             try:
@@ -283,35 +291,35 @@ class PolicyCoverageChecker:
                         "any driver", "all drivers", "any licensed"
                     ]):
                         # Plain text open authorization
-                        logger.info(f"✅ Open authorization detected: '{stripped}' — all drivers permitted")
+                        logger.info(f"Open authorization detected:'{stripped}'— all drivers permitted")
                         authorised_drivers = ["__open__"]
                     elif stripped in ("", "[]"):
                         authorised_drivers = []
                     else:
                         # Unknown format — benefit of doubt
-                        logger.warning(f"⚠️ Unknown authorised_drivers format: '{stripped}' — defaulting to open")
+                        logger.warning(f"Unknown authorised_drivers format:'{stripped}'— defaulting to open")
                         authorised_drivers = ["__open__"]
                 else:
                     authorised_drivers = []
             except (json.JSONDecodeError, TypeError) as e:
-                logger.warning(f"⚠️ Failed to parse authorised_drivers: '{authorised_drivers_json}' — {str(e)}")
+                logger.warning(f"Failed to parse authorised_drivers:'{authorised_drivers_json}'— {str(e)}")
                 authorised_drivers = ["__open__"]
 
             # Normalize driver name
             normalized_driver = driver.strip()
 
             # Debug logging
-            logger.info(f"🔍 Checking driver authorization:")
+            logger.info(f"Checking driver authorization:")
             logger.info(f"   Driver from form: '{normalized_driver}'")
             logger.info(f"   Authorized drivers: {authorised_drivers}")
 
             # Check if driver is authorized
             if "__open__" in authorised_drivers:
                 driver_authorized = True
-                logger.info(f"✅ Driver '{normalized_driver}' authorized — open policy")
+                logger.info(f"Driver'{normalized_driver}'authorized — open policy")
             elif not authorised_drivers:
                 driver_authorized = True
-                logger.info(f"✅ Driver '{normalized_driver}' authorized — no restrictions on policy")
+                logger.info(f"Driver'{normalized_driver}'authorized — no restrictions on policy")
             else:
                 driver_authorized = (
                     any(normalized_driver.lower() == auth.strip().lower() for auth in authorised_drivers)
@@ -323,27 +331,27 @@ class PolicyCoverageChecker:
             checks['driver_authorized'] = driver_authorized
             if not driver_authorized:
                 checks['exclusions_triggered'].append("Driver not authorized under policy")
-                logger.warning(f"❌ Driver '{driver}' not found in authorized list: {authorised_drivers}")
+                logger.warning(f"Driver'{driver}'not found in authorized list: {authorised_drivers}")
             else:
-                logger.info(f"✅ Driver '{driver}' is authorized")
+                logger.info(f"Driver'{driver}'is authorized")
 
             # Check class of use
-            incident_use = incident_details.get('vehicle_use', 'private').lower()
-            policy_use = policy.get('class_of_use', 'private').lower()
+            incident_use = (incident_details.get('vehicle_use') or 'private').lower()
+            policy_use = (policy.get('class_of_use') or 'private').lower()
 
             checks['class_of_use_compliant'] = incident_use == policy_use
             if incident_use != policy_use:
                 checks['warnings'].append(f"Vehicle used for {incident_use} but policy covers {policy_use}")
 
             # Check if own damage is covered
-            cover_type = policy.get('cover_type', '').upper()
+            cover_type = (policy.get('cover_type') or '').upper()
 
             if incident_details.get('damage_type') in ['collision', 'own_damage']:
                 checks['covers_own_damage'] = cover_type == 'COMPREHENSIVE'
                 if cover_type == 'TPO':
                     checks['exclusions_triggered'].append("Third Party Only policy does not cover own vehicle damage")
 
-        logger.debug(f"📊 DB checks completed: {checks}")
+        logger.debug(f"DB checks completed: {checks}")
         return checks
 
     async def _analyze_coverage_with_llm(
@@ -356,7 +364,7 @@ class PolicyCoverageChecker:
     ) -> Dict[str, Any]:
         """Use the local Ollama model to analyze coverage with full context"""
 
-        logger.info(f"🤖 Starting Ollama coverage analysis for {claim_type} claim")
+        logger.info(f"Starting Ollama coverage analysis for {claim_type} claim")
 
         # Build comprehensive prompt
         prompt = f"""
@@ -439,7 +447,7 @@ Respond with ONLY a JSON object in this exact shape:
             return result
 
         except OllamaError as e:
-            logger.error(f"❌ Ollama coverage analysis failed: {str(e)}")
+            logger.error(f"Ollama coverage analysis failed: {str(e)}")
 
             return {
                 "covered": None,
@@ -464,7 +472,7 @@ Respond with ONLY a JSON object in this exact shape:
         Q&A grounded in the member's actual policy record and wording.
         """
 
-        logger.info(f"💬 Policy Q&A for member {member_id} ({claim_type}): {question}")
+        logger.info(f"Policy Q&A for member {member_id} ({claim_type}): {question}")
 
         policy = self._get_member_policy(member_id, claim_type)
         if not policy:
@@ -508,7 +516,7 @@ Answer in plain text, 2-4 sentences.
             # Run in a worker thread — see comment in _analyze_coverage_with_llm.
             answer = await asyncio.to_thread(generate, prompt, timeout=120)
         except OllamaError as e:
-            logger.error(f"❌ Ollama policy Q&A failed: {str(e)}")
+            logger.error(f"Ollama policy Q&A failed: {str(e)}")
             answer = (
                 "Sorry, I'm unable to answer that right now. Please contact "
                 "support or try again shortly."

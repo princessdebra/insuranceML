@@ -1,17 +1,22 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AssessorLayout from "@/layouts/AssessorLayout";
-import { getAssessorClaims } from "@/lib/api";
+import { getAssessorClaims, getAssessorDashboardOverview, AssessorDashboardOverview } from "@/lib/api";
 
 export default function AssessorDashboard() {
   const navigate = useNavigate();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [overview, setOverview] = useState<AssessorDashboardOverview | null>(null);
+  const [overviewLoading, setOverviewLoading] = useState(true);
 
   useEffect(() => {
     const assessorId = localStorage.getItem("assessorId");
     if (!assessorId) { navigate("/assessor/login"); return; }
     getAssessorClaims(assessorId).then((d) => { setData(d); setLoading(false); }).catch(() => setLoading(false));
+    getAssessorDashboardOverview(assessorId)
+      .then((d) => { setOverview(d); setOverviewLoading(false); })
+      .catch(() => setOverviewLoading(false));
   }, [navigate]);
 
   // Claims still being analyzed (risk_level === "pending") finish on the
@@ -38,8 +43,26 @@ export default function AssessorDashboard() {
   if (loading) return <AssessorLayout><div className="flex items-center justify-center h-full"><p className="text-muted-foreground">Loading...</p></div></AssessorLayout>;
 
   const claims = data?.claims || [];
-  const pendingCount = claims.filter((c: any) => c.assignment_status === "pending").length;
-  const avgRisk = claims.length ? Math.round(claims.reduce((s: number, c: any) => s + (c.fraud_risk_score || 0), 0) / claims.length) : 0;
+
+  const widgets = overview ? [
+    { icon: "pending_actions", label: "Pending Inspections", value: overview.pending_inspections, iconColor: "text-amber-500", iconBg: "bg-amber-500/10" },
+    { icon: "today", label: "Inspections Scheduled Today", value: overview.inspections_scheduled_today, iconColor: "text-blue-500", iconBg: "bg-blue-500/10" },
+    { icon: "edit_note", label: "Reports Awaiting Submission", value: overview.reports_awaiting_submission, iconColor: "text-primary", iconBg: "bg-primary/10" },
+    { icon: "undo", label: "Reports Returned for Review", value: overview.reports_returned_for_review, iconColor: "text-destructive", iconBg: "bg-destructive/10" },
+    { icon: "task_alt", label: "Completed Assessments", value: overview.completed_assessments, iconColor: "text-emerald-600", iconBg: "bg-emerald-500/10" },
+    { icon: "warning", label: "Overdue Assessments", value: overview.overdue_assessments, iconColor: "text-destructive", iconBg: "bg-destructive/10" },
+    {
+      icon: "schedule", label: "Avg. Assessment Turnaround",
+      value: overview.avg_turnaround_hours !== null ? overview.avg_turnaround_hours : "—",
+      suffix: overview.avg_turnaround_hours !== null ? "hrs" : "",
+      iconColor: "text-muted-foreground", iconBg: "bg-muted",
+    },
+    {
+      icon: "payments", label: "Estimated Claim Value",
+      value: `KES ${Math.round(overview.estimated_claim_value_total).toLocaleString()}`,
+      iconColor: "text-primary", iconBg: "bg-primary/10",
+    },
+  ] : [];
 
   return (
     <AssessorLayout>
@@ -50,23 +73,38 @@ export default function AssessorDashboard() {
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
-          {[
-            { icon: "assignment_turned_in", label: "Total Assigned Claims", value: String(claims.length).padStart(2, "0"), iconColor: "text-primary", iconBg: "bg-primary/10", tag: "Overall" },
-            { icon: "pending_actions", label: "Pending Inspections", value: String(pendingCount).padStart(2, "0"), iconColor: "text-amber-500", iconBg: "bg-amber-500/10", tag: "Urgent" },
-            { icon: "analytics", label: "Average Risk Score", value: `${avgRisk}`, iconColor: "text-blue-500", iconBg: "bg-blue-500/10", tag: "AI Insight", suffix: "/100" },
-            { icon: "calendar_today", label: "Completed Today", value: "00", iconColor: "text-muted-foreground", iconBg: "bg-muted", tag: "" },
-          ].map((stat) => (
-            <div key={stat.label} className="bg-card p-6 rounded-xl border border-border shadow-sm">
-              <div className="flex items-center justify-between mb-4">
-                <span className={`material-symbols-outlined ${stat.iconColor} ${stat.iconBg} p-2 rounded-lg`}>{stat.icon}</span>
-                {stat.tag && <span className={`text-xs font-bold uppercase tracking-wider ${stat.tag === "Urgent" ? "text-amber-500" : "text-muted-foreground"}`}>{stat.tag}</span>}
+        {overviewLoading ? (
+          <div className="bg-card p-8 rounded-xl border border-border shadow-sm mb-10 text-center text-muted-foreground animate-pulse">
+            Loading assignment overview...
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
+            {widgets.map((stat) => (
+              <div key={stat.label} className="bg-card p-6 rounded-xl border border-border shadow-sm">
+                <div className="flex items-center justify-between mb-4">
+                  <span className={`material-symbols-outlined ${stat.iconColor} ${stat.iconBg} p-2 rounded-lg`}>{stat.icon}</span>
+                </div>
+                <p className="text-sm font-medium text-muted-foreground">{stat.label}</p>
+                <p className="text-3xl font-bold mt-1 text-foreground">{stat.value}{stat.suffix && <span className="text-sm font-normal text-muted-foreground ml-1">{stat.suffix}</span>}</p>
               </div>
-              <p className="text-sm font-medium text-muted-foreground">{stat.label}</p>
-              <p className="text-3xl font-bold mt-1 text-foreground">{stat.value}{stat.suffix && <span className="text-sm font-normal text-muted-foreground ml-1">{stat.suffix}</span>}</p>
+            ))}
+          </div>
+        )}
+
+        {/* Claims by Status */}
+        {overview && Object.keys(overview.claims_by_status).length > 0 && (
+          <div className="bg-card p-6 rounded-xl border border-border shadow-sm mb-10">
+            <h4 className="text-sm font-bold text-foreground mb-4">Claims by Status</h4>
+            <div className="flex flex-wrap gap-4">
+              {Object.entries(overview.claims_by_status).map(([status, count]) => (
+                <div key={status} className="flex items-center gap-2 px-4 py-2 bg-muted/30 border rounded-lg">
+                  <span className="text-lg font-black text-foreground tabular-nums">{count}</span>
+                  <span className="text-[11px] font-bold uppercase text-muted-foreground">{status.replace(/_/g, " ")}</span>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          </div>
+        )}
 
         {/* Claims Table */}
         <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
@@ -96,7 +134,6 @@ export default function AssessorDashboard() {
                   <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider">Claim Reference</th>
                   {/* <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider">Location</th> */}
                   <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider">Est. Cost</th>
-                  <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider">Risk Score</th>
                   <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider">Status</th>
                   <th className="px-6 py-4 text-xs font-bold text-muted-foreground uppercase tracking-wider text-right">Actions</th>
                 </tr>
@@ -131,18 +168,6 @@ export default function AssessorDashboard() {
                       )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      {claim.risk_level === "pending" ? (
-                        <span className="text-sm text-muted-foreground italic">pending</span>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <div className="flex-1 h-1.5 w-16 bg-muted rounded-full overflow-hidden">
-                            <div className="h-full bg-primary rounded-full" style={{ width: `${claim.fraud_risk_score}%` }}></div>
-                          </div>
-                          <span className="text-sm font-medium text-primary">{claim.risk_level} ({claim.fraud_risk_score})</span>
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800">
                         {claim.assignment_status}
                       </span>
@@ -163,38 +188,6 @@ export default function AssessorDashboard() {
           </div>
         </div>
 
-        {/* AI Insights */}
-        <div className="mt-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 bg-gradient-to-br from-primary to-emerald-800 p-6 rounded-xl text-primary-foreground shadow-lg flex items-center justify-between">
-            <div>
-              <h4 className="text-lg font-bold mb-2">Automated Claims Assist</h4>
-              <p className="text-emerald-50 text-sm max-w-md">Our AI monitors all claims for anomalies and provides real-time risk assessments.</p>
-              <button className="mt-4 px-4 py-2 bg-card text-primary rounded-lg text-sm font-bold shadow-sm hover:bg-background transition-colors">
-                View AI Analysis
-              </button>
-            </div>
-            <span className="material-symbols-outlined text-[64px] opacity-20 hidden sm:block">psychology</span>
-          </div>
-          <div className="bg-card p-6 rounded-xl border border-border shadow-sm">
-            <h4 className="font-bold mb-4 flex items-center gap-2 text-foreground">
-              <span className="material-symbols-outlined text-primary text-[20px]">event_note</span>
-              Upcoming Schedule
-            </h4>
-            <div className="space-y-4">
-              <div className="flex gap-3 pb-4 border-b border-border">
-                <div className="bg-primary/10 text-primary p-2 rounded flex flex-col items-center justify-center min-w-[48px]">
-                  <span className="text-xs font-bold">18</span>
-                  <span className="text-[10px] uppercase font-bold">Mar</span>
-                </div>
-                <div>
-                  <p className="text-sm font-bold text-foreground">Workshop Visit</p>
-                  <p className="text-xs text-muted-foreground">AutoExpress Thika Rd</p>
-                </div>
-              </div>
-              <p className="text-xs text-center text-muted-foreground italic">No other inspections scheduled.</p>
-            </div>
-          </div>
-        </div>
       </div>
     </AssessorLayout>
   );

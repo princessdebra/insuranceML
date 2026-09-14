@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,74 @@ Return ONLY valid JSON -- no text outside the JSON block.
     "quality_notes": "one sentence on legibility/completeness issues, empty string if none"
 }}
 """,
+    "claim_form": """
+You are extracting data from photo(s) of a filled-in Old Mutual "Motor Accident Claim Form" -- a
+multi-section paper form a policyholder completes by hand and hands (or a claims analyst
+receives) to start a motor insurance claim. You may be given multiple page images of the same
+form -- combine everything you read across all of them into one JSON result.
+
+The form has four sections. Only extract what is actually filled in -- most forms leave many
+fields blank, and a blank field must be null (or an empty array), never guessed or invented.
+
+Return ONLY valid JSON -- no text outside the JSON block.
+
+{{
+    "raw_text": "the full text visible across all pages, transcribed as accurately as possible",
+    "parsed_fields": {{
+        "policy_no": "policy number from Section A, or null",
+        "branch": "branch name, or null",
+        "cover_type": "Comprehensive / TPF&T / TPO -- whichever box is ticked, or null",
+        "insured_full_name": "the insured's full name (combine surname/middle/first, or the registered company name), or null",
+        "insured_id_no": "ID or passport number, or null",
+        "insured_phone": "best phone number given (mobile preferred over office/residential), or null",
+        "insured_email": "email address, or null",
+        "insured_address": "postal or physical address, or null",
+        "vehicle_make": "vehicle make, or null",
+        "vehicle_model": "vehicle model, or null",
+        "vehicle_year": "year of manufacture, or null",
+        "vehicle_reg_no": "registration number, or null",
+        "registered_owner_name": "name and address of registered owner if different from the insured, or null",
+        "accident_date": "date of the accident, YYYY-MM-DD if determinable, or null",
+        "accident_time": "time of the accident as written (include am/pm), or null",
+        "accident_place": "place the accident occurred, or null",
+        "road_surface": "type of road surface, or null",
+        "weather_condition": "wet or dry / weather described, or null",
+        "damage_description": "the 'state briefly apparent damage' free-text answer, or null",
+        "repairer_name": "repairer's name, or null",
+        "repairer_address": "repairer's address, or null",
+        "repairer_phone": "repairer's phone number, or null",
+        "vehicle_still_in_use": true/false/null,
+        "police_involved": true/false/null,
+        "police_station": "police station named, or null",
+        "police_constable_number": "constable number given, or null",
+        "third_party_vehicles": [
+            {{"owner_name": "...", "reg_no": "...", "insurer": "..."}}
+        ],
+        "third_party_property_damaged": [
+            {{"owner_name": "...", "property_damaged": "..."}}
+        ],
+        "persons_injured": [
+            {{"name": "...", "relationship_to_insured": "...", "apparent_injuries": "..."}}
+        ],
+        "witnesses": [
+            {{"name": "...", "address": "..."}}
+        ],
+        "driver_name": "the driver's name from Section D (may be the same as the insured), or null",
+        "driver_relationship_to_insured": "e.g. 'self', 'employee', 'family member', or null",
+        "driver_employed_by_insured": true/false/null,
+        "driver_had_permission": true/false/null,
+        "driver_to_blame": true/false/null,
+        "driver_admitted_liability": true/false/null,
+        "driver_licence_number": "driver's licence number, or null",
+        "driver_statement": "the free-text 'STATEMENT BY DRIVER' narrative from Section B, or null",
+        "owner_statement": "the free-text 'STATEMENT BY OWNER/INSURED' narrative from Section D, or null",
+        "declaration_date": "the date the form was signed, YYYY-MM-DD if determinable, or null"
+    }},
+    "extraction_confidence": 0-100,
+    "document_appears_genuine": true/false,
+    "quality_notes": "one sentence on legibility/completeness/handwriting issues, empty string if none"
+}}
+""",
     "other": """
 You are extracting data from a photo of a supporting document submitted as
 part of a motor insurance claim. The document type is not known in advance.
@@ -108,10 +176,14 @@ def _strip_code_fence(text: str) -> str:
 
 
 async def extract_document_data(
-    image_data: bytes, filename: str, document_type: str
+    image_data: Union[bytes, List[bytes]], filename: str, document_type: str
 ) -> Dict[str, Any]:
     """
-    OCR + structured extraction for a single document image.
+    OCR + structured extraction for a document. Accepts either a single
+    image or a list of images (multi-page forms, e.g. the 4-page claim
+    form -- the vision model reads all pages in one call and merges what it
+    finds across them into one JSON result, rather than needing a separate
+    extraction + manual merge per page).
     Never raises -- returns extraction_confidence=0 and an "error" key on
     failure, so a flaky Ollama connection degrades to "document stored with
     no extracted data" rather than blocking the claim submission it's
@@ -119,13 +191,21 @@ async def extract_document_data(
     """
     document_type = document_type if document_type in _PROMPTS else "other"
     prompt = _PROMPTS[document_type]
+    images = image_data if isinstance(image_data, list) else [image_data]
 
     try:
         from ollama_client import generate, OllamaError
 
+        # The claim-form schema has ~30 fields plus nested arrays -- the
+        # client's default 1024-token cap truncates it mid-JSON-string
+        # (confirmed live: json.loads raised "Unterminated string" on a
+        # real extraction attempt), so it gets a much larger budget than
+        # the other, smaller document schemas need.
+        num_predict = 4096 if document_type == "claim_form" else None
+
         response_text = await asyncio.to_thread(
-            generate, prompt, model=OCR_VISION_MODEL, images=[image_data],
-            json_mode=True, timeout=90,
+            generate, prompt, model=OCR_VISION_MODEL, images=images,
+            json_mode=True, timeout=120, num_predict=num_predict,
         )
         parsed = json.loads(_strip_code_fence(response_text))
 

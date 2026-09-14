@@ -14,6 +14,7 @@ from reconstruction_routes import reconstruction_router
 from schemas import ErrorResponseSchema
 from agents import PolicyCoverageChecker
 from database import db_manager
+import email_service
 
 # Configure logging
 logging.basicConfig(
@@ -85,7 +86,7 @@ async def check_coverage_before_claim(
     ```
     """
     try:
-        logger.info(f"🔍 Coverage check for {member_id} - {claim_type}")
+        logger.info(f"Coverage check for {member_id} - {claim_type}")
         
         # Build incident details
         incident_details = {
@@ -95,7 +96,15 @@ async def check_coverage_before_claim(
         }
         
         if claim_type == "motor":
-            incident_details["driver_name"] = driver_name
+            # PolicyCoverageChecker (agents.py ~line 269) does
+            # incident_details.get('driver_name', '').strip() -- that
+            # default only applies when the KEY is absent, not when its
+            # value is None, so passing the raw Optional[str]=None through
+            # crashes with "'NoneType' object has no attribute 'strip'"
+            # whenever a caller omits driver_name (confirmed live testing
+            # the claim-form-upload flow, whose driver name can genuinely
+            # be blank if it wasn't legible on the form).
+            incident_details["driver_name"] = driver_name or ""
             incident_details["vehicle_use"] = "private"  # Can be made dynamic
             incident_details["damage_type"] = "collision"  # Can be made dynamic
         
@@ -133,7 +142,7 @@ async def check_coverage_before_claim(
                 "applicable_excess": result.get('applicable_excess'),
                 "reasons": result.get('reasons_for_decision', []),
                 "next_step": "Proceed to create claim",
-                "message": "✅ Member is covered. You can now create a claim."
+                "message":"Member is covered. You can now create a claim."
             }
         else:
             return {
@@ -143,11 +152,11 @@ async def check_coverage_before_claim(
                 "reasons": result.get('reasons_for_decision', []),
                 "exclusions": result.get('exclusions_triggered', []),
                 "next_step": "Cannot create claim",
-                "message": "❌ Member is NOT covered for this incident."
+                "message":"Member is NOT covered for this incident."
             }
             
     except Exception as e:
-        logger.error(f"❌ Coverage check error: {str(e)}")
+        logger.error(f"Coverage check error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -181,7 +190,7 @@ async def ask_policy_question(
         return {"success": True, **result}
 
     except Exception as e:
-        logger.error(f"❌ Policy Q&A error: {str(e)}")
+        logger.error(f"Policy Q&A error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -248,7 +257,7 @@ async def list_all_assessors(
                 ) if assessor['max_workload'] > 0 else 0
                 assessor['is_available'] = assessor['current_workload'] < assessor['max_workload']
         
-        logger.info(f"📋 Retrieved {len(assessors)} assessors (filters: active={active_only}, spec={specialization})")
+        logger.info(f"Retrieved {len(assessors)} assessors (filters: active={active_only}, spec={specialization})")
         
         return {
             "success": True,
@@ -263,7 +272,7 @@ async def list_all_assessors(
         }
         
     except Exception as e:
-        logger.error(f"❌ Error listing assessors: {str(e)}")
+        logger.error(f"Error listing assessors: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving assessors: {str(e)}"
@@ -287,7 +296,7 @@ async def list_all_analysts(active_only: bool = Query(True)):
             analysts = [dict(row) for row in cursor.fetchall()]
         return {"success": True, "total_analysts": len(analysts), "analysts": analysts}
     except Exception as e:
-        logger.error(f"❌ Error listing analysts: {str(e)}")
+        logger.error(f"Error listing analysts: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -304,7 +313,7 @@ async def get_claims_filed_by_analyst(analyst_id: str):
         claims = db_manager.get_analyst_claims(analyst_id)
         return {"success": True, "analyst_id": analyst_id, "total_claims": len(claims), "claims": claims}
     except Exception as e:
-        logger.error(f"❌ Error fetching claims for analyst {analyst_id}: {str(e)}")
+        logger.error(f"Error fetching claims for analyst {analyst_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -341,7 +350,7 @@ async def manually_assign_assessor(
     ```
     """
     try:
-        logger.info(f"📌 Manual assignment: {assessor_id} → {claim_id}")
+        logger.info(f"Manual assignment: {assessor_id} → {claim_id}")
         
         with db_manager.get_connection() as conn:
             cursor = conn.cursor()
@@ -378,7 +387,7 @@ async def manually_assign_assessor(
                 )
             
             if assessor['current_workload'] >= assessor['max_workload']:
-                logger.warning(f"⚠️ Assessor {assessor_id} is at full capacity")
+                logger.warning(f"Assessor {assessor_id} is at full capacity")
                 # Allow override but warn
             
             # Check if already assigned
@@ -401,7 +410,7 @@ async def manually_assign_assessor(
                     }
                 else:
                     # Reassignment - cancel old, create new
-                    logger.info(f"🔄 Reassigning from {existing['assessor_id']} to {assessor_id}")
+                    logger.info(f"Reassigning from {existing['assessor_id']} to {assessor_id}")
                     
                     # Update old assignment
                     cursor.execute('''
@@ -442,7 +451,7 @@ async def manually_assign_assessor(
             
             conn.commit()
         
-        logger.info(f"✅ Assignment complete: {assignment_id}")
+        logger.info(f"Assignment complete: {assignment_id}")
         
         return {
             "success": True,
@@ -456,7 +465,7 @@ async def manually_assign_assessor(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Assignment error: {str(e)}")
+        logger.error(f"Assignment error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
@@ -494,7 +503,41 @@ async def get_my_assigned_claims(
         }
         
     except Exception as e:
-        logger.error(f"❌ Error fetching assessor claims: {str(e)}")
+        logger.error(f"Error fetching assessor claims: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/assessor/{assessor_id}/dashboard-overview")
+async def get_assessor_dashboard_overview_endpoint(assessor_id: str):
+    """
+    **Operational widgets for the assessor's own dashboard** -- pending/
+    scheduled/awaiting-submission/overdue/completed counts, turnaround time,
+    claim value, and a status breakdown. Deliberately excludes any
+    fraud/risk figures, consistent with those staying out of the assessor's
+    view everywhere else in the app.
+    """
+    try:
+        result = db_manager.get_assessor_dashboard_overview(assessor_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error building assessor dashboard overview: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/assessors/assignment/{assignment_id}/return-for-review")
+async def return_assignment_for_review_endpoint(
+    assignment_id: str,
+    reason: str = Form(..., description="Why this report is being sent back"),
+    returned_by: str = Form(..., description="admin_id of the reviewer"),
+):
+    """**ADMIN: Send a submitted assessor report back for revision** -- moves the assignment to 'returned_for_review'."""
+    try:
+        ok = db_manager.return_assignment_for_review(assignment_id, reason, returned_by)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+        return {"success": True, "assignment_id": assignment_id, "status": "returned_for_review"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error returning assignment for review: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/claim-details/{claim_id}")
@@ -569,7 +612,7 @@ async def get_claim_details_for_assessor(claim_id: str, assessor_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/member-claim-details/{claim_id}")
@@ -624,7 +667,7 @@ async def get_claim_details_for_member(claim_id: str, member_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/schedule-inspection")
@@ -650,6 +693,27 @@ async def schedule_inspection(
                 inspection_location=location
             )
 
+            cursor = conn.cursor()
+            cursor.execute("SELECT claim_id FROM claim_assignments WHERE assignment_id = ?", (assignment_id,))
+            row = cursor.fetchone()
+
+        # Best-effort -- never blocks scheduling if email fails/isn't configured.
+        try:
+            if row and row["claim_id"]:
+                claim = db_manager.get_claim(row["claim_id"])
+                member = db_manager.get_member_info(claim.get("member_id")) if claim and claim.get("member_id") else None
+                if member and member.get("email"):
+                    email_service.send_inspection_scheduled_email(
+                        to_email=member["email"],
+                        member_name=member.get("name") or "there",
+                        member_id=claim["member_id"],
+                        claim_id=row["claim_id"],
+                        inspection_date=inspection_date,
+                        location=location,
+                    )
+        except Exception as e:
+            logger.warning(f"Inspection-scheduled email failed for assignment {assignment_id}: {str(e)}")
+
         return {
             "success": True,
             "message": "Inspection scheduled successfully",
@@ -657,7 +721,7 @@ async def schedule_inspection(
         }
 
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
@@ -727,7 +791,7 @@ async def get_claim_workflow_status(claim_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create-claim")
@@ -740,6 +804,7 @@ async def create_claim_after_coverage(
     brief_description: str = Form(...),
     claim_type: str = Form(...),  # motor/marine/domestic
     filed_by_analyst_id: Optional[str] = Form(None, description="Set when a claims analyst is filing this on the member's behalf"),
+    filing_method: Optional[str] = Form(None, description="'phone' (default when filed_by_analyst_id is set) or 'form' -- an analyst transcribing a physical claim form"),
 ):
     """
     **STEP 2: Create claim AFTER coverage is confirmed**
@@ -766,7 +831,7 @@ async def create_claim_after_coverage(
     ```
     """
     try:
-        logger.info(f"📋 Creating claim for {member_id}")
+        logger.info(f"Creating claim for {member_id}")
         
         # Verify coverage check exists and is COVERED
         with db_manager.get_connection() as conn:
@@ -822,7 +887,7 @@ async def create_claim_after_coverage(
                 0,          # processing_time_ms - updated after AI analysis
                 '{}',       # analysis_result - populated after full analysis
                 filed_by_analyst_id,
-                'analyst_phone' if filed_by_analyst_id else 'member_self',
+                ('analyst_form' if filing_method == 'form' else 'analyst_phone') if filed_by_analyst_id else 'member_self',
             ))
             
             # Link coverage check to claim
@@ -841,9 +906,25 @@ async def create_claim_after_coverage(
             )
             
             conn.commit()
-        
-        logger.info(f"✅ Claim created: {claim_id}")
-        
+
+        logger.info(f"Claim created: {claim_id}")
+
+        # Best-effort -- confirms to the member (self-filed or analyst-filed
+        # alike) that their claim exists and is on an assessor's dashboard.
+        # Never blocks claim creation if email fails/isn't configured.
+        try:
+            member = db_manager.get_member_info(member_id)
+            if member and member.get("email"):
+                email_service.send_claim_created_email(
+                    to_email=member["email"],
+                    member_name=member.get("name") or "there",
+                    member_id=member_id,
+                    claim_id=claim_id,
+                    assessor_name=assignment.get("assessor_name"),
+                )
+        except Exception as e:
+            logger.warning(f"Claim-created email failed for {claim_id}: {str(e)}")
+
         return {
             "success": True,
             "claim_id": claim_id,
@@ -863,7 +944,7 @@ async def create_claim_after_coverage(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Claim creation error: {str(e)}")
+        logger.error(f"Claim creation error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/member/{member_id}/policies")
@@ -948,7 +1029,108 @@ async def search_members(q: str = Query(..., min_length=2, description="Name, ph
         results = db_manager.search_members(q)
         return {"success": True, "results": results}
     except Exception as e:
-        logger.error(f"❌ Member search error: {str(e)}")
+        logger.error(f"Member search error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/members/create")
+async def create_member(
+    name: str = Form(...),
+    email: Optional[str] = Form(None),
+    phone: Optional[str] = Form(None),
+):
+    """
+    **Create a member record on the fly.**
+
+    For the "upload a physical claim form" analyst flow: the insured named
+    on the form frequently isn't already in the system (a genuinely new
+    policyholder, or one who's never had a claim before). Coverage checking
+    and claim creation both require an existing `member_id`, so this exists
+    to unblock that case rather than forcing the analyst to abandon the
+    claim form just because the person isn't on file yet.
+
+    The `members` table has no NOT NULL constraints beyond the primary key,
+    so this intentionally accepts a bare minimum (a name) -- email/phone
+    are for contactability, not correctness.
+    """
+    try:
+        from utils import generate_unique_id
+        member_id = generate_unique_id("MEM")
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO members (member_id, name, email, phone) VALUES (?, ?, ?, ?)",
+                (member_id, name.strip(), (email or "").strip() or None, (phone or "").strip() or None),
+            )
+            conn.commit()
+        return {"success": True, "member_id": member_id}
+    except Exception as e:
+        logger.error(f"Error creating member: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/policies/create")
+async def create_policy(
+    member_id: str = Form(...),
+    policy_number: Optional[str] = Form(None),
+    cover_type: str = Form("Comprehensive"),
+    sum_insured: float = Form(...),
+    excess: float = Form(0),
+    start_date: str = Form(..., description="YYYY-MM-DD"),
+    end_date: str = Form(..., description="YYYY-MM-DD"),
+    vehicle_make: Optional[str] = Form(None),
+    vehicle_model: Optional[str] = Form(None),
+    vehicle_year: Optional[int] = Form(None),
+    vehicle_reg_no: Optional[str] = Form(None),
+):
+    """
+    **Create a motor policy on the fly, for a member with no policy on file.**
+
+    Coverage checking (see PolicyCoverageChecker._get_member_policy in
+    agents.py) requires a `policies` row with policy_type='motor' whose
+    [start_date, end_date] window covers today -- there's no path around
+    that requirement, so this is the minimum needed to let a
+    newly-created member's claim actually proceed through /check-coverage.
+
+    Not a substitute for real underwriting -- this is a claims-intake
+    convenience for the analyst/claim-form flow, recording what the paper
+    form and analyst say the policy terms are.
+    """
+    try:
+        from utils import generate_unique_id
+        policy_id = generate_unique_id("MPOL")
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                '''INSERT INTO policies
+                   (policy_id, member_id, policy_type, policy_number, cover_type, sum_insured, excess, start_date, end_date)
+                   VALUES (?, ?, 'motor', ?, ?, ?, ?, ?, ?)''',
+                (policy_id, member_id, (policy_number or "").strip() or policy_id, cover_type, sum_insured, excess, start_date, end_date),
+            )
+            # Always insert a motor_policy_details row, even with no vehicle
+            # info given -- coverage-check (agents.py PolicyCoverageChecker,
+            # ~line 269) reads authorised_drivers unconditionally for every
+            # motor claim via policy.get('authorised_drivers', '[]'), and
+            # that default only applies when the KEY is absent, not when its
+            # value is None/NULL -- a NULL column crashes with
+            # "'NoneType' object has no attribute 'strip'" (confirmed live).
+            # '[]' means "no restriction, any driver authorised", which is
+            # the correct default for a policy created from a claim form
+            # that doesn't list authorised drivers.
+            # class_of_use also has to be non-NULL for the same reason --
+            # coverage-check does policy.get('class_of_use', 'private').lower()
+            # unconditionally, same None-default pitfall as authorised_drivers.
+            # 'private' matches the same default check-coverage assumes for
+            # incident_details['vehicle_use'] when the caller doesn't say
+            # otherwise, so the two agree unless corrected later.
+            conn.execute(
+                '''INSERT INTO motor_policy_details
+                   (policy_id, vehicle_make, vehicle_model, vehicle_year, registration_number, authorised_drivers, class_of_use)
+                   VALUES (?, ?, ?, ?, ?, '[]', 'private')''',
+                (policy_id, vehicle_make, vehicle_model, vehicle_year, vehicle_reg_no),
+            )
+            conn.commit()
+        return {"success": True, "policy_id": policy_id}
+    except Exception as e:
+        logger.error(f"Error creating policy: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1012,18 +1194,18 @@ if os.path.exists("static"):
 @app.on_event("startup")
 async def startup_event():
     """Application startup event"""
-    logger.info("🚗 Starting Old Mutual Motor Underwriting AI")
-    logger.info("🔍 AI-powered fraud detection system initializing...")
-    logger.info("🇰🇪 Kenya-specific integrations ready")
-    logger.info("✅ System startup complete")
+    logger.info("Starting Old Mutual Motor Underwriting AI")
+    logger.info("AI-powered fraud detection system initializing...")
+    logger.info("Kenya-specific integrations ready")
+    logger.info("System startup complete")
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event"""
-    logger.info("🛑 Shutting down Old Mutual Motor Underwriting AI")
-    logger.info("💾 Saving system state...")
-    logger.info("✅ Shutdown complete")
+    logger.info("Shutting down Old Mutual Motor Underwriting AI")
+    logger.info("Saving system state...")
+    logger.info("Shutdown complete")
 
 
 # Health check endpoint
@@ -1066,19 +1248,19 @@ async def general_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     
-    print("🚗 Old Mutual Motor Underwriting AI - Demo Server")
-    print("🔍 AI-powered fraud detection for Kenyan motor insurance")
-    print("📊 Starting server on http://localhost:8000")
+    print("Old Mutual Motor Underwriting AI - Demo Server")
+    print("AI-powered fraud detection for Kenyan motor insurance")
+    print("Starting server on http://localhost:8000")
     print("")
-    print("🎯 Key Features:")
+    print("Key Features:")
     print("   • Photo Intelligence: Duplicate detection, manipulation analysis")
     print("   • Narrative AI: LLM-powered contradiction detection")
     print("   • Risk Scoring: ML-based fraud prediction")
     print("   • Kenya Integration: NTSA, AKI, KRA, MPesa ready")
     print("")
-    print("📖 API Documentation: http://localhost:8000/docs")
-    print("🔍 System Health: http://localhost:8000/health")
-    print("📊 System Stats: http://localhost:8000/api/system/stats")
+    print("API Documentation: http://localhost:8000/docs")
+    print("System Health: http://localhost:8000/health")
+    print("System Stats: http://localhost:8000/api/system/stats")
     print("")
     print("Built by Grace Wanjiru @ XE.AI for Old Mutual Kenya")
     print("Press Ctrl+C to stop the server")

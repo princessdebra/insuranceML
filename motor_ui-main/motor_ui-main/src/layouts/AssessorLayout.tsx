@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { ReactNode, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 interface AssessorLayoutProps {
@@ -18,11 +18,25 @@ export default function AssessorLayout({ children, assessorName, assessorId }: A
   const navigate = useNavigate();
   const name = assessorName || localStorage.getItem("assessorName") || "Assessor";
   const id = assessorId || localStorage.getItem("assessorId") || "";
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
-      {/* Sidebar */}
-      <aside className="w-64 flex-shrink-0 bg-card border-r border-border flex flex-col">
+      {/* Mobile backdrop */}
+      {mobileMenuOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 z-40 md:hidden"
+          onClick={() => setMobileMenuOpen(false)}
+        />
+      )}
+
+      {/* Sidebar -- off-canvas drawer below md, static column at md+ */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 w-64 flex-shrink-0 bg-card border-r border-border flex flex-col
+          transform transition-transform duration-200 ease-out
+          md:static md:translate-x-0
+          ${mobileMenuOpen ? "translate-x-0" : "-translate-x-full"}`}
+      >
         <div className="p-6">
           <div className="flex items-center gap-3 mb-8">
             <div className="w-10 h-10 bg-primary rounded-lg flex items-center justify-center text-primary-foreground">
@@ -49,6 +63,7 @@ export default function AssessorLayout({ children, assessorName, assessorId }: A
                 <Link
                   key={item.label}
                   to={item.path}
+                  onClick={() => setMobileMenuOpen(false)}
                   className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${
                     isActive
                       ? "bg-primary/10 text-primary"
@@ -80,14 +95,22 @@ export default function AssessorLayout({ children, assessorName, assessorId }: A
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-y-auto bg-background">
         {/* Header */}
-        <header className="h-16 bg-card border-b border-border flex items-center justify-between px-8 sticky top-0 z-10">
-          <div className="flex items-center gap-4">
-            <button onClick={() => navigate(-1)} className="flex items-center gap-1 text-muted-foreground hover:text-primary transition-colors text-sm font-medium">
+        <header className="h-16 bg-card border-b border-border flex items-center justify-between px-4 sm:px-8 sticky top-0 z-10 gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <button
+              type="button"
+              className="md:hidden flex items-center justify-center size-9 rounded-lg border border-border text-foreground shrink-0"
+              aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
+              onClick={() => setMobileMenuOpen((v) => !v)}
+            >
+              <span className="material-symbols-outlined">{mobileMenuOpen ? "close" : "menu"}</span>
+            </button>
+            <button onClick={() => navigate(-1)} className="hidden sm:flex items-center gap-1 text-muted-foreground hover:text-primary transition-colors text-sm font-medium shrink-0">
               <span className="material-symbols-outlined text-[20px]">chevron_left</span>
               Back
             </button>
-            <span className="h-4 w-px bg-border"></span>
-            <h1 className="text-lg font-bold text-foreground">Assessor Portal</h1>
+            <span className="hidden sm:block h-4 w-px bg-border"></span>
+            <h1 className="text-base sm:text-lg font-bold text-foreground truncate">Assessor Portal</h1>
           </div>
           <div className="flex items-center gap-4">
             <button className="relative text-muted-foreground hover:text-primary transition-colors">

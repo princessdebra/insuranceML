@@ -1,10 +1,13 @@
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
- 
+
+logger = logging.getLogger(__name__)
+
 DB_PATH = Path("claims_database.db")
- 
+
 DEFAULT_MU = 0.45
  
  
@@ -78,9 +81,16 @@ class RegistryAdapter:
     ) -> dict:
         engine_class = self._resolve_engine_class(conn, row["body_type"])
         effective_mass = row["kerb_weight_kg"] + row["pax_load_kg"]
- 
+
         return {
             "kenyan_operational_mass_kg": effective_mass,
+            # Raw components too (not just the pre-summed total) -- callers
+            # building a VehicleProfile (vehicle_registry.py) need kerb
+            # weight and passenger load as separate fields so its own
+            # effective_mass_kg property keeps computing the same way it
+            # does for every other (Python-dict-sourced) profile.
+            "kerb_weight_kg": row["kerb_weight_kg"],
+            "pax_load_kg": row["pax_load_kg"],
             "class": engine_class,
             "crumple_A": row["crumple_A"],
             "crumple_B": row["crumple_B"],

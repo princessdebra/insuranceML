@@ -84,6 +84,38 @@ def _is_cache_valid(timestamp: float) -> bool:
     return (time.time() - timestamp) < CACHE_TTL_SECONDS
 
 
+# Maps this module's coarse surface categories (weather already folded in
+# for the wet/mud cases, e.g. "wet_tarmac") onto the DB `friction_mu_lookup`
+# table's separate (road_type, weather) columns -- that table has real
+# per-condition rows (asphalt/oily, murram/muddy, etc.) this module's flat
+# 6-entry ROAD_FRICTION dict can't express.
+_SURFACE_TO_DB_ROAD_WEATHER = {
+    "tarmac":     ("asphalt", "dry"),
+    "wet_tarmac": ("asphalt", "wet"),
+    "gravel":     ("gravel", "dry"),
+    "murram":     ("murram", "dry"),
+    "dirt":       ("dirt", "dry"),
+    "mud":        ("murram", "muddy"),
+}
+
+
+def resolve_friction(surface: str) -> float:
+    """Friction coefficient for a surface category -- tries the DB-seeded
+    friction_mu_lookup table (weather-aware, richer than this module's own
+    hardcoded ROAD_FRICTION) first, falling back to ROAD_FRICTION on any DB
+    error so a missing/unreachable DB can't newly break terrain lookups that
+    worked before this table was wired in."""
+    road_type, weather = _SURFACE_TO_DB_ROAD_WEATHER.get(surface, ("asphalt", "dry"))
+    try:
+        from registry_adapter import RegistryAdapter
+        result = RegistryAdapter().get_friction_mu(road_type, weather)
+        if result and result.get("lookup_method") == "exact":
+            return result["mu"]
+    except Exception as e:
+        logger.warning(f"DB friction lookup failed for ({road_type}, {weather}), falling back to hardcoded table: {e}")
+    return ROAD_FRICTION.get(surface, 0.75)
+
+
 def _infer_surface_from_text(location_text: str) -> str:
     loc_lower = location_text.lower()
     for keyword, surface in SURFACE_KEYWORDS.items():
@@ -108,7 +140,7 @@ def _fallback_from_text(location_text: str) -> TerrainResult:
     if inferred_surface != "tarmac":
         surface = inferred_surface
 
-    friction = ROAD_FRICTION.get(surface, 0.75)
+    friction = resolve_friction(surface)
     confidence = 0.6 if matched_profile != "default" else 0.3
 
     logger.info(
@@ -195,7 +227,7 @@ def get_terrain(
                     elevation_m=cached['elevation_m'],
                     slope_degrees=cached['slope_degrees'],
                     road_surface=surface,
-                    friction_coefficient=ROAD_FRICTION.get(surface, 0.75),
+                    friction_coefficient=resolve_friction(surface),
                     source="cache", confidence=0.85
                 )
 
@@ -207,7 +239,7 @@ def get_terrain(
             slope_deg = _calculate_slope_from_elevations(elevations)
             elevation_m = sum(elevations) / len(elevations)
             surface = _infer_surface_from_text(location_text) if location_text else "tarmac"
-            friction = ROAD_FRICTION.get(surface, 0.75)
+            friction = resolve_friction(surface)
 
             _terrain_cache[_cache_key(latitude, longitude)] = {
                 'elevation_m': elevation_m, 'slope_degrees': slope_deg,

@@ -48,11 +48,11 @@ const RESPONSES = {
     "Visual Verification: Please provide workshop photos documenting the vehicle and repair scope:"
   ],
   SUBMITTING: [
-    "Processing technical financial quote... ⚙️",
-    "Transmitting workshop estimate to the claims management engine... 📡",
-    "Syncing quotation data and visual assets with the central server... 📂",
-    "Verifying financial parameters and uploading workshop evidence... ⏳",
-    "Finalizing submission. Encrypting workshop data for claim review... 🚀"
+    "Processing technical financial quote...",
+    "Transmitting workshop estimate to the claims management engine...",
+    "Syncing quotation data and visual assets with the central server...",
+    "Verifying financial parameters and uploading workshop evidence...",
+    "Finalizing submission. Encrypting workshop data for claim review..."
   ]
 };
 

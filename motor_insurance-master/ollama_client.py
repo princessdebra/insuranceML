@@ -45,10 +45,13 @@ def _post_generate(
     num_gpu: int = None,
     images_b64: list = None,
     system: str = None,
+    num_predict: int = None,
 ) -> str:
     options = dict(DEFAULT_OPTIONS)
     if num_gpu is not None:
         options["num_gpu"] = num_gpu
+    if num_predict is not None:
+        options["num_predict"] = num_predict
 
     payload = {
         "model": model,
@@ -87,6 +90,7 @@ def generate(
     images: list = None,
     gpu_retries: int = 4,
     system: str = None,
+    num_predict: int = None,
 ) -> str:
     """
     Call Ollama's /api/generate and return the raw text response.
@@ -98,6 +102,12 @@ def generate(
     `system`, if given, is sent as a separate system message (see
     claims-advisory-v1's usage in service.py's AI Advisory consolidation --
     it was fine-tuned on system+user pairs, not a single flattened prompt).
+
+    `num_predict`, if given, overrides DEFAULT_OPTIONS' 1024-token cap for
+    this call -- needed for schemas with many fields/nested arrays (e.g.
+    the multi-page claim-form OCR extraction), which otherwise get cut off
+    mid-JSON-string (surfaces as a json.loads "Unterminated string" error,
+    not an HTTP failure, so it's easy to miss without checking the logs).
 
     This is a shared, multi-tenant Ollama instance (a dev GPU other
     developers also use) — capacity is limited, and the team is
@@ -123,7 +133,7 @@ def generate(
     last_error = None
     for attempt in range(gpu_retries):
         try:
-            return _post_generate(prompt, resolved_model, json_mode, timeout, images_b64=images_b64, system=system)
+            return _post_generate(prompt, resolved_model, json_mode, timeout, images_b64=images_b64, system=system, num_predict=num_predict)
         except (requests.RequestException, KeyError, ValueError) as e:
             last_error = e
             logger.warning(f"Ollama generate attempt {attempt + 1}/{gpu_retries} failed: {e}")

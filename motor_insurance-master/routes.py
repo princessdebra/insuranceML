@@ -54,6 +54,7 @@ def build_structured_intake_block(
     third_party_involved: Optional[str] = None,
     third_party_details: Optional[str] = None,
     third_party_fled: Optional[str] = None,
+    other_vehicle_position: Optional[str] = None,
     police_reported: Optional[str] = None,
     police_ob_number: Optional[str] = None,
     witnesses_present: Optional[str] = None,
@@ -80,6 +81,16 @@ def build_structured_intake_block(
     if third_party_involved == "Yes":
         lines.append(f"Third-party vehicle/party involved: {third_party_details or 'details not provided'}")
         lines.append(f"Third party fled the scene before details were exchanged: {third_party_fled or 'not specified'}")
+        # Claimant-confirmed collision geometry -- physics reconstruction
+        # previously had to guess this from narrative wording (or defaulted
+        # to a fixed 90-degree T-bone layout regardless of what actually
+        # happened), which produced a simulation that could contradict the
+        # claimant's own account. Asked directly at intake, using the exact
+        # phrasing ("left side"/"right side"/"rear"/"front") already
+        # recognized by the narrative-keyword impact-zone inference, so it
+        # can be prioritized as a confirmed fact over any narrative guess.
+        if other_vehicle_position:
+            lines.append(f"Position of other vehicle at moment of impact (claimant-confirmed): {other_vehicle_position}")
     else:
         lines.append("Single-vehicle incident — no third party involved")
 
@@ -185,11 +196,50 @@ async def _process_member_claim_background(
         if ob_number:
             incident_details["ob_number"] = ob_number
 
+        # Re-check for assessor/repair-shop data that may have arrived WHILE
+        # this task was queued or running (this pipeline routinely takes
+        # minutes) -- without this, whichever of the member/assessor/
+        # repair-shop background tasks happens to finish last wins the
+        # final store_claim() write outright, silently erasing the other
+        # parties' submissions from analysis_result even though they were
+        # genuinely submitted (see CLM-2026-000040: assessor submitted and
+        # its own analysis briefly reflected that, then the member task
+        # finished afterward with no knowledge of it and wiped
+        # assessor_submission back to None). Mirrors the same recovery
+        # pattern submit_repair_shop_estimate already uses, just re-checked
+        # here at execution time instead of request time, since request
+        # time is exactly when this race can still be lost.
+        assessor_report, assessor_photos = None, None
+        repair_estimate, repair_photos = None, None
+        try:
+            existing_analysis = claim_row.get("analysis_result")
+            if isinstance(existing_analysis, str):
+                existing_analysis = json.loads(existing_analysis) if existing_analysis else {}
+            existing_analysis = existing_analysis or {}
+
+            assessor_submission = existing_analysis.get("assessor_submission")
+            if assessor_submission and assessor_submission.get("report"):
+                assessor_report = assessor_submission["report"]
+                assessor_photo_rows = db_manager.get_photos_by_claim_and_party(claim_id, "assessor")
+                assessor_photos = [(p["file_data"], p["filename"]) for p in assessor_photo_rows]
+
+            repair_submission = existing_analysis.get("repair_shop_submission")
+            if repair_submission and repair_submission.get("estimate"):
+                repair_estimate = repair_submission["estimate"]
+                repair_photo_rows = db_manager.get_photos_by_claim_and_party(claim_id, "repair_shop")
+                repair_photos = [(p["file_data"], p["filename"]) for p in repair_photo_rows]
+        except Exception as e:
+            logger.warning(f"Could not recover existing assessor/repair-shop data for {claim_id}: {e}")
+
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
             member_narrative=enriched_narrative,
             member_photos=photo_data,
+            assessor_report=assessor_report,
+            assessor_photos=assessor_photos,
+            repair_estimate=repair_estimate,
+            repair_photos=repair_photos,
             estimated_cost=estimated_cost,
             location=location,
             member_id=claim_row.get("member_id"),
@@ -198,12 +248,14 @@ async def _process_member_claim_background(
             incident_details=incident_details,
         )
 
-        with db_manager.get_connection() as conn:
-            conn.execute(
-                "UPDATE claims SET simulation_video_path = ? WHERE claim_id = ?",
-                (analysis_result.get("simulation_video_path"), claim_id)
-            )
-            conn.commit()
+        new_video_path = analysis_result.get("simulation_video_path")
+        if new_video_path:
+            with db_manager.get_connection() as conn:
+                conn.execute(
+                    "UPDATE claims SET simulation_video_path = ? WHERE claim_id = ?",
+                    (new_video_path, claim_id)
+                )
+                conn.commit()
 
         logger.info(
             f"[background] Member analysis complete for {claim_id} "
@@ -253,6 +305,26 @@ async def _process_assessor_analysis_background(
         evidence_block = build_document_evidence_block(documents_ocr)
         enriched_report = f"{evidence_block}\n\n{clean_report}" if evidence_block else clean_report
 
+        claim_row = db_manager.get_claim(claim_id) or {}
+
+        # Same re-check as _process_member_claim_background above -- pick up
+        # a repair-shop submission that may have arrived while this task was
+        # queued/running, instead of silently erasing it on store_claim().
+        repair_estimate, repair_photos = None, None
+        try:
+            existing_analysis = claim_row.get("analysis_result")
+            if isinstance(existing_analysis, str):
+                existing_analysis = json.loads(existing_analysis) if existing_analysis else {}
+            existing_analysis = existing_analysis or {}
+
+            repair_submission = existing_analysis.get("repair_shop_submission")
+            if repair_submission and repair_submission.get("estimate"):
+                repair_estimate = repair_submission["estimate"]
+                repair_photo_rows = db_manager.get_photos_by_claim_and_party(claim_id, "repair_shop")
+                repair_photos = [(p["file_data"], p["filename"]) for p in repair_photo_rows]
+        except Exception as e:
+            logger.warning(f"Could not recover existing repair-shop data for {claim_id}: {e}")
+
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
@@ -260,11 +332,16 @@ async def _process_assessor_analysis_background(
             member_photos=member_photo_data,
             assessor_report=enriched_report,
             assessor_photos=assessor_photo_data,
+            repair_estimate=repair_estimate,
+            repair_photos=repair_photos,
             estimated_cost=estimated_cost,
             location=location,
             assessor_crush_depth_mm=assessor_crush_depth_mm,
             assessor_approach_angle_deg=assessor_approach_angle_deg,
             assessor_id=assessor_id,
+            member_id=claim_row.get("member_id"),
+            policy_id=claim_row.get("policy_id"),
+            claim_type="motor",
         )
         db_manager.store_claim(analysis_result)
         logger.info(
@@ -289,6 +366,8 @@ async def _process_repairshop_analysis_background(
     location: str,
 ):
     try:
+        claim_row = db_manager.get_claim(claim_id) or {}
+
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
@@ -299,7 +378,10 @@ async def _process_repairshop_analysis_background(
             repair_estimate=clean_estimate,
             repair_photos=repair_photo_data,
             estimated_cost=total_cost,
-            location=location
+            location=location,
+            member_id=claim_row.get("member_id"),
+            policy_id=claim_row.get("policy_id"),
+            claim_type="motor",
         )
         db_manager.store_claim(analysis_result)
         logger.info(
@@ -491,6 +573,137 @@ async def _reevaluate_business_rules_background(claim_id: str):
         logger.error(f"Business rules re-evaluation failed for {claim_id}: {str(e)}")
 
 
+async def _reprocess_claim_after_late_photos_background(claim_id: str):
+    """
+    Fully re-runs the multi-party analysis (photo CV/damage detection,
+    narrative, physics reconstruction, business rules, risk scoring) after
+    new photos land on a claim that already went through initial analysis --
+    most importantly, a paper-form claim filed with zero photos, whose
+    member later adds them via the notify-member link.
+
+    Without this, a late-added photo's CV analysis was computed once (for
+    the AI-ROL audit trail) and then discarded -- never shown to the
+    assessor, and the claim's risk/decision stayed frozen at whatever the
+    evidence-free original submission produced. This re-runs the exact same
+    analyze_multiparty_claim() pipeline the original submission used, over
+    ALL currently-stored member photos (not just the newest one) plus the
+    claim's current narrative/estimated_cost/location -- so a claim that
+    got photos added late ends up in the same state a claim filed WITH
+    those photos from the start would be in.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            logger.error(f"[background] Reprocess skipped — claim {claim_id} not found")
+            return
+
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT filename, file_data FROM claim_photo_files WHERE claim_id = ? AND party = 'member' ORDER BY uploaded_at ASC",
+                (claim_id,),
+            )
+            member_photos = [(row["file_data"], row["filename"]) for row in cursor.fetchall()]
+
+        if not member_photos:
+            return
+
+        orchestrator = get_claim_orchestrator()
+        analysis_result = await orchestrator.analyze_multiparty_claim(
+            claim_id=claim_id,
+            member_narrative=claim.get("narrative") or "",
+            member_photos=member_photos,
+            estimated_cost=claim.get("estimated_cost") or 0.0,
+            location=claim.get("location") or "",
+            member_id=claim.get("member_id"),
+            policy_id=claim.get("policy_id"),
+            claim_type="motor",
+        )
+
+        # Physics reconstruction (and its rendered video) only re-runs when
+        # it hasn't already run for this claim (see "Physics already run —
+        # skipping" in service.py) -- so on a re-run, analysis_result often
+        # has no simulation_video_path at all. Only overwrite the existing
+        # path when a real one comes back; an unconditional UPDATE here
+        # would otherwise wipe out a perfectly good, already-rendered video
+        # every time a claim gets re-processed after its first analysis.
+        new_video_path = analysis_result.get("simulation_video_path")
+        if new_video_path:
+            with db_manager.get_connection() as conn:
+                conn.execute(
+                    "UPDATE claims SET simulation_video_path = ? WHERE claim_id = ?",
+                    (new_video_path, claim_id),
+                )
+                conn.commit()
+
+        logger.info(
+            f"[background] Reprocessed {claim_id} after late photo(s) "
+            f"over {len(member_photos)} total member photo(s) "
+            f"(Risk: {analysis_result['fraud_risk_score']}/100)"
+        )
+    except Exception as e:
+        logger.error(f"[background] Reprocess after late photos failed for {claim_id}: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
+@analysis_router.post("/speech-to-text")
+async def speech_to_text(
+    audio: UploadFile = File(..., description="Recorded audio clip (webm/mp4/ogg/wav from MediaRecorder)"),
+):
+    """
+    **Transcribe a recorded voice answer to text**
+
+    Server-side (Whisper, via faster-whisper), not the browser's Web Speech
+    API — Safari/iOS never implemented that, and most of this team is on
+    iPhone. The frontend records with MediaRecorder (works on every modern
+    browser) and uploads the clip here.
+    """
+    try:
+        content = await audio.read()
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Recording exceeds 15MB limit")
+        if not content:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty recording")
+
+        import speech_to_text as stt
+        result = await asyncio.to_thread(stt.transcribe_audio, content, audio.filename or "audio.webm")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error transcribing audio: {str(e)}")
+        return {"success": False, "error": "Transcription failed — you can type your answer instead."}
+
+
+@analysis_router.post("/photos/damage-decision")
+async def save_damage_decision(
+    claim_id: str = Form(...),
+    filename: str = Form(...),
+    detection_index: int = Form(...),
+    component: str = Form(...),
+    ai_recommendation: str = Form(...),
+    assessor_decision: str = Form(..., description="'repair' or 'replace'"),
+    assessor_id: str = Form(...),
+):
+    """Assessor's own repair/replace call on one AI-detected damage component. AI recommends, assessor decides."""
+    if assessor_decision not in ("repair", "replace"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="assessor_decision must be 'repair' or 'replace'")
+    ok = db_manager.save_photo_damage_decision(
+        claim_id, filename, detection_index, component, ai_recommendation, assessor_decision, assessor_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not save decision")
+    return {"success": True}
+
+
+@analysis_router.get("/claim/{claim_id}/damage-decisions")
+async def get_damage_decisions(claim_id: str):
+    """All of an assessor's repair/replace decisions recorded for this claim's photos."""
+    decisions = db_manager.get_photo_damage_decisions(claim_id)
+    return {"success": True, "decisions": decisions}
+
+
 @analysis_router.post("/documents/upload")
 async def upload_and_ocr_document(
     background_tasks: BackgroundTasks,
@@ -515,7 +728,13 @@ async def upload_and_ocr_document(
     than needing to be re-uploaded at that point.
     """
     try:
-        if not file.content_type or not file.content_type.startswith('image/'):
+        # content_type isn't reliable alone -- some browsers/OSes send
+        # application/octet-stream for .webp (and other) image uploads, which
+        # silently 400'd every such upload even though the file was a real
+        # image. Fall back to the filename extension in that case.
+        IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif')
+        looks_like_image = (file.content_type or '').startswith('image/') or (file.filename or '').lower().endswith(IMAGE_EXTENSIONS)
+        if not looks_like_image:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
 
         content = await file.read()
@@ -569,6 +788,84 @@ async def upload_and_ocr_document(
         raise
     except Exception as e:
         logger.error(f"Error uploading/OCR'ing document for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim-form/extract")
+async def extract_claim_form(
+    analyst_id: str = Form(..., description="Analyst performing the extraction, for logging"),
+    files: List[UploadFile] = File(..., description="One image per page of the filled paper claim form, OR a single multi-page PDF"),
+):
+    """
+    **ANALYST ONLY: OCR a scanned/photographed physical claim form BEFORE a
+    claim exists.**
+
+    This is the real analyst workflow: a member fills in and hands over the
+    paper "Motor Accident Claim Form" (policy details, vehicle, accident
+    circumstances, damage, driver/owner statements...), and the analyst's
+    job is to get that form's contents into the system -- not to re-type it
+    while re-interviewing the member over the phone (the older
+    ClaimChatbot(analystMode) flow this replaces for form-based intake).
+
+    Runs all page images through one vision-model call so multi-page
+    answers (e.g. a statement that continues onto page 2) get merged
+    correctly, rather than extracting each page in isolation.
+
+    Stateless -- no claim_id exists yet at this point, so nothing is
+    persisted here. The analyst reviews/corrects the returned fields in the
+    UI, then the normal /check-coverage -> /create-claim -> /api/analysis/member
+    pipeline runs with the (possibly-edited) extracted values. The original
+    page images can be attached afterward via /documents/upload with
+    document_type=claim_form once a claim_id exists.
+    """
+    try:
+        if not files:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one page image or a PDF is required")
+        if len(files) > 8:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Too many pages (max 8)")
+
+        images = []
+        for f in files:
+            is_pdf = f.content_type == "application/pdf" or (f.filename or "").lower().endswith(".pdf")
+            if not is_pdf and not (f.content_type and f.content_type.startswith("image/")):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{f.filename} must be an image or a PDF")
+            content = await f.read()
+            if len(content) > 20 * 1024 * 1024:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"{f.filename} exceeds 20MB")
+
+            if is_pdf:
+                try:
+                    import fitz
+                    pdf = fitz.open(stream=content, filetype="pdf")
+                    if pdf.page_count > 8:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{f.filename} has too many pages (max 8)")
+                    for page in pdf:
+                        pix = page.get_pixmap(dpi=200)
+                        images.append(pix.tobytes("png"))
+                    pdf.close()
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Couldn't read {f.filename} as a PDF: {e}")
+            else:
+                images.append(content)
+
+        from document_ocr import extract_document_data
+        ocr_result = await extract_document_data(images, files[0].filename, "claim_form")
+
+        logger.info(f"Analyst {analyst_id} extracted claim form from {len(files)} page(s), confidence={ocr_result.get('extraction_confidence')}")
+
+        return {
+            "success": True,
+            "parsed_fields": ocr_result.get("parsed_fields", {}),
+            "extraction_confidence": ocr_result.get("extraction_confidence", 0),
+            "document_appears_genuine": ocr_result.get("document_appears_genuine"),
+            "quality_notes": ocr_result.get("quality_notes", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error extracting claim form: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -664,6 +961,37 @@ async def lookup_claim(claim_id: str):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
+@analysis_router.get("/claims/list")
+async def list_all_claims(limit: int = Query(300, description="Max claims to return, most recent first")):
+    """
+    **Every claim in the system, lightweight -- backs the analyst dashboard's
+    claim picker**
+
+    Same "no fraud/risk data" boundary as /claim/{claim_id}/lookup above,
+    just for all claims at once instead of one at a time -- lets an analyst
+    pick any claim from a dropdown instead of having to already know and
+    type its exact ID.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT c.claim_id, c.member_id, c.location, c.created_at, m.name AS member_name
+                FROM claims c
+                LEFT JOIN members m ON m.member_id = c.member_id
+                ORDER BY c.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            claims = [dict(row) for row in cursor.fetchall()]
+        return {"success": True, "claims": claims, "total": len(claims)}
+    except Exception as e:
+        logger.error(f"Error listing all claims: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
 @analysis_router.get("/claim/{claim_id}/photos")
 async def list_claim_photos(claim_id: str, party: Optional[str] = Query(None)):
     """
@@ -686,6 +1014,7 @@ async def list_claim_photos(claim_id: str, party: Optional[str] = Query(None)):
 @analysis_router.post("/claim/{claim_id}/photos")
 async def add_claim_photos(
     claim_id: str,
+    background_tasks: BackgroundTasks,
     uploader_type: str = Form(..., description="'member' or 'analyst'"),
     uploader_id: str = Form(..., description="member_id or analyst_id"),
     photos: List[UploadFile] = File(...),
@@ -699,12 +1028,13 @@ async def add_claim_photos(
     emailed in after a phone-filed claim (see /api/analysis/documents/upload
     for the equivalent on documents).
 
-    Each photo gets the same per-photo CV analysis as the original
-    submission (real anomaly detection, not inert storage) and is logged to
-    the AI-ROL trail. This does NOT re-run narrative analysis or physics
-    reconstruction for the claim as a whole -- those reflect the evidence
-    available at original submission time, same boundary as document
-    corrections (see /documents/{id}/correct).
+    Storing the photo is synchronous (the response confirms it's saved);
+    the full multi-party re-analysis (photo CV/damage detection, narrative,
+    physics, business rules, risk scoring -- see
+    _reprocess_claim_after_late_photos_background) runs in the background
+    over ALL of the claim's member photos so far, same as original
+    submission would have. Until it finishes, the assessor's damage-
+    detection view reflects the claim's prior evidence only.
     """
     try:
         claim = db_manager.get_claim(claim_id)
@@ -723,7 +1053,6 @@ async def add_claim_photos(
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="uploader_type must be 'member' or 'analyst'")
 
-        orchestrator = get_claim_orchestrator()
         stored = []
 
         for photo in photos:
@@ -738,24 +1067,12 @@ async def add_claim_photos(
                 file_data=content, content_type=photo.content_type,
                 uploaded_by=uploader_id,
             )
-
-            try:
-                result = await orchestrator.photo_service.analyze_photo(
-                    content, photo.filename, claim_id, party='member',
-                )
-                ai_rol.record_recommendation(
-                    claim_id=claim_id,
-                    capability="computer_vision",
-                    recommendation=f"Late-added photo analyzed — {len(result.anomalies)} anomaly(ies) detected",
-                    confidence=result.analysis_confidence / 100,
-                    evidence={"filename": photo.filename, "risk_score": result.risk_score, "anomalies": result.anomalies},
-                )
-            except Exception as e:
-                logger.warning(f"CV analysis failed for late-added photo {photo.filename} on {claim_id}: {e}")
-
             stored.append({"photo_id": photo_id, "filename": photo.filename})
 
-        logger.info(f"📸 {len(stored)} photo(s) added to {claim_id} by {uploader_type} {uploader_id}")
+        if stored:
+            background_tasks.add_task(_reprocess_claim_after_late_photos_background, claim_id)
+
+        logger.info(f"{len(stored)} photo(s) added to {claim_id} by {uploader_type} {uploader_id} — full re-analysis queued")
         return {"success": True, "claim_id": claim_id, "photos_added": len(stored), "photos": stored}
 
     except HTTPException:
@@ -765,21 +1082,37 @@ async def add_claim_photos(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
+# Claim fields a member can answer themselves when the paper form left them
+# blank -- kept in lockstep with DatabaseManager.MEMBER_EDITABLE_CLAIM_FIELDS,
+# since these are the only keys that can end up in claims.pending_member_fields.
+MEMBER_FIELD_LABELS = {
+    "estimated_cost": "Estimated Repair Cost (KES)",
+    "location": "Incident Location",
+    "narrative": "What Happened (narrative)",
+}
+
+
 @analysis_router.post("/claim/{claim_id}/notify-member")
 async def notify_member_to_add_photos(
     claim_id: str,
     requested_by: str = Form(..., description="analyst_id or admin_id triggering this"),
+    missing_fields: Optional[str] = Form(
+        None, description='JSON list of claim field keys left blank on the paper form, e.g. ["estimated_cost"]'
+    ),
 ):
     """
-    **Email the member a link to add photos to a claim filed on their behalf**
+    **Email the member a link to add photos (and answer any blank fields) to a claim filed on their behalf**
 
-    For phone-filed claims with no photos yet -- lets the analyst hand off
-    getting real evidence to the person who actually has the vehicle in
-    front of them, instead of that evidence never arriving at all. Email is
-    best-effort: if GMAIL_ADDRESS/GMAIL_APP_PASSWORD aren't configured on
-    this deployment, this returns success=false with a clear reason rather
-    than failing the request outright -- filing a claim should never be
-    blocked by whether notification email happens to be set up.
+    For phone- or paper-form-filed claims with no photos yet -- lets the
+    analyst hand off getting real evidence to the person who actually has
+    the vehicle in front of them, instead of that evidence never arriving
+    at all. `missing_fields` additionally flags claim fields the paper form
+    left blank (e.g. estimated repair cost) so the member's claim page
+    prompts them to fill those in too. Email is best-effort: if
+    GMAIL_ADDRESS/GMAIL_APP_PASSWORD aren't configured on this deployment,
+    this returns success=false with a clear reason rather than failing the
+    request outright -- filing a claim should never be blocked by whether
+    notification email happens to be set up.
     """
     try:
         claim = db_manager.get_claim(claim_id)
@@ -791,15 +1124,32 @@ async def notify_member_to_add_photos(
         if not member or not member.get("email"):
             return {"success": False, "reason": "No email on file for this claim's member"}
 
+        missing_list: List[str] = []
+        if missing_fields:
+            try:
+                missing_list = [f for f in json.loads(missing_fields) if f in MEMBER_FIELD_LABELS]
+            except (json.JSONDecodeError, TypeError):
+                missing_list = []
+
+        if missing_list:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'UPDATE claims SET pending_member_fields = ? WHERE claim_id = ?',
+                    (json.dumps(missing_list), claim_id),
+                )
+                conn.commit()
+
         sent = email_service.send_add_photos_email(
             to_email=member["email"],
             member_name=member.get("name") or "there",
             member_id=member_id,
             claim_id=claim_id,
+            missing_field_labels=[MEMBER_FIELD_LABELS[f] for f in missing_list],
         )
 
         if sent:
-            logger.info(f"📧 Notified member {member_id} about claim {claim_id} (requested by {requested_by})")
+            logger.info(f"Notified member {member_id} about claim {claim_id} (requested by {requested_by})")
             return {"success": True, "sent_to": member["email"]}
         else:
             return {"success": False, "reason": "Email is not configured on this deployment"}
@@ -808,6 +1158,39 @@ async def notify_member_to_add_photos(
         raise
     except Exception as e:
         logger.error(f"Error notifying member for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim/{claim_id}/member-update-fields")
+async def member_update_claim_fields(
+    claim_id: str,
+    member_id: str = Form(...),
+    fields: str = Form(..., description='JSON object of {field_key: value}, e.g. {"estimated_cost": 45000}'),
+):
+    """
+    **Member answers claim fields the paper form left blank**
+
+    Restricted to DatabaseManager.MEMBER_EDITABLE_CLAIM_FIELDS -- a member
+    can only fill in the handful of fields the notify-member email flagged
+    as missing, not rewrite arbitrary claim state.
+    """
+    try:
+        try:
+            parsed_fields = json.loads(fields)
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="fields must be valid JSON")
+
+        result = db_manager.update_claim_member_fields(claim_id, member_id, parsed_fields)
+        return {"success": True, **result}
+
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating member fields for {claim_id}: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -895,6 +1278,7 @@ async def submit_member_claim(
     third_party_involved: Optional[str] = Form(None),
     third_party_details: Optional[str] = Form(None),
     third_party_fled: Optional[str] = Form(None),
+    other_vehicle_position: Optional[str] = Form(None, description="Claimant-confirmed position of the other vehicle at impact -- behind / oncoming / left side / right side"),
     police_reported: Optional[str] = Form(None),
     police_ob_number: Optional[str] = Form(None),
     witnesses_present: Optional[str] = Form(None),
@@ -964,6 +1348,7 @@ async def submit_member_claim(
         clean_narrative = ValidationUtils.sanitize_narrative(narrative)
         structured_block = build_structured_intake_block(
             third_party_involved, third_party_details, third_party_fled,
+            other_vehicle_position,
             police_reported, police_ob_number,
             witnesses_present, witness_details,
             injuries_reported, injury_details,
@@ -973,10 +1358,15 @@ async def submit_member_claim(
         # member_id doesn't depend on the AI analysis at all — write it now
         # rather than waiting for the background task, so the claim record
         # is correct immediately instead of appearing unlinked for minutes.
+        # initial_estimated_cost is captured once here and never touched
+        # again (COALESCE keeps whatever was first set) -- the repair-shop
+        # stage's estimate then becomes the "final" figure the
+        # cost_escalation business rule compares against.
         with db_manager.get_connection() as conn:
             conn.execute(
-                "UPDATE claims SET member_id = ? WHERE claim_id = ?",
-                (member_id, claim_id)
+                "UPDATE claims SET member_id = ?, "
+                "initial_estimated_cost = COALESCE(initial_estimated_cost, ?) WHERE claim_id = ?",
+                (member_id, estimated_cost, claim_id)
             )
             conn.commit()
 
@@ -1056,7 +1446,18 @@ async def submit_assessor_report(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Claim {claim_id} not found"
             )
- 
+
+        # Captured once here, separate from claims.estimated_cost (which the
+        # repair-shop stage later overwrites as the "final" figure) -- gives
+        # the cost-divergence rule a real assessor-side number to compare
+        # against the member's and repair shop's independently.
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                "UPDATE claims SET assessor_estimated_cost = ? WHERE claim_id = ?",
+                (estimated_cost, claim_id)
+            )
+            conn.commit()
+
         assessor_photo_data = []
         stored_count = 0
  
@@ -1133,6 +1534,20 @@ async def submit_assessor_report(
         )
 
         logger.info(f"Assessor submission accepted for {claim_id} — analysis running in background")
+
+        # Best-effort -- never blocks the assessor's submission if email
+        # fails/isn't configured.
+        try:
+            member = db_manager.get_member_info(existing_claim.get("member_id")) if existing_claim.get("member_id") else None
+            if member and member.get("email"):
+                email_service.send_assessor_report_email(
+                    to_email=member["email"],
+                    member_name=member.get("name") or "there",
+                    member_id=existing_claim["member_id"],
+                    claim_id=claim_id,
+                )
+        except Exception as e:
+            logger.warning(f"Assessor-report email failed for {claim_id}: {str(e)}")
 
         return {
             "success": True,
@@ -1258,6 +1673,17 @@ async def submit_repair_shop_estimate(
  
         clean_estimate = ValidationUtils.sanitize_narrative(repair_estimate)
 
+        # shop_id doesn't depend on the AI analysis -- persist it now so the
+        # repeat_repair_shop business rule and graph relationship analysis
+        # have something to check against (previously accepted here and
+        # silently dropped).
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                "UPDATE claims SET repair_shop_id = ? WHERE claim_id = ?",
+                (shop_id, claim_id)
+            )
+            conn.commit()
+
         background_tasks.add_task(
             _process_repairshop_analysis_background,
             claim_id, member_narrative, member_photo_data, assessor_report,
@@ -1375,6 +1801,997 @@ async def get_simulation_status(claim_id: str):
     }
  
  
+@analysis_router.get("/admin/analytics/overview")
+async def get_admin_analytics_overview(days: int = Query(30, description="Window for the claims-over-time trend")):
+    """
+    **ADMIN ONLY: System-wide oversight — fraud trends, rule-trigger frequency,
+    risk distribution, and AI-ROL audit activity across every claim.**
+
+    Distinct from the paginated claims list (/admin claims endpoint): that
+    view's "stats" only ever reflected whatever 20 claims were on the
+    current page. This scans every claim once and aggregates properly, so
+    the numbers here are true totals, not a page-sized sample.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+
+            # ── Risk distribution + global average (cheap — columns, no JSON) ──
+            cursor.execute("SELECT risk_level, COUNT(*) as cnt FROM claims GROUP BY risk_level")
+            risk_distribution = {row["risk_level"] or "unknown": row["cnt"] for row in cursor.fetchall()}
+
+            cursor.execute("SELECT COUNT(*) as total, AVG(fraud_risk_score) as avg_score FROM claims")
+            totals_row = cursor.fetchone()
+            total_claims = totals_row["total"] or 0
+            avg_risk_score = round(totals_row["avg_score"], 1) if totals_row["avg_score"] is not None else 0
+
+            # ── Final human decisions (latest per claim) ────────────────────────
+            cursor.execute('''
+                SELECT decision, COUNT(*) as cnt FROM (
+                    SELECT claim_id, decision,
+                           ROW_NUMBER() OVER (PARTITION BY claim_id ORDER BY decided_at DESC) as rn
+                    FROM claim_decisions
+                ) WHERE rn = 1
+                GROUP BY decision
+            ''')
+            decision_distribution = {row["decision"]: row["cnt"] for row in cursor.fetchall()}
+
+            # ── AI-ROL activity: volume by capability + handler-action split ────
+            cursor.execute("SELECT capability, COUNT(*) as cnt FROM ai_rol_records GROUP BY capability ORDER BY cnt DESC")
+            ai_rol_by_capability = {row["capability"]: row["cnt"] for row in cursor.fetchall()}
+
+            cursor.execute('''
+                SELECT COALESCE(handler_action, 'pending') as action, COUNT(*) as cnt
+                FROM ai_rol_records GROUP BY handler_action
+            ''')
+            handler_action_distribution = {row["action"]: row["cnt"] for row in cursor.fetchall()}
+
+            # ── Claims filed per day, last N days ───────────────────────────────
+            cursor.execute('''
+                SELECT DATE(created_at) as day, COUNT(*) as cnt
+                FROM claims
+                WHERE created_at >= datetime('now', ?)
+                GROUP BY DATE(created_at)
+                ORDER BY day
+            ''', (f'-{days} days',))
+            claims_over_time = [{"date": row["day"], "count": row["cnt"]} for row in cursor.fetchall()]
+
+            # ── Business-rule / relationship / similarity trigger frequency ─────
+            # These live inside analysis_result JSON, not their own columns, so
+            # this part scans -- fine at PoC claim volumes, would move to a
+            # materialized rollup table if this ever runs against a real book.
+            cursor.execute("SELECT analysis_result FROM claims WHERE analysis_result IS NOT NULL AND analysis_result != '{}'")
+            rule_trigger_counts: Dict[str, int] = {}
+            relationship_type_counts: Dict[str, int] = {}
+            claims_with_relationship_findings = 0
+            claims_with_similarity_matches = 0
+            claims_analyzed = 0
+
+            for row in cursor.fetchall():
+                try:
+                    ar = json.loads(row["analysis_result"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not ar:
+                    continue
+                claims_analyzed += 1
+
+                business_rules_data = ar.get("business_rules") or {}
+                for rule_id in business_rules_data.get("rules_fired", []):
+                    rule_trigger_counts[rule_id] = rule_trigger_counts.get(rule_id, 0) + 1
+
+                relationship_data = ar.get("relationship_analysis") or {}
+                findings = relationship_data.get("findings", [])
+                if findings:
+                    claims_with_relationship_findings += 1
+                for f in findings:
+                    rtype = f.get("type", "unknown")
+                    relationship_type_counts[rtype] = relationship_type_counts.get(rtype, 0) + 1
+
+                similarity_data = ar.get("narrative_similarity") or {}
+                if similarity_data.get("matches"):
+                    claims_with_similarity_matches += 1
+
+            top_rules = sorted(rule_trigger_counts.items(), key=lambda kv: kv[1], reverse=True)
+
+            # ── Operational KPIs: live assignment workload, not just claim counts ──
+            cursor.execute('''
+                SELECT ca.status, ca.assigned_at, c.risk_level, c.estimated_cost
+                FROM claim_assignments ca JOIN claims c ON c.claim_id = ca.claim_id
+            ''')
+            assignment_rows = [dict(r) for r in cursor.fetchall()]
+
+        active_assessments = 0
+        pending_review = 0
+        completed_assessments = 0
+        overdue_assessments = 0
+        claim_value_under_assessment = 0.0
+        for r in assignment_rows:
+            computed = _classify_assignment_status(r)
+            if computed == "Completed":
+                completed_assessments += 1
+            elif computed == "Overdue":
+                overdue_assessments += 1
+                active_assessments += 1
+                claim_value_under_assessment += r.get("estimated_cost") or 0
+            else:
+                active_assessments += 1
+                claim_value_under_assessment += r.get("estimated_cost") or 0
+            if (r.get("status") or "").lower() == "pending":
+                pending_review += 1
+
+        return {
+            "success": True,
+            "total_claims": total_claims,
+            "claims_analyzed": claims_analyzed,
+            "active_assessments": active_assessments,
+            "pending_review": pending_review,
+            "completed_assessments": completed_assessments,
+            "overdue_assessments": overdue_assessments,
+            "claim_value_under_assessment": round(claim_value_under_assessment, 2),
+            "avg_risk_score": avg_risk_score,
+            "risk_distribution": risk_distribution,
+            "decision_distribution": decision_distribution,
+            "ai_rol_activity_by_capability": ai_rol_by_capability,
+            "handler_action_distribution": handler_action_distribution,
+            "claims_over_time": claims_over_time,
+            "business_rules_trigger_frequency": [{"rule_id": r, "count": c} for r, c in top_rules],
+            "relationship_findings": {
+                "claims_with_findings": claims_with_relationship_findings,
+                "by_type": relationship_type_counts,
+            },
+            "narrative_similarity": {
+                "claims_with_matches": claims_with_similarity_matches,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error building admin analytics overview: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+def _classify_assignment_status(row: Dict[str, Any]) -> str:
+    """A single human-readable status for the Live Operations table --
+    collapses the raw assignment status + timing into the four buckets an
+    admin actually cares about at a glance."""
+    status_raw = (row.get("status") or "pending").lower()
+    if status_raw == "in_progress":
+        return "AI Review" if row.get("risk_level") == "pending" else "Inspection"
+    if status_raw in ("pending",):
+        assigned_at = row.get("assigned_at")
+        if assigned_at:
+            try:
+                age_hours = (datetime.now() - datetime.fromisoformat(assigned_at.split(".")[0])).total_seconds() / 3600
+                if age_hours > 72:
+                    return "Overdue"
+            except Exception:
+                pass
+        return "Inspection"
+    if status_raw == "completed":
+        return "Completed"
+    return status_raw.replace("_", " ").title()
+
+
+@analysis_router.get("/admin/live-operations")
+async def get_live_assessment_operations(
+    limit: int = Query(20, description="Page size"),
+    offset: int = Query(0, description="Pagination offset"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Inspection / AI Review / Overdue / Completed"),
+    risk_level: Optional[str] = Query(None, description="low / medium / high"),
+):
+    """
+    **ADMIN ONLY: Live Assessment Operations feed** -- every assessment
+    currently in the system with vehicle, assessor, status and AI risk in
+    one row, matching a real claims-ops board rather than a bare claims list.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT
+                    ca.claim_id, ca.assignment_id, ca.assessor_id, ca.assigned_at, ca.status,
+                    c.estimated_cost, c.risk_level, c.fraud_risk_score, c.created_at, c.policy_id,
+                    a.name as assessor_name,
+                    m.vehicle_make, m.vehicle_model, m.vehicle_year
+                FROM claim_assignments ca
+                JOIN claims c ON c.claim_id = ca.claim_id
+                LEFT JOIN assessors a ON a.assessor_id = ca.assessor_id
+                LEFT JOIN motor_policy_details m ON m.policy_id = c.policy_id
+                ORDER BY ca.assigned_at DESC
+            ''')
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        for r in rows:
+            r["computed_status"] = _classify_assignment_status(r)
+
+        if status_filter:
+            rows = [r for r in rows if r["computed_status"].lower() == status_filter.lower()]
+        if risk_level:
+            rows = [r for r in rows if (r.get("risk_level") or "").lower() == risk_level.lower()]
+
+        total = len(rows)
+        page = rows[offset:offset + limit]
+
+        operations = []
+        for r in page:
+            vehicle = " ".join(filter(None, [
+                str(r["vehicle_year"]) if r.get("vehicle_year") else None,
+                r.get("vehicle_make"), r.get("vehicle_model"),
+            ])) or None
+            operations.append({
+                "claim_id": r["claim_id"],
+                "assignment_id": r["assignment_id"],
+                "vehicle": vehicle,
+                "assessor_name": r.get("assessor_name") or r.get("assessor_id"),
+                "status": r["computed_status"],
+                "ai_risk": (r.get("risk_level") or "unknown"),
+                "fraud_risk_score": r.get("fraud_risk_score"),
+                "value": r.get("estimated_cost"),
+                "assigned_at": r.get("assigned_at"),
+            })
+
+        return {"success": True, "total": total, "limit": limit, "offset": offset, "operations": operations}
+    except Exception as e:
+        logger.error(f"Error building live assessment operations: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# Component-name buckets for the AI vs Assessor disagreement breakdown --
+# groups the many specific part names (from both the YOLO taxonomy and the
+# vision-LLM's free-form part identification) into the handful of families
+# an admin actually wants a rate for, rather than one row per exact part.
+_COMPONENT_BUCKETS = [
+    ("Bumper", ["bumper"]),
+    ("Headlamp", ["headlamp", "headlight"]),
+    ("Taillamp", ["taillamp", "taillight"]),
+    ("Fender", ["fender"]),
+    ("Door", ["door"]),
+    ("Glass/Windscreen", ["windscreen", "window", "windshield"]),
+    ("Bonnet/Hood", ["bonnet", "hood"]),
+    ("Roof", ["roof"]),
+    ("Mirror", ["mirror"]),
+    ("Grille", ["grille"]),
+]
+
+
+def _bucket_component(component: str) -> str:
+    c = (component or "").lower()
+    for label, keywords in _COMPONENT_BUCKETS:
+        if any(kw in c for kw in keywords):
+            return label
+    return "Other"
+
+
+@analysis_router.get("/admin/ai/overview")
+async def get_ai_intelligence_overview():
+    """
+    **ADMIN ONLY: AI Intelligence Centre -- top-level AI performance.**
+
+    Every number here is computed from what the system actually stored
+    (detections, whole-photo scan zones, and assessor decisions) rather
+    than a static claim about accuracy -- so it moves as real claims are
+    assessed, and reads as "unknown" rather than a fabricated figure
+    wherever there isn't yet enough data to compute it honestly.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT analysis_result FROM claims WHERE analysis_result IS NOT NULL AND analysis_result != '{}'")
+            claim_rows = cursor.fetchall()
+
+            cursor.execute("SELECT COUNT(*) as cnt FROM photo_damage_decisions")
+            total_decisions = cursor.fetchone()["cnt"] or 0
+            cursor.execute("SELECT COUNT(*) as cnt FROM photo_damage_decisions WHERE ai_recommendation = assessor_decision")
+            confirmed_decisions = cursor.fetchone()["cnt"] or 0
+
+        images_analysed = 0
+        total_detections = 0
+        confidence_sum = 0.0
+        confidence_count = 0
+        low_confidence_count = 0
+        pending_review_count = 0
+
+        for row in claim_rows:
+            try:
+                ar = json.loads(row["analysis_result"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            photo_analysis = ar.get("photo_analysis") or {}
+            for photo_result in photo_analysis.get("results", []):
+                images_analysed += 1
+                detections = photo_result.get("detections") or []
+                damage_zones = photo_result.get("damage_zones") or []
+                for d in detections:
+                    total_detections += 1
+                    conf = d.get("confidence")
+                    if conf is not None:
+                        confidence_sum += conf
+                        confidence_count += 1
+                    if d.get("low_confidence") or (conf is not None and conf < 0.4):
+                        low_confidence_count += 1
+                        pending_review_count += 1
+                for z in damage_zones:
+                    total_detections += 1
+                    conf = z.get("confidence")
+                    if conf is not None:
+                        confidence_sum += conf
+                        confidence_count += 1
+                    if conf is not None and conf < 0.4:
+                        low_confidence_count += 1
+                        pending_review_count += 1
+
+        avg_confidence = round((confidence_sum / confidence_count) * 100, 1) if confidence_count else None
+        confirmation_rate = round((confirmed_decisions / total_decisions) * 100, 1) if total_decisions else None
+        override_rate = round(100 - confirmation_rate, 1) if confirmation_rate is not None else None
+        # Detections/zones outstanding an assessor decision -- decided ones
+        # are already excluded from pending, so this is a genuine backlog
+        # count, not a static placeholder.
+        pending_assessor_decisions = max(0, total_detections - total_decisions)
+
+        return {
+            "success": True,
+            "images_analysed": images_analysed,
+            "damage_detections": total_detections,
+            "assessor_confirmation_rate": confirmation_rate,
+            "human_override_rate": override_rate,
+            "ai_confidence_avg": avg_confidence,
+            "low_confidence_cases": low_confidence_count,
+            "pending_assessor_decisions": pending_assessor_decisions,
+            "total_assessor_decisions_logged": total_decisions,
+        }
+    except Exception as e:
+        logger.error(f"Error building AI intelligence overview: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/ai/comparison")
+async def get_ai_vs_assessor_comparison():
+    """
+    **ADMIN ONLY: AI vs Assessor comparison** -- overall agreement rate plus
+    a per-component-family disagreement breakdown, built entirely from
+    logged assessor decisions (photo_damage_decisions), never inferred.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT claim_id, filename, component, ai_recommendation, assessor_decision, assessor_id, decided_at
+                FROM photo_damage_decisions ORDER BY decided_at DESC
+            ''')
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        bucket_totals: Dict[str, int] = {}
+        bucket_disagreements: Dict[str, int] = {}
+        agreements = 0
+        recent = []
+
+        for r in rows:
+            bucket = _bucket_component(r.get("component"))
+            agree = r.get("ai_recommendation") == r.get("assessor_decision")
+            bucket_totals[bucket] = bucket_totals.get(bucket, 0) + 1
+            if agree:
+                agreements += 1
+            else:
+                bucket_disagreements[bucket] = bucket_disagreements.get(bucket, 0) + 1
+            if len(recent) < 25:
+                recent.append({
+                    "claim_id": r["claim_id"],
+                    "component": r.get("component"),
+                    "ai_recommendation": r.get("ai_recommendation"),
+                    "assessor_decision": r.get("assessor_decision"),
+                    "agreed": agree,
+                    "decided_at": r.get("decided_at"),
+                })
+
+        total = len(rows)
+        agreement_rate = round((agreements / total) * 100, 1) if total else None
+        disagreement_by_component = [
+            {
+                "component": bucket,
+                "total": bucket_totals[bucket],
+                "disagreements": bucket_disagreements.get(bucket, 0),
+                "disagreement_rate": round((bucket_disagreements.get(bucket, 0) / bucket_totals[bucket]) * 100, 1),
+            }
+            for bucket in sorted(bucket_totals.keys(), key=lambda b: bucket_totals[b], reverse=True)
+        ]
+
+        return {
+            "success": True,
+            "total_decisions": total,
+            "agreement_rate": agreement_rate,
+            "disagreement_by_component": disagreement_by_component,
+            "recent_decisions": recent,
+        }
+    except Exception as e:
+        logger.error(f"Error building AI vs assessor comparison: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/ai/risk-queue")
+async def get_ai_risk_fraud_queue(limit: int = Query(30, description="Max claims to return")):
+    """
+    **ADMIN ONLY: AI Risk & Fraud Centre** -- a triaged queue built from the
+    business-rules engine's findings already stored per claim. Presented as
+    risk indicators requiring review, never as a fraud verdict -- the
+    engine itself never declares a claim fraudulent, only flags patterns
+    worth a human look.
+    """
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT claim_id, analysis_result, created_at, estimated_cost
+                FROM claims WHERE analysis_result IS NOT NULL AND analysis_result != '{}'
+                ORDER BY created_at DESC
+            ''')
+            rows = cursor.fetchall()
+
+        queue = []
+        for row in rows:
+            try:
+                ar = json.loads(row["analysis_result"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            business_rules_data = ar.get("business_rules") or {}
+            findings = business_rules_data.get("findings") or []
+            if not findings:
+                continue
+
+            severities = [f.get("severity") for f in findings]
+            if "high" in severities:
+                tier = "critical"
+            elif "medium" in severities:
+                tier = "review"
+            else:
+                tier = "normal"
+
+            queue.append({
+                "claim_id": row["claim_id"],
+                "tier": tier,
+                "risk_score": business_rules_data.get("risk_score"),
+                "created_at": row["created_at"],
+                "estimated_cost": row["estimated_cost"],
+                "indicators": [
+                    {"type": f.get("type"), "severity": f.get("severity"), "description": f.get("description"), "confidence": f.get("confidence")}
+                    for f in findings
+                ],
+            })
+
+        tier_order = {"critical": 0, "review": 1, "normal": 2}
+        queue.sort(key=lambda q: (tier_order.get(q["tier"], 3), -(q["risk_score"] or 0)))
+
+        return {
+            "success": True,
+            "total_flagged": len(queue),
+            "critical_count": sum(1 for q in queue if q["tier"] == "critical"),
+            "review_count": sum(1 for q in queue if q["tier"] == "review"),
+            "queue": queue[:limit],
+        }
+    except Exception as e:
+        logger.error(f"Error building AI risk & fraud queue: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/ai/decision-trace/{claim_id}")
+async def get_ai_decision_trace(claim_id: str):
+    """
+    **ADMIN ONLY: AI Decision Trace** -- the real per-detection pipeline
+    (what actually runs in service.py/damage_detector.py/part_identifier.py
+    for every photo) rendered as an explainable step list, so "why did the
+    AI recommend this" has a concrete answer instead of a black box.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        analysis_result = claim.get("analysis_result")
+        if isinstance(analysis_result, str):
+            analysis_result = json.loads(analysis_result)
+
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT filename, detection_index, assessor_decision FROM photo_damage_decisions WHERE claim_id = ?",
+                (claim_id,),
+            )
+            decisions = {(r["filename"], r["detection_index"]): r["assessor_decision"] for r in cursor.fetchall()}
+
+        photo_analysis = analysis_result.get("photo_analysis") or {}
+        traces = []
+        for photo_result in photo_analysis.get("results", []):
+            filename = photo_result.get("filename")
+            for i, d in enumerate(photo_result.get("detections") or []):
+                conf = d.get("confidence")
+                low_conf = bool(d.get("low_confidence")) or (conf is not None and conf < 0.4)
+                decided = decisions.get((filename, i))
+                traces.append({
+                    "filename": filename,
+                    "source": "detector",
+                    "component": d.get("component"),
+                    "steps": [
+                        {"label": "Image received", "done": True},
+                        {"label": "Photo quality check", "done": True},
+                        {"label": "Vehicle component detected", "done": True, "detail": d.get("component")},
+                        {"label": "Damage detected", "done": True, "detail": d.get("class", "").replace("-", " ")},
+                        {"label": "Severity estimated", "done": True, "detail": d.get("severity", "moderate")},
+                        {"label": "Repair/Replace recommendation", "done": True, "detail": d.get("recommended_action")},
+                        {"label": "Confidence", "done": True, "detail": f"{round((conf or 0) * 100)}%"},
+                        {"label": "Human verification required", "done": True, "detail": "YES" if low_conf else "Recommended"},
+                    ],
+                    "confidence": conf,
+                    "low_confidence": low_conf,
+                    "recommended_action": d.get("recommended_action"),
+                    "assessor_decision": decided,
+                })
+            for i, z in enumerate(photo_result.get("damage_zones") or []):
+                conf = z.get("confidence")
+                low_conf = conf is not None and conf < 0.4
+                decided = decisions.get((filename, 100 + i))
+                traces.append({
+                    "filename": filename,
+                    "source": "whole_photo_scan",
+                    "component": z.get("part"),
+                    "steps": [
+                        {"label": "Image received", "done": True},
+                        {"label": "Photo quality check", "done": True},
+                        {"label": "Vehicle component identified", "done": True, "detail": z.get("part")},
+                        {"label": "Damage classified", "done": True, "detail": z.get("damage_type")},
+                        {"label": "Severity estimated", "done": True, "detail": z.get("severity")},
+                        {"label": "Repair/Replace recommendation", "done": True, "detail": z.get("recommended_action")},
+                        {"label": "Confidence", "done": True, "detail": f"{round((conf or 0) * 100)}%"},
+                        {"label": "Human verification required", "done": True, "detail": "YES" if low_conf else "Recommended"},
+                    ],
+                    "confidence": conf,
+                    "low_confidence": low_conf,
+                    "recommended_action": z.get("recommended_action"),
+                    "assessor_decision": decided,
+                })
+
+        return {"success": True, "claim_id": claim_id, "traces": traces}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building AI decision trace for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/claim/{claim_id}/details")
+async def get_admin_claim_details(claim_id: str):
+    """
+    **ADMIN ONLY: unrestricted claim details** -- same shape as the
+    assessor's /claim-details endpoint (raw analysis_result, photos,
+    documents, member info) but with no assessor-assignment check, since an
+    admin needs to open any claim, not just ones assigned to them. This is
+    what the AI Intelligence Centre's Assessment Review tab reads photo
+    detections/damage_zones from -- the curated /full-report endpoint
+    deliberately strips that raw detail out into a fraud-summary shape.
+    """
+    try:
+        claim_data = db_manager.get_claim(claim_id)
+        if not claim_data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        member_info = db_manager.get_member_info(claim_data.get("member_id", "")) if claim_data.get("member_id") else None
+
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, filename, party, file_size, content_type, uploaded_at
+                FROM claim_photo_files WHERE claim_id = ? ORDER BY uploaded_at ASC
+            ''', (claim_id,))
+            photos = [dict(row) for row in cursor.fetchall()]
+
+            cursor.execute('''
+                SELECT ca.*, a.name as assessor_name FROM claim_assignments ca
+                LEFT JOIN assessors a ON a.assessor_id = ca.assessor_id
+                WHERE ca.claim_id = ? ORDER BY ca.assigned_at DESC
+            ''', (claim_id,))
+            assignments = [dict(row) for row in cursor.fetchall()]
+
+            policy_info = None
+            if claim_data.get("policy_id"):
+                cursor.execute('''
+                    SELECT p.sum_insured, p.excess, p.cover_type, m.vehicle_make, m.vehicle_model, m.vehicle_year
+                    FROM policies p LEFT JOIN motor_policy_details m ON m.policy_id = p.policy_id
+                    WHERE p.policy_id = ?
+                ''', (claim_data["policy_id"],))
+                row = cursor.fetchone()
+                if row:
+                    policy_info = dict(row)
+
+        documents = db_manager.get_documents_by_claim(claim_id)
+        damage_decisions = db_manager.get_photo_damage_decisions(claim_id)
+
+        return {
+            "success": True,
+            "claim_id": claim_id,
+            "claim_details": claim_data,
+            "member_info": member_info,
+            "policy_info": policy_info,
+            "photos": photos,
+            "documents": documents,
+            "assignments": assignments,
+            "damage_decisions": damage_decisions,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building admin claim details for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/claim/{claim_id}/recipients")
+async def get_claim_recipients(claim_id: str):
+    """
+    **ADMIN ONLY: candidate recipients for the AI communications flow** --
+    every party actually attached to this claim (member, assigned assessor,
+    filing analyst, repair shop) with a name + email where one exists, so
+    the admin picks a person, not types an address from memory.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        recipients = []
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+
+            if claim.get("member_id"):
+                cursor.execute("SELECT name, email FROM members WHERE member_id = ?", (claim["member_id"],))
+                row = cursor.fetchone()
+                if row and row["email"]:
+                    recipients.append({"type": "member", "id": claim["member_id"], "name": row["name"], "email": row["email"]})
+
+            cursor.execute('''
+                SELECT a.assessor_id, a.name, a.email FROM claim_assignments ca
+                JOIN assessors a ON a.assessor_id = ca.assessor_id
+                WHERE ca.claim_id = ? ORDER BY ca.assigned_at DESC LIMIT 1
+            ''', (claim_id,))
+            row = cursor.fetchone()
+            if row and row["email"]:
+                recipients.append({"type": "assessor", "id": row["assessor_id"], "name": row["name"], "email": row["email"]})
+
+            if claim.get("filed_by_analyst_id"):
+                cursor.execute("SELECT name, email FROM analysts WHERE analyst_id = ?", (claim["filed_by_analyst_id"],))
+                row = cursor.fetchone()
+                if row and row["email"]:
+                    recipients.append({"type": "analyst", "id": claim["filed_by_analyst_id"], "name": row["name"], "email": row["email"]})
+
+            if claim.get("repair_shop_id"):
+                cursor.execute("SELECT shop_id, name FROM repair_shops WHERE shop_id = ?", (claim["repair_shop_id"],))
+                row = cursor.fetchone()
+                if row:
+                    # repair_shops carries no email column in this schema --
+                    # still surfaced so the admin can type one in manually
+                    # rather than not seeing the repairer as an option at all.
+                    recipients.append({"type": "repair_shop", "id": row["shop_id"], "name": row["name"], "email": None})
+
+        return {"success": True, "claim_id": claim_id, "recipients": recipients}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building recipients for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/admin/claim/{claim_id}/ai-draft-message")
+async def ai_draft_claim_message(
+    claim_id: str,
+    recipient_type: str = Form(..., description="member / assessor / analyst / repair_shop"),
+    recipient_name: str = Form(""),
+    instruction: str = Form("", description="What the admin wants said, in their own words"),
+):
+    """
+    **ADMIN ONLY: AI-drafted email for a claim** -- pulls real claim context
+    (status, decision, risk indicators) into a short professional draft the
+    admin reviews and edits before sending, mirroring the "AI drafts, human
+    approves and sends" pattern -- nothing here ever sends on its own.
+    """
+    try:
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Claim {claim_id} not found")
+
+        analysis_result = claim.get("analysis_result")
+        if isinstance(analysis_result, str):
+            try:
+                analysis_result = json.loads(analysis_result)
+            except (json.JSONDecodeError, TypeError):
+                analysis_result = {}
+        analysis_result = analysis_result or {}
+
+        audience_profile = {
+            "member": {
+                "who": "the POLICYHOLDER who filed this claim -- a customer, not a colleague",
+                "tone": "plain, reassuring, non-technical language, no internal risk/fraud terminology, no operational jargon",
+                "default_ask": "a general status update on their own claim -- reassure them it's being handled",
+                "never": "do not ask them to inspect anything, do not reference assignments or workload -- they are not staff",
+            },
+            "assessor": {
+                "who": "the ASSESSOR assigned to inspect this claim -- a staff member doing a job, not the customer",
+                "tone": "direct, operational, colleague-to-colleague -- can reference inspection scheduling, assignment details, documentation needed",
+                "default_ask": "a reminder or status check on their assigned inspection for this claim",
+                "never": "do not write as if the recipient is the person whose car was damaged, do not reassure them about 'their claim being handled' -- it is not their claim, it is their assignment",
+            },
+            "analyst": {
+                "who": "the CLAIMS ANALYST who filed this claim on the member's behalf -- a staff member, not the customer",
+                "tone": "operational, colleague-to-colleague, can reference claim status and next processing steps",
+                "default_ask": "a status update on a claim they filed, for their records",
+                "never": "do not address them as if they are the policyholder",
+            },
+            "repair_shop": {
+                "who": "the REPAIR SHOP handling the vehicle -- an external vendor, not the customer or staff",
+                "tone": "focused on repair scope and parts, no internal risk data",
+                "default_ask": "a request for a repair quote or status update on repair work",
+                "never": "do not discuss claim risk/fraud assessment with them",
+            },
+        }.get(recipient_type, {"who": "the recipient", "tone": "professional", "default_ask": "a general update", "never": ""})
+
+        context = {
+            "claim_id": claim_id,
+            "status": claim.get("risk_level"),
+            "estimated_cost": claim.get("estimated_cost"),
+            "location": claim.get("location"),
+            "decision": analysis_result.get("final_assessment", {}).get("decision") if isinstance(analysis_result.get("final_assessment"), dict) else None,
+        }
+
+        prompt = f"""Draft a short, professional email about motor insurance claim {claim_id}.
+
+You are writing this email TO {recipient_name or "the recipient"} DIRECTLY -- address them as "you" throughout. This person is {audience_profile['who']}.
+Tone for this recipient: {audience_profile['tone']}.
+{audience_profile['never']}.
+
+Claim context (ONLY facts, from the system -- treat "null" as "not yet known", never invent a value for it): {json.dumps(context)}
+What the sender (a claims admin) wants communicated: {instruction or audience_profile['default_ask']}
+
+Critical: never state or imply a claim outcome (approved, declined, payment authorized, payment refused, etc.) unless "decision" above is a real non-null value that says so. If "decision" is null, the claim is still under review -- say exactly that, don't guess. Never mention internal fraud/risk scores or business-rule findings unless the recipient is explicitly the assessor and the instruction asks for it. Stay strictly in the voice appropriate for THIS recipient -- do not slip into language meant for a different audience (e.g. never console an assessor as if they were the person whose car was damaged).
+Respond with ONLY this JSON: {{"subject": "...", "body": "..."}}
+"body" should be plain text (no HTML), 3-6 short sentences, signed "Claims Team"."""
+
+        draft = generate_json(prompt, timeout=60)
+        subject = draft.get("subject") or f"Update on claim {claim_id}"
+        body = draft.get("body") or "We are reviewing your claim and will be in touch shortly."
+
+        return {"success": True, "subject": subject, "body": body}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error drafting AI message for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/admin/claim/{claim_id}/send-message")
+async def send_claim_message(
+    claim_id: str,
+    to_email: str = Form(...),
+    subject: str = Form(...),
+    body: str = Form(...),
+    recipient_type: str = Form(""),
+):
+    """**ADMIN ONLY: send an (admin-approved, possibly AI-drafted) email for this claim.**"""
+    try:
+        if not email_service.is_configured():
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Email sending is not configured on this server.")
+        html_body = "".join(f"<p>{line}</p>" for line in body.split("\n") if line.strip())
+        sent = email_service.send_email(to_email, subject, html_body)
+        if not sent:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Email failed to send.")
+        return {"success": True, "claim_id": claim_id, "to": to_email, "recipient_type": recipient_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending message for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# rb_field pulls the raw 0-100 component score from risk_breakdown;
+# weight_key pulls the matching weight from risk_breakdown.weights_applied
+# -- these use two DIFFERENT naming schemes in the underlying data
+# (weights_applied uses short keys like "photo"/"business_rules", while the
+# score fields use "_risk"-suffixed names), so both must be mapped
+# explicitly rather than assumed to match "key".
+_RISK_FACTOR_META = [
+    {"key": "photo_analysis", "rb_field": "photo_risk", "weight_key": "photo", "label": "Photo Evidence", "icon": "photo_camera"},
+    {"key": "narrative_analysis", "rb_field": "narrative_risk", "weight_key": "narrative", "label": "Claim Narrative", "icon": "description"},
+    {"key": "business_rules", "rb_field": "business_rules_risk", "weight_key": "business_rules", "label": "Business Rules", "icon": "rule"},
+    {"key": "amount_based", "rb_field": "amount_risk", "weight_key": "amount", "label": "Claim Amount", "icon": "payments"},
+    {"key": "location_based", "rb_field": "location_risk", "weight_key": "location", "label": "Location", "icon": "location_on"},
+    {"key": "historical_patterns", "rb_field": "historical_risk", "weight_key": "historical", "label": "Historical Comparison", "icon": "history"},
+]
+
+
+def _impact_tier(pct: float) -> str:
+    if pct >= 0.6:
+        return "high"
+    if pct >= 0.3:
+        return "medium"
+    return "low"
+
+
+@analysis_router.post("/admin/claim/{claim_id}/explain-risk-score")
+async def explain_risk_score(
+    claim_id: str,
+    risk_breakdown: str = Form(..., description="JSON string of the claim's risk_breakdown object, as already shown on screen"),
+    risk_level: str = Form(""),
+    decision: str = Form(""),
+    photo_anomaly_count: int = Form(0),
+    narrative_issue_count: int = Form(0),
+    cross_party_issue_count: int = Form(0),
+    business_rule_findings: str = Form("[]", description="JSON array of {type, severity, description} from the claim's business_rules.findings"),
+):
+    """
+    **ADMIN ONLY: structured AI Investigation Summary for a claim's risk score.**
+
+    Every number here (points, max points, impact tier) is computed
+    deterministically in Python from the same risk_breakdown weights/scores
+    already shown on screen -- the LLM is used ONLY to phrase the reasoning
+    sentence per factor, grounded in the real finding counts passed in, so
+    it can't invent a count or a determination that wasn't actually made.
+    """
+    try:
+        try:
+            rb = json.loads(risk_breakdown)
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="risk_breakdown must be valid JSON")
+        try:
+            findings = json.loads(business_rule_findings)
+            if not isinstance(findings, list):
+                findings = []
+        except (json.JSONDecodeError, TypeError):
+            findings = []
+
+        weights = rb.get("weights_applied") or {}
+        overall = rb.get("overall_score") or 0
+
+        factors = []
+        for meta in _RISK_FACTOR_META:
+            weight = weights.get(meta["weight_key"])
+            raw_score = rb.get(meta["rb_field"])
+            if weight is None or raw_score is None:
+                continue
+            max_points = round(weight * 100, 1)
+            points = round(raw_score * weight, 1)
+            pct = (raw_score / 100) if raw_score else 0
+            factors.append({
+                "key": meta["key"], "label": meta["label"], "icon": meta["icon"],
+                "points": points, "max_points": max_points, "impact": _impact_tier(pct),
+            })
+        factors.sort(key=lambda f: f["points"], reverse=True)
+
+        # Ground truth counts for the factors that have them -- these are
+        # real, already-computed numbers from this claim's own analysis
+        # (fraud_indicators / business_rules.findings), not invented.
+        evidence = {
+            "photo_analysis": f"{photo_anomaly_count} flagged photo anomal{'y' if photo_anomaly_count == 1 else 'ies'}" if photo_anomaly_count else "no specific photo anomalies flagged individually",
+            "narrative_analysis": f"{narrative_issue_count} narrative inconsistenc{'y' if narrative_issue_count == 1 else 'ies'}" if narrative_issue_count else "no specific narrative inconsistencies flagged individually",
+            "business_rules": f"{len(findings)} triggered rule(s): " + "; ".join(f.get("description", f.get("type", "")) for f in findings[:4]) if findings else "no business rules triggered",
+        }
+
+        # Only ask the LLM to phrase reasoning for factors that actually
+        # matter (medium/high impact) -- low-impact factors get a fixed,
+        # non-hallucinatable template sentence instead of a model call.
+        needs_reasoning = [f for f in factors if f["impact"] != "low"]
+        reasoning_map: Dict[str, str] = {}
+        headline = f"This claim is rated {risk_level or 'unknown'} risk ({overall}/100) and requires additional review before settlement."
+        if needs_reasoning:
+            factor_lines = "\n".join(
+                f"- {f['label']} ({f['key']}): {f['points']}/{f['max_points']} points, impact={f['impact']}. "
+                f"Ground truth: {evidence.get(f['key'], 'no additional detail available')}."
+                for f in needs_reasoning
+            )
+            prompt = f"""A motor insurance claim scored {overall}/100 ("{risk_level or 'unknown'}" risk, decision so far: {decision or 'not yet decided'}).
+
+These factors need a one-sentence, plain-English reasoning for a non-technical claims admin, using ONLY the ground-truth detail given for each -- never invent a number, a detail, or an outcome not stated below:
+{factor_lines}
+
+Also write one overall headline sentence summarizing why this claim needs review (which 1-2 factors matter most, in plain terms).
+
+Critical: never say "fraud" or "fraudulent" -- say "requires review" / "warrants investigation" instead. This is a risk indicator, not a fraud determination.
+
+Respond with ONLY this JSON: {{"headline": "...", "reasoning": {{"{needs_reasoning[0]['key']}": "...", ...one entry per factor key above...}}}}"""
+            try:
+                result = generate_json(prompt, timeout=50)
+                headline = result.get("headline") or headline
+                reasoning_map = result.get("reasoning") or {}
+            except Exception as e:
+                logger.warning(f"AI investigation summary phrasing failed for {claim_id}, using fallback text: {e}")
+
+        for f in factors:
+            if f["impact"] == "low":
+                f["reasoning"] = "Minimal contribution to the overall score."
+            else:
+                f["reasoning"] = reasoning_map.get(f["key"]) or f"Contributed {f['points']} of {f['max_points']} possible points -- {evidence.get(f['key'], 'reviewed as part of the overall assessment')}."
+
+        what_to_review = []
+        if any(f["key"] == "photo_analysis" and f["impact"] != "low" for f in factors):
+            what_to_review.append("Vehicle photographs and AI damage annotations")
+        if any(f["key"] == "business_rules" and f["impact"] != "low" for f in factors):
+            what_to_review.append("Triggered business rules")
+        if any(f["key"] == "narrative_analysis" and f["impact"] != "low" for f in factors):
+            what_to_review.append("Accident narrative")
+        if cross_party_issue_count:
+            what_to_review.append("Cross-party verification issues")
+        what_to_review.append("Supporting documents")
+        if not what_to_review:
+            what_to_review = ["Supporting documents"]
+
+        return {
+            "success": True,
+            "claim_id": claim_id,
+            "headline": headline,
+            "risk_level": risk_level,
+            "score": overall,
+            "factors": factors,
+            "what_to_review": what_to_review,
+            "important_note": "This score is a risk indicator, not a fraud determination. It does not by itself confirm fraud or mean the claim should be rejected -- final decisions remain with the authorized claims team.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error explaining risk score for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/admin/business-rules-config")
+async def get_business_rules_config():
+    """
+    **ADMIN ONLY: current values (default or admin-overridden) for every
+    configurable business-rule threshold, plus the schema (label/group/help/
+    unit) the Settings page renders from.** Keeps the frontend from having
+    to hardcode field labels/descriptions -- business_rules.py's
+    CONFIG_SCHEMA is the single source of truth for both.
+    """
+    try:
+        overrides = db_manager.get_system_config_overrides()
+        fields = []
+        for field in business_rules.CONFIG_SCHEMA:
+            key = field["key"]
+            fields.append({
+                **field,
+                "value": overrides.get(key, field["default"]),
+                "is_overridden": key in overrides,
+            })
+        return {"success": True, "fields": fields}
+    except Exception as e:
+        logger.error(f"Error retrieving business rules config: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/admin/business-rules-config")
+async def update_business_rules_config(
+    updates: str = Form(..., description="JSON object of {config_key: number} to set, or {config_key: null} to reset to default"),
+    admin_id: str = Form(..., description="Admin making the change, for the audit trail"),
+):
+    """
+    **ADMIN ONLY: update one or more business-rule thresholds.** Only keys
+    already present in business_rules.CONFIG_SCHEMA are accepted -- this is
+    a retuning knob for existing rules, not a way to inject arbitrary config
+    the rules engine was never written to read.
+    """
+    try:
+        try:
+            parsed = json.loads(updates)
+            if not isinstance(parsed, dict):
+                raise ValueError("updates must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid updates payload: {e}")
+
+        valid_keys = {f["key"] for f in business_rules.CONFIG_SCHEMA}
+        unknown_keys = set(parsed.keys()) - valid_keys
+        if unknown_keys:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown config key(s): {', '.join(sorted(unknown_keys))}")
+
+        db_manager.set_system_config_overrides(parsed, updated_by=admin_id)
+        logger.info(f"Business rules config updated by {admin_id}: {parsed}")
+        return {"success": True, "updated": list(parsed.keys())}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating business rules config: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
 @analysis_router.get("/claim/{claim_id}/full-report")
 async def get_full_fraud_analysis(
     claim_id: str,
@@ -1488,6 +2905,7 @@ async def get_full_fraud_analysis(
             "analysis_timestamp": analysis_result.get('timestamp'),
             "estimated_cost":     estimated_cost,
             "location":           location,
+            "business_rules":     analysis_result.get('business_rules') or {},
             "final_assessment": {
                 "decision":         final_decision,
                 "decision_reason":  decision_reason,
@@ -1522,34 +2940,57 @@ async def get_full_fraud_analysis(
                 "cross_party_issues": cross_party.get('inconsistencies', [])
             },
             "risk_breakdown": {
-                "photo_risk":       risk_scoring.get('component_scores', {}).get('photo_analysis', 0),
-                "narrative_risk":   risk_scoring.get('component_scores', {}).get('narrative_analysis', 0),
-                "amount_risk":      risk_scoring.get('component_scores', {}).get('amount_based', 0),
-                "estimated_cost":   estimated_cost,
-                "location_risk":    risk_scoring.get('component_scores', {}).get('location_based', 0),
-                "location":         location,
-                "historical_risk":  risk_scoring.get('component_scores', {}).get('historical_patterns', 0),
-                "physics_risk":     risk_scoring.get('component_scores', {}).get('physics_reconstruction', 0),
-                "cross_party_risk": cross_party.get('cross_party_risk_score', 0),
-                "weights_applied":  risk_scoring.get('weights', {}),
-                "explanation":      risk_scoring.get('explanation', ''),
-                "overall_score":    risk_score
+                "photo_risk":           risk_scoring.get('component_scores', {}).get('photo_analysis', 0),
+                "narrative_risk":       risk_scoring.get('component_scores', {}).get('narrative_analysis', 0),
+                "amount_risk":          risk_scoring.get('component_scores', {}).get('amount_based', 0),
+                "estimated_cost":       estimated_cost,
+                "location_risk":        risk_scoring.get('component_scores', {}).get('location_based', 0),
+                "location":             location,
+                "historical_risk":      risk_scoring.get('component_scores', {}).get('historical_patterns', 0),
+                "business_rules_risk":  risk_scoring.get('component_scores', {}).get('business_rules', 0),
+                "physics_risk":         risk_scoring.get('component_scores', {}).get('physics_reconstruction', 0),
+                "cross_party_risk":     cross_party.get('cross_party_risk_score', 0),
+                "weights_applied":      risk_scoring.get('weights', {}),
+                "explanation":          risk_scoring.get('explanation', ''),
+                "overall_score":        risk_score
             },
             "physics_reconstruction": {
                 "status":              physics_summary.get('status', 'not_run'),
                 "claim_category":      physics_summary.get('claim_category'),
                 "pathway":             physics_summary.get('pathway'),
+                "vehicle_1_key":       physics_summary.get('vehicle_1_key'),
+                "vehicle_2_key":       physics_summary.get('vehicle_2_key'),
+                "v2_body_type":        physics_summary.get('v2_body_type'),
                 "physics_fraud_score": physics_summary.get('physics_fraud_score'),
                 "physics_verdict":     physics_verdict,
                 "verdict_reason":      physics_summary.get('verdict_reason'),
                 "physics_explanation": physics_summary.get('physics_explanation', ''),
                 "simulation_method":   physics_summary.get('simulation_method'),
+                "confidence":          physics_summary.get('confidence'),
                 "inconsistencies":     physics_summary.get('inconsistencies', []),
                 "warnings":            physics_summary.get('warnings', []),
                 "signature":           physics_summary.get('signature'),
                 "timeline_metadata":   timeline_meta,
                 "timeline":            timeline if include_timeline else None,
                 "comparison":          physics_summary.get('comparison'),
+                # Which value each key physics input came from (assessor
+                # measurement / Gemini narrative extraction / keyword
+                # inference / stationary override) -- lets the reconstruction
+                # UI label numbers as observed vs inferred vs calculated
+                # instead of presenting everything with the same confidence.
+                "data_sources":        physics_summary.get('data_sources'),
+                "delta_v_kmh":         physics_summary.get('delta_v_kmh'),
+                "kinetic_energy_j":    physics_summary.get('kinetic_energy_j'),
+                "crush_energy_j":      physics_summary.get('crush_energy_j'),
+                "energy_consistent":   physics_summary.get('energy_consistent'),
+                "impact_force_magnitude_n": physics_summary.get('impact_force_magnitude_n'),
+                "impact_force_is_estimated": physics_summary.get('impact_force_is_estimated'),
+                "v1_impact_vertex_xyz": physics_summary.get('v1_impact_vertex_xyz'),
+                "terrain_adjusted":    physics_summary.get('terrain_adjusted'),
+                "slope_adjustment_kmh": physics_summary.get('slope_adjustment_kmh'),
+                "impact_zone_v1":      physics_summary.get('impact_zone_v1'),
+                "impact_zone_v1_source": physics_summary.get('impact_zone_v1_source'),
+                "impact_zone_v1_detected_part": physics_summary.get('impact_zone_v1_detected_part'),
                 "measurement_flags":   physics_summary.get('measurement_flags', []),
                 "has_measurement_discrepancy": physics_summary.get('has_measurement_discrepancy', False),
             },
@@ -1591,8 +3032,45 @@ async def get_full_fraud_analysis(
                 for a in all_anomalies if a.get('severity') == 'high'
             ],
             "member_submission":      analysis_result.get('member_submission'),
-            "assessor_submission":    analysis_result.get('assessor_submission'),
-            "repair_shop_submission": analysis_result.get('repair_shop_submission'),
+            # The member's own cost estimate at filing time never lived
+            # inside member_submission (that JSON only ever held narrative
+            # data) -- it's a separate column, captured once and never
+            # overwritten, so it stays comparable to the assessor/repair
+            # shop figures that come later.
+            "member_stated_estimate": claim.get('initial_estimated_cost'),
+            # AI's own independent repair-cost estimate from detected damage
+            # (see part_identifier.estimate_damage_cost / the
+            # cost_reasonableness business rule) -- an extra cross-check
+            # figure, not sourced from any party with a stake in payout.
+            # Prefer the blob's own figure (same run as ai_cost_breakdown
+            # below) over the raw column -- the column is written slightly
+            # earlier in analyze_multiparty_claim than the blob's
+            # store_claim() call, and if the member/assessor/repair-shop
+            # background tasks overlap, a different (later) run's column
+            # write can otherwise end up paired with an earlier run's
+            # breakdown text, showing a number that doesn't match the
+            # sentence explaining it. Falls back to the column only for
+            # claims analyzed before ai_estimated_cost existed in the blob.
+            "ai_estimated_cost": analysis_result.get('ai_estimated_cost') or claim.get('ai_estimated_cost'),
+            "ai_cost_breakdown": analysis_result.get('ai_cost_breakdown'),
+            # assessor_submission/repair_shop_submission never carried a cost
+            # figure at all (service.py only ever put report/estimate TEXT
+            # and photo counts in there) -- the frontend's "Assessor
+            # Physical Estimate"/"Repair Shop Invoice Proposal" rows always
+            # showed N/A regardless of whether the party had submitted.
+            # Enrich with the real figures from their own DB columns
+            # (assessor_estimated_cost is written synchronously and
+            # independent of analysis timing; the "final" estimated_cost
+            # column becomes the repair shop's figure once they submit,
+            # same convention member_stated_estimate above relies on).
+            "assessor_submission": (
+                {**analysis_result['assessor_submission'], "estimated_cost": claim.get('assessor_estimated_cost')}
+                if analysis_result.get('assessor_submission') else None
+            ),
+            "repair_shop_submission": (
+                {**analysis_result['repair_shop_submission'], "total_cost": claim.get('estimated_cost')}
+                if analysis_result.get('repair_shop_submission') else None
+            ),
             "recommendations":        analysis_result.get('recommendations', []),
             # Consolidated Narrative Intelligence + Computer Vision + Physics +
             # Cross-validation recommendation from claims-advisory-v1 (see
@@ -1742,6 +3220,23 @@ async def record_claim_decision(
         except Exception as e:
             logger.warning(f"Could not mirror claim decision into AI-ROL trail for {claim_id}: {e}")
 
+        # Best-effort -- never blocks recording the decision if email
+        # fails/isn't configured.
+        try:
+            member = db_manager.get_member_info(claim.get("member_id")) if claim.get("member_id") else None
+            if member and member.get("email"):
+                email_service.send_decision_email(
+                    to_email=member["email"],
+                    member_name=member.get("name") or "there",
+                    member_id=claim["member_id"],
+                    claim_id=claim_id,
+                    decision=decision,
+                    reason=reason,
+                    payout_amount=payout_amount if decision == "PAY" else None,
+                )
+        except Exception as e:
+            logger.warning(f"Decision email failed for {claim_id}: {str(e)}")
+
         return {
             "success": True,
             "claim_id": claim_id,
@@ -1775,11 +3270,11 @@ async def get_analysis_summary(claim_id: str):
         cross_party = analysis_result.get('cross_party_verification', {})
  
         if risk_score >= 75:
-            decision, color = "DECLINE", "🔴"
+            decision, color ="DECLINE",""
         elif risk_score >= 50:
-            decision, color = "INVESTIGATE", "🟡"
+            decision, color ="INVESTIGATE",""
         else:
-            decision, color = "APPROVE", "🟢"
+            decision, color ="APPROVE",""
  
         return {
             "claim_id":          claim_id,
@@ -1800,7 +3295,7 @@ async def get_analysis_summary(claim_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error retrieving summary: {str(e)}")
+        logger.error(f"Error retrieving summary: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error retrieving summary: {str(e)}")
  
  
@@ -2009,8 +3504,40 @@ async def get_all_claims_analysis(
                     for a in all_anomalies if a.get('severity') == 'high'
                 ],
                 "member_submission":      analysis_result.get('member_submission'),
-                "assessor_submission":    analysis_result.get('assessor_submission'),
-                "repair_shop_submission": analysis_result.get('repair_shop_submission'),
+                "member_stated_estimate": claim.get('initial_estimated_cost'),
+            # AI's own independent repair-cost estimate from detected damage
+            # (see part_identifier.estimate_damage_cost / the
+            # cost_reasonableness business rule) -- an extra cross-check
+            # figure, not sourced from any party with a stake in payout.
+            # Prefer the blob's own figure (same run as ai_cost_breakdown
+            # below) over the raw column -- the column is written slightly
+            # earlier in analyze_multiparty_claim than the blob's
+            # store_claim() call, and if the member/assessor/repair-shop
+            # background tasks overlap, a different (later) run's column
+            # write can otherwise end up paired with an earlier run's
+            # breakdown text, showing a number that doesn't match the
+            # sentence explaining it. Falls back to the column only for
+            # claims analyzed before ai_estimated_cost existed in the blob.
+            "ai_estimated_cost": analysis_result.get('ai_estimated_cost') or claim.get('ai_estimated_cost'),
+            "ai_cost_breakdown": analysis_result.get('ai_cost_breakdown'),
+                # assessor_submission/repair_shop_submission never carried a cost
+            # figure at all (service.py only ever put report/estimate TEXT
+            # and photo counts in there) -- the frontend's "Assessor
+            # Physical Estimate"/"Repair Shop Invoice Proposal" rows always
+            # showed N/A regardless of whether the party had submitted.
+            # Enrich with the real figures from their own DB columns
+            # (assessor_estimated_cost is written synchronously and
+            # independent of analysis timing; the "final" estimated_cost
+            # column becomes the repair shop's figure once they submit,
+            # same convention member_stated_estimate above relies on).
+            "assessor_submission": (
+                {**analysis_result['assessor_submission'], "estimated_cost": claim.get('assessor_estimated_cost')}
+                if analysis_result.get('assessor_submission') else None
+            ),
+                "repair_shop_submission": (
+                {**analysis_result['repair_shop_submission'], "total_cost": claim.get('estimated_cost')}
+                if analysis_result.get('repair_shop_submission') else None
+            ),
                 "recommendations":        analysis_result.get('recommendations', []),
                 "next_actions": (
                     [f"Decision: {final_decision}", "Review complete fraud analysis report", "Notify all parties of decision"]
@@ -2067,7 +3594,7 @@ async def get_multiparty_status(claim_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error getting claim status: {str(e)}")
+        logger.error(f"Error getting claim status: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error retrieving claim status: {str(e)}")
  
  

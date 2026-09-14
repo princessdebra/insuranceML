@@ -87,6 +87,13 @@ class PhysicsResult:
  
     v1_impact_vertex_xyz: list = field(default_factory=list)
     impact_force_magnitude_n: float = 0.0
+    # True only for the Pathway-1 (telemetry-derived) force below -- an
+    # impulse-momentum ESTIMATE (mass x Δv / assumed crash-pulse duration)
+    # is computed for every claim regardless of pathway, but callers must be
+    # able to tell "measured from real sensor data" apart from "estimated
+    # from an assumed impact duration" rather than showing both as the same
+    # bare "CALCULATED" figure.
+    impact_force_is_estimated: bool = True
     telemetry_delta_v_ms: float = 0.0
  
     def to_dict(self):
@@ -104,6 +111,45 @@ def velocity_from_crush_energy(crush_energy_j, mass_kg):
     return math.sqrt(2 * crush_energy_j / mass_kg)
  
  
+def two_body_pre_impact_speed_v1(crush_energy_j, m1_kg, m2_kg, v2_pre_impact_ms):
+    """
+    V1's own crush energy gives its velocity CHANGE (delta_v1) via the
+    single-body sqrt(2E/m) relation -- that part is legitimate on its own,
+    but the previous code then used that number directly AS V1's full
+    pre-impact speed, which silently assumes V1 decelerated to a complete
+    stop (i.e. hit an immovable wall). That's wrong whenever V1 actually hit
+    a second vehicle that moved -- a heavy truck absorbs/imparts very
+    different momentum than a parked motorcycle would for the exact same
+    crush depth on V1, and the old formula couldn't tell the difference
+    since it never looked at m2 at all.
+
+    Conservation of momentum requires the two vehicles' velocity changes to
+    be inversely proportional to their masses (m1*delta_v1 = m2*delta_v2),
+    so delta_v2 is derived that way instead of needing V2's own crush depth
+    -- which usually doesn't exist, since the third-party vehicle rarely has
+    photos. V1's actual pre-impact speed is then reconstructed from V2's
+    (stated) speed plus both delta-v's.
+
+    No restitution coefficient here -- sqrt(2E/m) already implicitly treats
+    the crush energy as the vehicle's entire kinetic energy change (a fully
+    inelastic, e=0 assumption baked into the single-body formula itself, the
+    same one this codebase already uses for the barrier/fixed-object
+    pathway). Dividing by (1+e) on top of that would double-count
+    restitution rather than correct for it. This also means the formula
+    reduces to exactly the old single-body result when m2 is very large
+    relative to m1 and stationary (delta_v2 -> 0), so the already-correct
+    fixed-object/barrier case is unaffected by this change.
+
+    Returns (v1_pre_impact_ms, delta_v1_ms).
+    """
+    if m1_kg <= 0:
+        return 0.0, 0.0
+    delta_v1 = math.sqrt(2 * crush_energy_j / m1_kg)
+    delta_v2 = (m1_kg / m2_kg) * delta_v1 if m2_kg > 0 else 0.0
+    v1_pre_impact_ms = v2_pre_impact_ms + delta_v1 + delta_v2
+    return v1_pre_impact_ms, delta_v1
+
+
 def expected_crush_depth(velocity_ms, mass_kg, surface_width_m, A, B):
     KE = 0.5 * mass_kg * velocity_ms ** 2
     a_coef = B * surface_width_m
@@ -352,7 +398,8 @@ class CrashReconstructionEngine:
         if crush_depth_m > 0:
             crush_energy = mchenry_crush_energy(crush_depth_m, impact_width_m, profile_v1.crumple_A, profile_v1.crumple_B)
             result.crush_energy_j = round(crush_energy, 2)
-            result.computed_speed_v1_kmh = round(velocity_from_crush_energy(crush_energy, m1) * MS_TO_KMH, 1)
+            v1_pre_impact_ms, _ = two_body_pre_impact_speed_v1(crush_energy, m1, m2, v2_ms)
+            result.computed_speed_v1_kmh = round(v1_pre_impact_ms * MS_TO_KMH, 1)
             expected_depth_m = expected_crush_depth(v1_ms, m1, impact_width_m, profile_v1.crumple_A, profile_v1.crumple_B)
             result.expected_crush_depth_mm = round(expected_depth_m * 1000, 1)
             result.stated_crush_depth_mm = crush_depth_mm
@@ -371,7 +418,25 @@ class CrashReconstructionEngine:
  
         momentum = momentum_analysis(v1_ms, m1, v2_ms, m2, approach_angle_deg)
         result.delta_v_kmh = round(momentum["delta_v1_kmh"], 1)
- 
+
+        # Impulse-momentum force estimate (F = m·Δv / Δt) -- computable from
+        # data every claim already has (mass, ΔV), regardless of pathway.
+        # Previously the UI only ever showed a real force for Pathway 1
+        # (telemetry) claims and a bare "unavailable" for every narrative
+        # claim, even though this estimate is standard crash-reconstruction
+        # practice, not a guess invented for this codebase. 0.12s is a
+        # typical passenger-vehicle crash-pulse duration from published
+        # crash-test data (same order of magnitude as the |t|<0.15s "impact
+        # phase" window already used elsewhere in this pipeline) -- an
+        # assumption, not a measurement, which is exactly why
+        # impact_force_is_estimated stays True here; reconstruct_from_input()
+        # overwrites both fields with the real telemetry-derived value AND
+        # sets impact_force_is_estimated=False when Pathway 1 data exists.
+        ASSUMED_CRASH_PULSE_DURATION_S = 0.12
+        delta_v_ms = result.delta_v_kmh / MS_TO_KMH
+        result.impact_force_magnitude_n = round(m1 * delta_v_ms / ASSUMED_CRASH_PULSE_DURATION_S, 0)
+        result.impact_force_is_estimated = True
+
         stated_vs_computed_delta = abs(result.stated_speed_v1_kmh - result.computed_speed_v1_kmh)
         result.stated_vs_computed_delta_kmh = round(stated_vs_computed_delta, 1)
         severity = velocity_fraud_severity(stated_vs_computed_delta)
@@ -508,6 +573,7 @@ class CrashReconstructionEngine:
  
             if physics_input.impact_force_magnitude_n > 0:
                 result.impact_force_magnitude_n = physics_input.impact_force_magnitude_n
+                result.impact_force_is_estimated = False
  
             if physics_input.telemetry_delta_v_ms > 0:
                 telemetry_speed_kmh = round(

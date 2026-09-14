@@ -5,11 +5,14 @@ import AnalystLayout from "@/layouts/AnalystLayout";
 import { checkCoverage, getMemberPolicies, createClaim, submitMemberClaim, assessNarrative, ensureOllamaReady, uploadDocument, searchMembers, ExtractedIntakeFacts, MemberSearchResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Calendar } from "@/components/ui/calendar";
 import { format } from "date-fns";
+import { useSpeechToText } from "@/hooks/useSpeechToText";
+import { findSimilarRoads } from "@/lib/kenyaRoads";
 
 // --- DYNAMIC RESPONSE VARIATIONS ---
 const RESPONSES = {
@@ -65,22 +68,22 @@ const RESPONSES = {
     "In a few words, tell me what happened during the incident."
   ],
   ANALYZING_COVERAGE: [
-    "Analyzing your policy rules and verifying driver authority... 🛡️",
-    "Checking your policy limits and coverage eligibility... 🔍",
-    "Validating incident data against your active policy... ⚙️",
-    "Running a real-time coverage verification. One moment... 🤖",
-    "Cross-referencing your claim details with our underwriting rules... 📋"
+    "Analyzing your policy rules and verifying driver authority...",
+    "Checking your policy limits and coverage eligibility...",
+    "Validating incident data against your active policy...",
+    "Running a real-time coverage verification. One moment...",
+    "Cross-referencing your claim details with our underwriting rules..."
   ],
   FETCHING_POLICY: [
-    "Syncing policy IDs for claim registration... 📂",
-    "Retrieving your policy details from the secure vault... 🔐",
-    "Connecting to the policy management system... 🌐",
+    "Syncing policy IDs for claim registration...",
+    "Retrieving your policy details from the secure vault...",
+    "Connecting to the policy management system...",
     "Fetching your specific policy parameters for this claim...",
     "Accessing your insurance records to finalize the setup..."
   ],
   CREATING_CLAIM: [
-    "Registering claim and assigning field assessor... ⏳",
-    "Creating your official claim record in the system... ✍️",
+    "Registering claim and assigning field assessor...",
+    "Creating your official claim record in the system...",
     "Finalizing claim registration and notifying our assessment team...",
     "Generating your unique claim ID and dispatching an assessor...",
     "Submitting your details to the claims department. Please wait..."
@@ -93,9 +96,9 @@ const RESPONSES = {
     "Please type a full description of the events leading up to the damage:"
   ],
   ANALYZING_NARRATIVE: [
-    "Let me make sure I've got the full picture... 🤔",
-    "Reviewing what you've told me so far... 🔍",
-    "One moment, checking if I have enough detail for the assessor... 🧠",
+    "Let me make sure I've got the full picture...",
+    "Reviewing what you've told me so far...",
+    "One moment, checking if I have enough detail for the assessor...",
     "Just double-checking your account for completeness...",
   ],
   ASK_THIRD_PARTY: [
@@ -109,6 +112,10 @@ const RESPONSES = {
   ASK_THIRD_PARTY_FLED: [
     "Did the other party leave the scene before you could exchange details?",
     "Was the other driver still there when you exchanged information, or did they leave?",
+  ],
+  ASK_OTHER_VEHICLE_POSITION: [
+    "Where was the other vehicle in relation to yours at the moment of impact?",
+    "To help us accurately reconstruct the accident, where was the other vehicle positioned when it hit you?",
   ],
   ASK_POLICE: [
     "Was this incident reported to the police?",
@@ -149,8 +156,8 @@ const RESPONSES = {
     "To finish, kindly upload any photos you have of the scene and damage."
   ],
   SUBMITTING: [
-    "Uploading evidence and analyzing submission... 🚀",
-    "Transmitting your claim file to the headquarters... 📡",
+    "Uploading evidence and analyzing submission...",
+    "Transmitting your claim file to the headquarters...",
     "Finalizing your submission and archiving the evidence...",
     "Syncing your photos and narrative with the claim record...",
     "Processing your final claim report. This won't take long..."
@@ -187,6 +194,27 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
   const [step, setStep] = useState("START");
   const [inputValue, setInputValue] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow the input box to fit whatever's typed (up to a cap) --
+  // re-runs on every inputValue change, including when it's cleared
+  // programmatically (after send, or a suggestion-chip click), not just
+  // on user keystrokes, so the box always snaps back to one line then too.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [inputValue]);
+
+  // Lets the claimant talk instead of type for any free-text question --
+  // narrative, driver name, location, witness/injury details, all funnel
+  // through the same input bar, so one mic button here covers every step.
+  const speech = useSpeechToText({
+    onTranscript: (finalText) => {
+      setInputValue((prev) => (prev.trim() ? `${prev.trim()} ${finalText}` : finalText));
+    },
+  });
 
   // const [formData, setFormData] = useState({
   //   member_id: memberId,
@@ -218,6 +246,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
     third_party_involved: "",
     third_party_details: "",
     third_party_fled: "",
+    other_vehicle_position: "",
     police_reported: "",
     police_ob_number: "",
     witnesses_present: "",
@@ -644,6 +673,30 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
   const handleThirdPartyFledSelect = async (fled: boolean) => {
     addUserMessage(fled ? "Yes, they left the scene" : "No, we exchanged details");
     updateForm({ third_party_fled: fled ? "Yes" : "No" });
+    askOtherVehiclePosition();
+  };
+
+  // Asked directly rather than left for the physics engine to guess from
+  // narrative wording (or default to a generic layout) -- the claimant is
+  // the one person who actually knows where the other vehicle was, so
+  // asking them here means the accident reconstruction can match what they
+  // described instead of contradicting it.
+  const askOtherVehiclePosition = async () => {
+    setStep("ASK_OTHER_VEHICLE_POSITION");
+    await addBotMessage(getRand(RESPONSES.ASK_OTHER_VEHICLE_POSITION),
+      <div className="flex flex-wrap gap-2 mt-3">
+        <Button variant="secondary" className="rounded-full font-bold" onClick={() => handleOtherVehiclePositionSelect("behind me (rear-end)", "Behind me")}>Behind me</Button>
+        <Button variant="secondary" className="rounded-full font-bold" onClick={() => handleOtherVehiclePositionSelect("in front of me / oncoming (head-on)", "In front of me / oncoming")}>In front of me / oncoming</Button>
+        <Button variant="secondary" className="rounded-full font-bold" onClick={() => handleOtherVehiclePositionSelect("to my left side", "To my left side")}>To my left side</Button>
+        <Button variant="secondary" className="rounded-full font-bold" onClick={() => handleOtherVehiclePositionSelect("to my right side", "To my right side")}>To my right side</Button>
+        <Button variant="outline" className="rounded-full font-bold" onClick={() => handleOtherVehiclePositionSelect("not sure", "I'm not sure")}>I'm not sure</Button>
+      </div>
+    );
+  };
+
+  const handleOtherVehiclePositionSelect = async (value: string, displayLabel: string) => {
+    addUserMessage(displayLabel);
+    updateForm({ other_vehicle_position: value });
     proceedToPolice();
   };
 
@@ -704,7 +757,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
     setPoliceAbstract(null);
     setStep("PROCESSING");
     setUploadingAbstract(true);
-    await addBotMessage(getRand(["Reading the document... 🔍", "Extracting details from the abstract... 🔎"]));
+    await addBotMessage(getRand(["Reading the document...","Extracting details from the abstract..."]));
     try {
       const res = await uploadDocument({
         claimId: formDataRef.current.claim_id,
@@ -787,8 +840,22 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
     }
   };
 
+  // ASK_THIRD_PARTY / ASK_THIRD_PARTY_FLED / ASK_POLICE / ASK_WITNESSES /
+  // ASK_INJURIES only ever advanced via their Yes/No buttons -- typing a
+  // free-text answer at any of those steps (e.g. "I'm not sure") matched no
+  // branch in handleSend below and the bot just went silent. This parses a
+  // typed answer the same way a button click would; genuinely ambiguous
+  // text ("I don't know") re-asks with the buttons rather than guessing.
+  const parseYesNo = (text: string): boolean | null => {
+    const t = text.trim().toLowerCase();
+    if (/^(y|yes|yeah|yep|correct|true|affirmative)\b/.test(t) || /\byes\b/.test(t)) return true;
+    if (/^(n|no|nope|negative|false)\b/.test(t) || /\bno\b/.test(t)) return false;
+    return null;
+  };
+
   const handleSend = async () => {
     if (!inputValue) return;
+    if (speech.listening) speech.stop();
     const val = inputValue;
     setInputValue("");
     addUserMessage(val);
@@ -858,6 +925,70 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
           ? "Last step. If the caller has emailed or sent photos you have on hand, you can attach them now — otherwise skip ahead, the assessor will capture photos during the on-site inspection."
           : getRand(RESPONSES.ASK_PHOTOS)
       );
+    } else if (step === "ASK_THIRD_PARTY") {
+      const yn = parseYesNo(val);
+      if (yn === true) {
+        updateForm({ third_party_involved: "Yes" });
+        setStep("ASK_THIRD_PARTY_DETAILS");
+        await addBotMessage(getRand(RESPONSES.ASK_THIRD_PARTY_DETAILS));
+      } else if (yn === false) {
+        updateForm({ third_party_involved: "No", third_party_details: "N/A", third_party_fled: "N/A" });
+        proceedToPolice();
+      } else {
+        await addBotMessage("No worries if you're not sure — could you tap one of the options below, or type \"yes\" or \"no\"?");
+        askThirdParty();
+      }
+    } else if (step === "ASK_THIRD_PARTY_FLED") {
+      const yn = parseYesNo(val);
+      if (yn !== null) {
+        updateForm({ third_party_fled: yn ? "Yes" : "No" });
+        askOtherVehiclePosition();
+      } else {
+        await addBotMessage("Could you tap one of the options below, or type \"yes\" or \"no\"?");
+        askThirdPartyFled();
+      }
+    } else if (step === "ASK_OTHER_VEHICLE_POSITION") {
+      updateForm({ other_vehicle_position: val });
+      proceedToPolice();
+    } else if (step === "ASK_POLICE") {
+      const yn = parseYesNo(val);
+      if (yn === true) {
+        updateForm({ police_reported: "Yes" });
+        askPoliceAbstractUpload();
+      } else if (yn === false) {
+        updateForm({ police_reported: "No", police_ob_number: "N/A" });
+        proceedToWitnesses();
+      } else {
+        await addBotMessage("No worries if you're not sure — could you tap one of the options below, or type \"yes\" or \"no\"?");
+        askPolice();
+      }
+    } else if (step === "ASK_WITNESSES") {
+      const yn = parseYesNo(val);
+      if (yn === true) {
+        updateForm({ witnesses_present: "Yes" });
+        setStep("ASK_WITNESS_DETAILS");
+        await addBotMessage(getRand(RESPONSES.ASK_WITNESS_DETAILS));
+      } else if (yn === false) {
+        updateForm({ witnesses_present: "No", witness_details: "N/A" });
+        proceedToInjuries();
+      } else {
+        await addBotMessage("No worries if you're not sure — could you tap one of the options below, or type \"yes\" or \"no\"?");
+        askWitnesses();
+      }
+    } else if (step === "ASK_INJURIES") {
+      const yn = parseYesNo(val);
+      if (yn === true) {
+        updateForm({ injuries_reported: "Yes" });
+        setStep("ASK_INJURY_DETAILS");
+        await addBotMessage(getRand(RESPONSES.ASK_INJURY_DETAILS));
+      } else if (yn === false) {
+        updateForm({ injuries_reported: "No", injury_details: "N/A" });
+        setStep("ASK_DETAILED_COST");
+        await addBotMessage(getRand(RESPONSES.ASK_COST));
+      } else {
+        await addBotMessage("No worries if you're not sure — could you tap one of the options below, or type \"yes\" or \"no\"?");
+        askInjuries();
+      }
     }
   };
 
@@ -901,7 +1032,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
           </div>
         );
       } else {
-        await addBotMessage(`❌ Coverage Denied`,
+        await addBotMessage(`Coverage Denied`,
           <div className="mt-2 bg-destructive/5 border border-destructive/20 rounded-lg p-3 text-xs text-destructive">
             <p className="font-bold mb-2">{result.message}</p>
           </div>
@@ -993,7 +1124,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
         <div className="grid grid-cols-2 gap-2 mt-2">
             {selectedPhotos.map((f, i) => (
                 <div key={i} className="text-[9px] bg-white/10 p-1 rounded border border-white/20 overflow-hidden text-ellipsis whitespace-nowrap">
-                   📸 {f.name}
+                   {f.name}
                 </div>
             ))}
         </div>
@@ -1020,6 +1151,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
         third_party_involved: formData.third_party_involved,
         third_party_details: formData.third_party_details,
         third_party_fled: formData.third_party_fled,
+        other_vehicle_position: formData.other_vehicle_position,
         police_reported: formData.police_reported,
         police_ob_number: formData.police_ob_number,
         witnesses_present: formData.witnesses_present,
@@ -1086,10 +1218,40 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                   <label className="text-[10px] text-muted-foreground mb-1 block">
                     Damage photos {analystMode ? "(optional — assessor will capture these on-site)" : ""}
                   </label>
-                  <Input type="file" multiple accept="image/*" className="mb-4" onChange={(e) => setPhotos(Array.from(e.target.files || []))} />
+                  <Input
+                    type="file"
+                    multiple
+                    accept="image/*"
+                    className="mb-4"
+                    onChange={(e) => {
+                      const newFiles = Array.from(e.target.files || []);
+                      // Append, don't replace -- reopening the picker to add
+                      // more photos shouldn't silently discard ones already
+                      // chosen. Dedupe on name+size so re-picking the same
+                      // file twice doesn't double it up.
+                      setPhotos((prev) => {
+                        const existingKeys = new Set(prev.map((f) => `${f.name}:${f.size}`));
+                        const toAdd = newFiles.filter((f) => !existingKeys.has(`${f.name}:${f.size}`));
+                        return [...prev, ...toAdd];
+                      });
+                      e.target.value = "";
+                    }}
+                  />
                   {photos.length > 0 && (
                       <div className="grid grid-cols-4 gap-2 mb-4">
-                          {photos.map((f, i) => <div key={i} className="aspect-square bg-muted rounded border text-[8px] p-1 flex items-center justify-center text-center overflow-hidden">{f.name}</div>)}
+                          {photos.map((f, i) => (
+                            <div key={`${f.name}-${f.size}-${i}`} className="relative aspect-square bg-muted rounded border text-[8px] p-1 flex items-center justify-center text-center overflow-hidden">
+                              {f.name}
+                              <button
+                                type="button"
+                                onClick={() => setPhotos((prev) => prev.filter((_, pi) => pi !== i))}
+                                className="absolute -top-1.5 -right-1.5 size-4 rounded-full bg-destructive text-white flex items-center justify-center text-[9px] leading-none"
+                                title="Remove this photo"
+                              >
+                                <span className="material-symbols-outlined text-[11px]">close</span>
+                              </button>
+                            </div>
+                          ))}
                       </div>
                   )}
 
@@ -1098,7 +1260,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                     <div>
                       <label className="text-[10px] text-muted-foreground mb-1 block">National ID / Driving Licence photo</label>
                       <Input type="file" accept="image/*" className="text-xs" onChange={(e) => setIdDocument(e.target.files?.[0] || null)} />
-                      {idDocument && <p className="text-[10px] text-emerald-600 mt-1">✓ {idDocument.name}</p>}
+                      {idDocument && <p className="text-[10px] text-emerald-600 mt-1"> {idDocument.name}</p>}
                     </div>
                   </div>
 
@@ -1120,7 +1282,7 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                     disabled={uploadingAbstract}
                     onChange={(e) => setPoliceAbstract(e.target.files?.[0] || null)}
                   />
-                  {policeAbstract && <p className="text-[10px] text-emerald-600 mb-3">✓ {policeAbstract.name}</p>}
+                  {policeAbstract && <p className="text-[10px] text-emerald-600 mb-3"> {policeAbstract.name}</p>}
                   <div className="flex gap-2">
                     <Button
                       className="flex-1 bg-primary font-bold"
@@ -1185,18 +1347,84 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
         </ScrollArea>
 
         <div className="p-4 border-t bg-card">
-          <div className="max-w-2xl mx-auto flex gap-3">
-            <Input
-              className="flex-1 h-12"
-              placeholder="Type here..."
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              disabled={["ASK_TYPE", "ASK_DATE", "ASK_DRIVER", "ASK_PHOTOS", "ASK_POLICE_ABSTRACT_UPLOAD", "MEMBER_SEARCH", "FINISHED", "PROCESSING", "FINALIZING"].includes(step)}
-            />
-            <Button className="size-12 rounded-full" onClick={handleSend} disabled={!inputValue}>
-              <span className="material-symbols-outlined">send</span>
-            </Button>
+          <div className="max-w-2xl mx-auto">
+            {speech.listening && (
+              <p className="text-xs text-primary font-medium mb-1.5 flex items-center gap-1.5 animate-pulse">
+                <span className="material-symbols-outlined text-[14px]">graphic_eq</span>
+                Recording... tap the mic again when you're done
+              </p>
+            )}
+            {speech.transcribing && (
+              <p className="text-xs text-muted-foreground font-medium mb-1.5 flex items-center gap-1.5">
+                <span className="material-symbols-outlined text-[14px] animate-spin">progress_activity</span>
+                Transcribing...
+              </p>
+            )}
+            {speech.error && !speech.listening && !speech.transcribing && (
+              <p className="text-xs text-destructive font-medium mb-1.5">{speech.error}</p>
+            )}
+            {step === "ASK_LOCATION" && inputValue.trim().length >= 3 && (() => {
+              const suggestions = findSimilarRoads(inputValue);
+              if (suggestions.length === 0) return null;
+              return (
+                <div className="mb-2">
+                  <p className="text-[10px] font-bold uppercase text-muted-foreground mb-1">
+                    Did you mean one of these roads?
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {suggestions.map((road) => (
+                      <button
+                        key={road}
+                        type="button"
+                        onClick={() => setInputValue(road)}
+                        className="text-xs font-semibold px-3 py-1.5 rounded-full border border-primary/30 text-primary bg-primary/5 hover:bg-primary/10 transition-colors"
+                      >
+                        {road}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+            <div className="flex gap-3 items-end">
+              {(() => {
+                const inputDisabled = ["ASK_TYPE", "ASK_DATE", "ASK_DRIVER", "ASK_PHOTOS", "ASK_POLICE_ABSTRACT_UPLOAD", "MEMBER_SEARCH", "FINISHED", "PROCESSING", "FINALIZING"].includes(step);
+                return (
+                  <>
+                    <Textarea
+                      ref={inputRef}
+                      className="flex-1 min-h-12 max-h-40 resize-none py-3 overflow-y-auto"
+                      rows={1}
+                      placeholder="Type or tap the mic to talk..."
+                      value={inputValue}
+                      onChange={(e) => setInputValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSend();
+                        }
+                      }}
+                      disabled={inputDisabled}
+                    />
+                    {speech.supported && (
+                      <Button
+                        type="button"
+                        variant={speech.listening ? "default" : "outline"}
+                        className={`size-12 rounded-full shrink-0 ${speech.listening ? "bg-destructive hover:bg-destructive/90 text-destructive-foreground" : ""}`}
+                        onClick={() => (speech.listening ? speech.stop() : speech.start())}
+                        disabled={inputDisabled || speech.transcribing}
+                        title={speech.listening ? "Stop recording" : "Speak your answer"}
+                      >
+                        <span className="material-symbols-outlined">{speech.listening ? "stop" : "mic"}</span>
+                      </Button>
+                    )}
+                    <Button className="size-12 rounded-full shrink-0" onClick={handleSend} disabled={!inputValue}>
+                      <span className="material-symbols-outlined">send</span>
+                    </Button>
+                  </>
+                );
+              })()}
+            </div>
           </div>
         </div>
       </div>

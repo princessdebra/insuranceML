@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AdminLayout from "@/layouts/AdminLayout";
-import { getAdminClaims } from "@/lib/api";
+import { getAdminClaims, getAdminAnalyticsOverview, AdminAnalyticsOverview } from "@/lib/api";
+import OversightPanel from "@/components/OversightPanel";
+import LiveOperationsTable from "@/components/LiveOperationsTable";
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
@@ -15,6 +17,9 @@ export default function AdminDashboard() {
   const [sortOrder, setSortOrder] = useState("desc");
   const pageSize = 20;
 
+  const [overview, setOverview] = useState<AdminAnalyticsOverview | null>(null);
+  const [overviewLoading, setOverviewLoading] = useState(true);
+
   useEffect(() => {
     const adminId = localStorage.getItem("adminId");
     if (!adminId) {
@@ -22,6 +27,15 @@ export default function AdminDashboard() {
       return;
     }
   }, [navigate]);
+
+  useEffect(() => {
+    getAdminAnalyticsOverview(30)
+      .then((d) => {
+        setOverview(d);
+        setOverviewLoading(false);
+      })
+      .catch(() => setOverviewLoading(false));
+  }, []);
 
   useEffect(() => {
     setLoading(true);
@@ -71,26 +85,6 @@ export default function AdminDashboard() {
     return 0;
   });
 
-  const highRiskCount = claims.filter((c: any) => {
-    const risk = c.final_assessment?.risk_level || c.risk_level;
-    return risk === "high" || risk === "critical";
-  }).length;
-
-  const investigateCount = claims.filter((c: any) => {
-    const decision = c.final_assessment?.decision || c.decision;
-    return decision === "INVESTIGATE" || decision === "INVESTIGATE_FURTHER";
-  }).length;
-
-  const avgRisk = claims.length
-    ? Math.round(
-        claims.reduce(
-          (sum: number, c: any) =>
-            sum + (c.final_assessment?.fraud_risk_score ?? c.fraud_risk_score ?? 0),
-          0
-        ) / claims.length
-      )
-    : 0;
-
   const getRiskColor = (level: string) => {
     switch (level?.toLowerCase()) {
       case "high":
@@ -109,53 +103,52 @@ export default function AdminDashboard() {
     switch (decision) {
       case "APPROVE":
       case "APPROVE_CLAIM":
-        return "🟢";
+        return"";
       case "INVESTIGATE":
       case "INVESTIGATE_FURTHER":
-        return "🟡";
+        return"";
       case "REJECT":
       case "DECLINE_CLAIM":
-        return "🔴";
+        return"";
       default:
-        return "⚪";
+        return"";
     }
   };
+
+  const adminId = localStorage.getItem("adminId") || "Admin";
 
   return (
     <AdminLayout>
       <div className="p-8 max-w-7xl mx-auto w-full">
-        <div className="mb-8">
-          <h2 className="text-3xl font-bold text-foreground">Claims Intelligence Dashboard</h2>
-          <p className="text-muted-foreground mt-1">AI-powered fraud detection and claims analysis overview.</p>
+        <div className="mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4 rounded-3xl bg-gradient-to-br from-primary/10 via-primary/5 to-transparent border border-primary/10 px-7 py-6">
+          <div>
+            <h2 className="text-3xl font-black text-foreground">Welcome back, <span className="text-primary">{adminId}</span></h2>
+            <p className="text-muted-foreground mt-1 text-sm">Here's what's happening across your assessment network.</p>
+          </div>
+          <div className="flex items-center gap-2 bg-card border border-border rounded-full px-4 py-2 shadow-sm shrink-0">
+            <span className="material-symbols-outlined text-[18px] text-primary">calendar_today</span>
+            <span className="text-sm font-semibold text-foreground">
+              {new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+            </span>
+          </div>
         </div>
 
-        {/* Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
-          {[
-            { icon: "folder_open", label: "Total Claims", value: String(totalClaims), iconColor: "text-primary", iconBg: "bg-primary/10" },
-            { icon: "warning", label: "Needs Investigation", value: String(investigateCount), iconColor: "text-amber-500", iconBg: "bg-amber-500/10" },
-            { icon: "gpp_bad", label: "High Risk Claims", value: String(highRiskCount), iconColor: "text-destructive", iconBg: "bg-destructive/10" },
-            { icon: "analytics", label: "Avg Risk Score", value: `${avgRisk}`, iconColor: "text-blue-500", iconBg: "bg-blue-500/10", suffix: "/100" },
-          ].map((stat) => (
-            <div key={stat.label} className="bg-card p-6 rounded-xl border border-border shadow-sm">
-              <div className="flex items-center justify-between mb-4">
-                <span className={`material-symbols-outlined ${stat.iconColor} ${stat.iconBg} p-2 rounded-lg`}>{stat.icon}</span>
-              </div>
-              <p className="text-sm font-medium text-muted-foreground">{stat.label}</p>
-              <p className="text-3xl font-bold mt-1 text-foreground">{stat.value}{stat.suffix && <span className="text-sm font-normal text-muted-foreground ml-1">{stat.suffix}</span>}</p>
-            </div>
-          ))}
-        </div>
+        <OversightPanel data={overview} loading={overviewLoading} />
+
+        <LiveOperationsTable />
 
         {/* Filters */}
-        <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
+        <div className="bg-card rounded-3xl border border-border shadow-sm overflow-hidden">
           <div className="px-6 py-5 border-b border-border flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <h3 className="text-lg font-bold text-foreground">All Claims</h3>
+            <h3 className="text-lg font-black text-foreground flex items-center gap-2">
+              <span className="material-symbols-outlined text-primary bg-primary/10 p-1.5 rounded-lg text-[20px]">folder_open</span>
+              All Claims
+            </h3>
             <div className="flex items-center gap-2 flex-wrap">
               <select
                 value={riskFilter}
                 onChange={(e) => { setRiskFilter(e.target.value); setPage(1); }}
-                className="px-3 py-2 border border-border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
+                className="px-3 py-2 border border-border rounded-full text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
               >
                 <option value="">All Risks</option>
                 <option value="low">Low Risk</option>
@@ -166,7 +159,7 @@ export default function AdminDashboard() {
               <select
                 value={decisionFilter}
                 onChange={(e) => { setDecisionFilter(e.target.value); setPage(1); }}
-                className="px-3 py-2 border border-border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
+                className="px-3 py-2 border border-border rounded-full text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
               >
                 <option value="">All Decisions</option>
                 <option value="APPROVE_CLAIM">Approve</option>
@@ -177,7 +170,7 @@ export default function AdminDashboard() {
               <select
                 value={verdictFilter}
                 onChange={(e) => { setVerdictFilter(e.target.value); setPage(1); }}
-                className="px-3 py-2 border border-border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
+                className="px-3 py-2 border border-border rounded-full text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
               >
                 <option value="">All Verdicts</option>
                 <option value="CONSISTENT">Consistent</option>
@@ -188,7 +181,7 @@ export default function AdminDashboard() {
               <select
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value)}
-                className="px-3 py-2 border border-border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
+                className="px-3 py-2 border border-border rounded-full text-sm bg-background text-foreground focus:ring-2 focus:ring-primary/50 outline-none"
               >
                 <option value="created_at">Date</option>
                 <option value="fraud_risk_score">Risk Score</option>
@@ -196,7 +189,7 @@ export default function AdminDashboard() {
               </select>
               <button
                 onClick={() => setSortOrder(sortOrder === "desc" ? "asc" : "desc")}
-                className="px-3 py-2 border border-border rounded-lg text-sm font-medium flex items-center gap-1 hover:bg-muted transition-colors text-foreground"
+                className="px-3 py-2 border border-border rounded-full text-sm font-medium flex items-center gap-1 hover:bg-muted transition-colors text-foreground"
               >
                 <span className="material-symbols-outlined text-[18px]">{sortOrder === "desc" ? "arrow_downward" : "arrow_upward"}</span>
                 {sortOrder === "desc" ? "Newest" : "Oldest"}
@@ -210,7 +203,7 @@ export default function AdminDashboard() {
             </div>
           ) : (
             <>
-              <div className="divide-y divide-border">
+              <div className="p-4 space-y-3">
                 {sortedClaims.map((claim: any) => {
                   const riskLevel = claim.final_assessment?.risk_level || claim.risk_level;
                   const fraudScore = claim.final_assessment?.fraud_risk_score ?? claim.fraud_risk_score ?? 0;
@@ -219,7 +212,7 @@ export default function AdminDashboard() {
                   const location = claim.location || claim.member_submission?.location || "N/A";
 
                   return (
-                    <div key={claim.claim_id} className="px-6 py-4 hover:bg-muted/50 transition-colors flex flex-col sm:flex-row sm:items-center gap-4">
+                    <div key={claim.claim_id} className="px-5 py-4 rounded-2xl border border-border bg-background hover:border-primary/30 hover:shadow-sm transition-all flex flex-col sm:flex-row sm:items-center gap-4">
                       {/* Left: Key info */}
                       <div className="flex-1 grid grid-cols-2 sm:grid-cols-4 gap-3">
                         <div>
@@ -264,7 +257,7 @@ export default function AdminDashboard() {
                       {/* Right: Action */}
                       <Link
                         to={`/admin/claim/${claim.claim_id}`}
-                        className="text-xs font-bold bg-primary text-primary-foreground px-4 py-2 rounded-lg hover:bg-primary/90 transition-all text-center flex-shrink-0"
+                        className="text-xs font-bold bg-primary text-primary-foreground px-4 py-2 rounded-full hover:bg-primary/90 transition-all text-center flex-shrink-0"
                       >
                         View Report
                       </Link>
@@ -288,14 +281,14 @@ export default function AdminDashboard() {
                   <button
                     disabled={!hasPrevious}
                     onClick={() => setPage(page - 1)}
-                    className="px-3 py-1.5 border border-border rounded-lg text-sm font-medium disabled:opacity-40 hover:bg-muted transition-colors text-foreground"
+                    className="px-3 py-1.5 border border-border rounded-full text-sm font-medium disabled:opacity-40 hover:bg-muted transition-colors text-foreground"
                   >
                     Previous
                   </button>
                   <button
                     disabled={!hasNext}
                     onClick={() => setPage(page + 1)}
-                    className="px-3 py-1.5 border border-border rounded-lg text-sm font-medium disabled:opacity-40 hover:bg-muted transition-colors text-foreground"
+                    className="px-3 py-1.5 border border-border rounded-full text-sm font-medium disabled:opacity-40 hover:bg-muted transition-colors text-foreground"
                   >
                     Next
                   </button>

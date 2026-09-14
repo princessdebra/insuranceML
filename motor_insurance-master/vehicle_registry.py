@@ -536,11 +536,51 @@ FALLBACK_PROFILES: dict[str, VehicleProfile] = {
         center_of_gravity_height_ratio=0.68,
         dimension_confidence=0.45, stiffness_confidence=0.3
     ),
+    # Synthetic "vehicle" representing a rigid fixed object (barrier,
+    # concrete pillar, wall) for single-vehicle-vs-object reconstruction --
+    # see CrashReconstructionEngine.reconstruct_single_vehicle_impact() in
+    # physics_engine.py. Mass is set high enough (50 tonnes) that momentum
+    # conservation treats it as effectively immovable, matching standard
+    # barrier-equivalent-speed crash reconstruction convention, without a
+    # special-cased zero-mass/infinite-mass branch in the momentum math.
+    # crumple_A/B are irrelevant here (a barrier's own deformation isn't
+    # modeled, only the vehicle's crush against it) and set to 0 rather than
+    # a guessed value.
+    "fixed_object": VehicleProfile(
+        make="N/A", model="Fixed Object (barrier/pillar/wall)", body_type="fixed_object",
+        kerb_weight_kg=50000, gross_weight_kg=50000, typical_passenger_load_kg=0,
+        length_mm=3000, width_mm=3000, height_mm=3000,
+        has_abs=False, airbag_count=0, crumple_A=0.0, crumple_B=0.0,
+        dimension_confidence=1.0, stiffness_confidence=1.0,
+    ),
 }
 
 
 def _normalise_key(make: str, model: str) -> str:
     return f"{make}_{model}".lower().replace(" ", "_").replace("-", "_")
+
+
+def _profile_from_db_spec(spec: dict) -> VehicleProfile:
+    """Builds a VehicleProfile from RegistryAdapter.get_vehicle_spec()'s
+    returned dict -- same dataclass every caller already expects, just
+    sourced from the `vehicle_registry` DB table instead of the hardcoded
+    dict below. Fields the DB table doesn't carry (front/rear overhang,
+    ground clearance, ESC, suspension type, drag coefficient, rolling
+    resistance, zones) keep VehicleProfile's own defaults rather than being
+    guessed."""
+    return VehicleProfile(
+        make=spec["make"], model=spec["model"], body_type=spec["body_type"],
+        kerb_weight_kg=spec["kerb_weight_kg"], gross_weight_kg=spec.get("gross_weight_kg", spec["kerb_weight_kg"]),
+        typical_passenger_load_kg=spec["pax_load_kg"],
+        length_mm=spec["length_mm"] or 4200.0, width_mm=spec["width_mm"] or 1700.0,
+        height_mm=spec["height_mm"] or 1450.0, wheelbase_mm=spec["wheelbase_mm"] or 2550.0,
+        has_abs=spec["has_abs"], airbag_count=spec["airbag_count"], drive_type=spec["drive_type"] or "2WD",
+        crumple_zone=spec["crumple_zone"] or "standard",
+        crumple_A=spec["crumple_A"], crumple_B=spec["crumple_B"],
+        center_of_gravity_height_ratio=spec["cog_height_ratio"],
+        data_source=f"db_vehicle_registry:{spec['data_source']}",
+        dimension_confidence=spec["confidence"], stiffness_confidence=spec["confidence"],
+    )
 
 
 def get_vehicle_profile(
@@ -549,6 +589,21 @@ def get_vehicle_profile(
     body_type: Optional[str] = None
 ) -> tuple[VehicleProfile, str]:
     key = _normalise_key(make, model)
+
+    # The `vehicle_registry` DB table (seeded separately, 27 vehicles) is
+    # checked first -- it's the intended source of truth (registry_adapter.py
+    # was built specifically to read it) but was never actually wired into
+    # this lookup before now. Falls through to the hardcoded Python dict
+    # below on any DB error (missing table, no file, etc.) so this can't
+    # newly break reconstruction if the DB isn't reachable for some reason.
+    try:
+        from registry_adapter import RegistryAdapter
+        spec = RegistryAdapter().get_vehicle_spec(key, body_type)
+        if spec and spec.get("lookup_method") in ("exact_match", "partial_match"):
+            logger.info(f"DB registry hit: {spec['registry_key']} ({spec['lookup_method']}, confidence={spec['confidence']})")
+            return _profile_from_db_spec(spec), f"db_{spec['lookup_method']}"
+    except Exception as e:
+        logger.warning(f"DB vehicle registry lookup failed for {key}, falling back to hardcoded registry: {e}")
 
     if key in VEHICLE_REGISTRY:
         logger.info(f"Registry hit: {key} (confidence={VEHICLE_REGISTRY[key].confidence})")

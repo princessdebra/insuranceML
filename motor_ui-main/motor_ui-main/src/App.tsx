@@ -14,7 +14,9 @@ import MemberClaimDetails from "./pages/MemberClaimDetails";
 import AnalystLogin from "./pages/AnalystLogin";
 import AnalystDashboard from "./pages/AnalystDashboard";
 import AnalystClaimIntake from "./pages/AnalystClaimIntake";
+import AnalystClaimFormUpload from "./pages/AnalystClaimFormUpload";
 import AnalystClaimPhotos from "./pages/AnalystClaimPhotos";
+import AnalystClaimReport from "./pages/AnalystClaimReport";
 import AssessorLogin from "./pages/AssessorLogin";
 import AssessorDashboard from "./pages/AssessorDashboard";
 import AssessorClaimDetails from "./pages/AssessorClaimDetails";
@@ -22,6 +24,8 @@ import StartInspection from "./pages/StartInspection";
 import RepairShopSubmission from "./pages/RepairShopSubmission";
 import AdminLogin from "./pages/AdminLogin";
 import AdminDashboard from "./pages/AdminDashboard";
+import AdminAIIntelligence from "./pages/AdminAIIntelligence";
+import AdminSettings from "./pages/AdminSettings";
 import AdminClaimReport from "./pages/AdminClaimReport";
 import NotFound from "./pages/NotFound";
 import ClaimChatbot from "./pages/ClaimChatbot";
@@ -49,7 +53,9 @@ const App = () => (
           <Route path="/analyst/login" element={<AnalystLogin />} />
           <Route path="/analyst/dashboard" element={<AnalystDashboard />} />
           <Route path="/analyst/file-claim" element={<AnalystClaimIntake />} />
+          <Route path="/analyst/upload-claim-form" element={<AnalystClaimFormUpload />} />
           <Route path="/analyst/claim/:claimId/photos" element={<AnalystClaimPhotos />} />
+          <Route path="/analyst/claim/:claimId" element={<AnalystClaimReport />} />
           <Route path="/assessor/login" element={<AssessorLogin />} />
           <Route path="/assessor/dashboard" element={<AssessorDashboard />} />
           <Route path="/assessor/claim/:claimId" element={<AssessorClaimDetails />} />
@@ -58,6 +64,8 @@ const App = () => (
           <Route path="/repair-shop/:claimId" element={<RepairShopChatbot />} />
           <Route path="/admin/login" element={<AdminLogin />} />
           <Route path="/admin/dashboard" element={<AdminDashboard />} />
+          <Route path="/admin/ai-intelligence" element={<AdminAIIntelligence />} />
+          <Route path="/admin/settings" element={<AdminSettings />} />
           <Route path="/admin/claim/:claimId" element={<AdminClaimReport />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
