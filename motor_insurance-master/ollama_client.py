@@ -1,85 +1,44 @@
 """
-Thin client for a self-hosted Ollama instance, used in place of the Gemini API.
+Client used across this app for every text/vision LLM call.
 
-Configure via env vars:
-    OLLAMA_BASE_URL  (default: http://127.0.0.1:11434)
-    OLLAMA_MODEL     (default: claims-advisory-v1 -- a LoRA fine-tune of
-                     qwen2.5:7b trained on the synthetic claims dataset to
-                     produce the Xenova AI Advisory JSON schema reliably;
-                     see nlp/scripts/export_to_ollama.md for how it was built.
-                     Set OLLAMA_MODEL=qwen2.5:7b to fall back to the base
-                     model if needed.)
+Despite the filename (kept as-is deliberately -- see below), this no longer
+talks to a self-hosted Ollama instance. It now proxies every call to the
+XeAI Gateway (xeai_gateway_client.py) -- gpt-oss-20b for text, qwen2.5-vl-7b
+for vision -- per the shared-server migration: everyone on the devserver is
+standardizing on the gateway instead of each project running its own model
+on the shared GPU.
+
+The public interface (generate(), generate_json(), OllamaError) is kept
+byte-for-byte identical to the old Ollama-backed version on purpose: every
+existing call site across this codebase (service.py, agents.py,
+part_identifier.py, document_ocr.py) calls these two functions and nothing
+else, so rewriting the internals here means the whole app moves to the
+gateway without touching 20+ call sites individually -- lower risk than a
+mechanical find-and-replace across every file, and the same reasoning the
+`gpu_retries` backoff logic below inherits from the old implementation. The
+module keeps its old name for the same reason: a rename would touch every
+importer for zero functional benefit. New code should prefer calling
+xeai_gateway_client.py directly.
+
+`model` is still accepted for backward compatibility but no longer does
+anything -- the gateway has exactly one text model and one vision model, so
+there's no longer a choice to make; which one gets used is decided by
+whether `images` is passed, not by this argument.
 """
 
-import base64
 import json
 import logging
-import os
-import random
-import time
+from typing import List, Optional
 
-import requests
+import xeai_gateway_client as gateway
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "claims-advisory-v1")
-
-# Lower temperature + a repeat penalty measurably cut down on the degenerate
-# token-looping (e.g. "l_2_im_2_logic-" repeated forever) seen from gemma4:26b
-# on long/complex prompts — structured-output calls want determinism, not
-# creativity. num_predict is set generously so multi-field JSON schemas don't
-# get cut off mid-object (seen as "Expecting ',' delimiter" at the tail end).
-DEFAULT_OPTIONS = {"temperature": 0.2, "repeat_penalty": 1.3, "num_predict": 1024}
-
 
 class OllamaError(Exception):
-    """Raised when Ollama is unreachable or fails to produce usable output."""
-
-
-def _post_generate(
-    prompt: str,
-    model: str,
-    json_mode: bool,
-    timeout: int,
-    num_gpu: int = None,
-    images_b64: list = None,
-    system: str = None,
-    num_predict: int = None,
-) -> str:
-    options = dict(DEFAULT_OPTIONS)
-    if num_gpu is not None:
-        options["num_gpu"] = num_gpu
-    if num_predict is not None:
-        options["num_predict"] = num_predict
-
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": options,
-        # gemma4:26b supports a "thinking" mode that burns num_predict on
-        # hidden reasoning before the actual answer — for structured JSON
-        # output we want the answer directly, not chain-of-thought eating
-        # the token budget and truncating the response.
-        "think": False,
-    }
-    if json_mode:
-        payload["format"] = "json"
-    if images_b64:
-        payload["images"] = images_b64
-    if system is not None:
-        # Only meaningful for models whose Modelfile TEMPLATE actually
-        # branches on {{ if .System }} (e.g. claims-advisory-v1 -- see
-        # nlp/scripts/export_to_ollama.md). Without this, /api/generate's
-        # bare prompt renders as a plain user turn with no system message,
-        # which does NOT match how claims-advisory-v1 was fine-tuned
-        # (system + user, both required) and produces off-schema output.
-        payload["system"] = system
-
-    resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()["response"]
+    """Raised when the gateway is unreachable or fails to produce usable
+    output. Name kept for backward compatibility -- every existing except
+    clause across the codebase catches this specific exception type."""
 
 
 def generate(
@@ -91,57 +50,71 @@ def generate(
     gpu_retries: int = 4,
     system: str = None,
     num_predict: int = None,
+    reasoning_effort: str = "low",
 ) -> str:
     """
-    Call Ollama's /api/generate and return the raw text response.
+    Call the XeAI Gateway and return the raw text response.
 
-    `images`, if given, is a list of raw image bytes — passed to a
-    vision-capable model (e.g. gemma4:26b) the same way Gemini's
-    generate_content([prompt, image]) took a PIL image.
+    `images`, if given, is a list of raw image bytes -- routes this call to
+    the vision model (qwen2.5-vl-7b) instead of the text model, the same
+    role this played when the underlying backend was a single vision-capable
+    Ollama model (gemma4:26b) handling both text and vision. The gateway
+    accepts max 2 images per call; see xeai_gateway_client.generate_vision.
 
-    `system`, if given, is sent as a separate system message (see
-    claims-advisory-v1's usage in service.py's AI Advisory consolidation --
-    it was fine-tuned on system+user pairs, not a single flattened prompt).
+    `system`, if given, is sent as a proper system message.
 
-    `num_predict`, if given, overrides DEFAULT_OPTIONS' 1024-token cap for
-    this call -- needed for schemas with many fields/nested arrays (e.g.
-    the multi-page claim-form OCR extraction), which otherwise get cut off
-    mid-JSON-string (surfaces as a json.loads "Unterminated string" error,
-    not an HTTP failure, so it's easy to miss without checking the logs).
+    `num_predict`, if given, maps onto the gateway's max_tokens -- kept
+    under its old name so every existing call site (which was tuning this
+    for Ollama's multi-field JSON schemas that otherwise got cut off
+    mid-string) didn't need to change. Defaults to 1024 for the same reason
+    the old DEFAULT_OPTIONS did: most of this app's prompts return
+    multi-field JSON, and a short default cap was the actual root cause of
+    the old "Expecting ',' delimiter" truncation errors.
 
-    This is a shared, multi-tenant Ollama instance (a dev GPU other
-    developers also use) — capacity is limited, and the team is
-    standardized on one model, so we don't fall back to a different/smaller
-    model or force CPU-only inference (empirically, forcing num_gpu=0 on
-    gemma4:26b produces degenerate repeated-token garbage, not just slower
-    output — it's actively wrong, not just slow). Instead we retry on GPU
-    with backoff, since most failures here are transient contention from
-    other jobs on the shared GPU.
+    `reasoning_effort` controls gpt-oss-20b's thinking budget ("low"/
+    "medium"/"high") -- defaults to "low" since most calls in this app are
+    structured extraction/classification, matching the gateway guide's own
+    guidance for high-volume trivial tasks. Callers doing genuinely hard
+    reasoning (e.g. the AI Advisory consolidation) pass "high" explicitly.
+    Meaningless for vision calls (qwen2.5-vl-7b isn't a reasoning model) --
+    silently ignored there.
 
-    The service is not actually going down (checked directly: systemd unit,
-    6+ days continuous uptime, healthy on every check) -- the failures seen
-    in practice are transient connection resets mid-request from other
-    tenants' load, often on BOTH attempts within a couple of seconds of each
-    other. A flat 3s gap wasn't giving those enough room to clear, so this
-    backs off exponentially (with jitter, to avoid every concurrent request
-    retrying in lockstep) and tries more times before giving up.
+    `gpu_retries` is passed straight through to the gateway client's own
+    retry/backoff, which already handles the gateway's documented failure
+    modes (429 rate limit, 5xx with auto-failover between GPUs).
     """
+    # "high" reasoning effort means gpt-oss-20b spends materially more of
+    # its budget thinking before the visible answer -- confirmed live: a
+    # coverage-check call at reasoning_effort="high" with the old flat
+    # 1024-token default came back with genuinely empty content (all budget
+    # spent on reasoning, none left for the JSON answer) on every retry,
+    # not just occasionally. A vision call ignores reasoning_effort
+    # entirely, so this only raises the default for text calls that
+    # actually asked for it.
+    if num_predict is not None:
+        max_tokens = num_predict
+    elif reasoning_effort == "high" and not images:
+        max_tokens = 3072
+    else:
+        max_tokens = 1024
 
-    resolved_model = model or OLLAMA_MODEL
-    images_b64 = [base64.b64encode(img).decode() for img in images] if images else None
+    try:
+        if images:
+            return gateway.generate_vision(
+                prompt, images, max_tokens=max_tokens, json_mode=json_mode,
+                timeout=timeout, retries=gpu_retries,
+            )
 
-    last_error = None
-    for attempt in range(gpu_retries):
-        try:
-            return _post_generate(prompt, resolved_model, json_mode, timeout, images_b64=images_b64, system=system, num_predict=num_predict)
-        except (requests.RequestException, KeyError, ValueError) as e:
-            last_error = e
-            logger.warning(f"Ollama generate attempt {attempt + 1}/{gpu_retries} failed: {e}")
-            if attempt < gpu_retries - 1:
-                backoff = min(2 ** attempt, 10) + random.uniform(0, 1.5)
-                time.sleep(backoff)
-
-    raise OllamaError(f"Ollama request failed after {gpu_retries} attempts: {last_error}")
+        return gateway.generate_text(
+            prompt, system=system, max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+            json_mode=json_mode, timeout=timeout, retries=gpu_retries,
+        )
+    except gateway.GatewayError as e:
+        # Every existing call site across this codebase catches OllamaError
+        # specifically (agents.py, service.py, document_ocr.py) -- re-raise
+        # under that name so their error handling keeps working unchanged
+        # rather than letting a gateway.GatewayError propagate uncaught.
+        raise OllamaError(str(e)) from e
 
 
 def generate_json(
@@ -151,19 +124,32 @@ def generate_json(
     timeout: int = 90,
     images: list = None,
     system: str = None,
+    reasoning_effort: str = "low",
+    num_predict: int = None,
 ) -> dict:
     """
-    Call Ollama with format=json (forces syntactically valid JSON) and parse it.
-    Retries on malformed output since open models are less consistent than Gemini here.
+    Call the gateway with structured JSON output enabled and parse it.
+    Retries on malformed output -- kept even though the gateway's
+    response_format=json_object is far more reliable than Ollama's bare
+    format="json" ever was, since a retry here is cheap insurance against
+    the rare genuinely-malformed response.
+
+    `num_predict`, if given, overrides generate()'s own reasoning_effort-
+    based default -- most callers won't need this (the "high" effort default
+    of 3072 already covers it), but a schema with many fields/nested arrays
+    may need more.
     """
 
     last_error = None
     for attempt in range(retries + 1):
         try:
-            text = generate(prompt, model=model, json_mode=True, timeout=timeout, images=images, system=system)
+            text = generate(
+                prompt, model=model, json_mode=True, timeout=timeout, images=images,
+                system=system, reasoning_effort=reasoning_effort, num_predict=num_predict,
+            )
             return json.loads(text)
         except (OllamaError, json.JSONDecodeError) as e:
             last_error = e
-            logger.warning(f"Ollama JSON generation attempt {attempt + 1} failed: {e}")
+            logger.warning(f"Gateway JSON generation attempt {attempt + 1} failed: {e}")
 
-    raise OllamaError(f"Ollama failed to produce valid JSON after {retries + 1} attempts: {last_error}")
+    raise OllamaError(f"Gateway failed to produce valid JSON after {retries + 1} attempts: {last_error}")

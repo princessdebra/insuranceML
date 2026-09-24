@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import AnalystLayout from "@/layouts/AnalystLayout";
-import { getClaimFullReport, getSimulationStatus, getClaimDecision, recordClaimDecision, explainRiskScore, AiInvestigationSummary, BASE_URL } from "@/lib/api";
+import { getClaimFullReport, getSimulationStatus, getClaimDecision, recordClaimDecision, explainRiskScore, getAdminClaimDetails, AiInvestigationSummary, BASE_URL } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import PhysicsReconstructionViewer from "@/components/reconstruction/PhysicsReconstructionViewer";
+import DamagePanel from "@/components/DamagePanel";
 
 export default function AnalystClaimReport() {
   const { claimId } = useParams();
@@ -19,6 +20,14 @@ export default function AnalystClaimReport() {
   const [simulationStatus, setSimulationStatus] = useState<any>(null);
   const [loadingSimulation, setLoadingSimulation] = useState(false);
 
+  // Photo evidence + CV damage detections -- getClaimFullReport's shape
+  // deliberately strips this raw per-photo detail out into a fraud-summary
+  // count (see the matching comment on get_admin_claim_details), so the
+  // Media tab fetches it separately, on demand, the same way the physics
+  // tab fetches simulation status on demand rather than upfront.
+  const [photoDetails, setPhotoDetails] = useState<any>(null);
+  const [loadingPhotoDetails, setLoadingPhotoDetails] = useState(false);
+
   // Final triage decision (PAY / DENY / ESCALATE) -- the human reviewer's
   // actual, persisted business call, distinct from the AI's recomputed
   // "Recommended Action" suggestion shown below.
@@ -27,6 +36,9 @@ export default function AnalystClaimReport() {
   const [payoutAmount, setPayoutAmount] = useState("");
   const [submittingDecision, setSubmittingDecision] = useState(false);
   const [decisionError, setDecisionError] = useState("");
+  const [reasonsExpanded, setReasonsExpanded] = useState(false);
+  const REASONS_COLLAPSED_COUNT = 5;
+  const [photoAnomaliesExpanded, setPhotoAnomaliesExpanded] = useState(false);
 
   // AI Investigation Summary -- a structured, plain-English breakdown of
   // the risk score fetched on demand. Points/impact tiers are computed
@@ -101,6 +113,22 @@ export default function AnalystClaimReport() {
     }
   }, [activeTab, claimId]);
 
+  // Fetch photo evidence + CV damage detections (Media tab only, once)
+  useEffect(() => {
+    if (activeTab === "media" && claimId && !photoDetails && !loadingPhotoDetails) {
+      setLoadingPhotoDetails(true);
+      getAdminClaimDetails(claimId)
+        .then((d) => {
+          setPhotoDetails(d);
+          setLoadingPhotoDetails(false);
+        })
+        .catch((err) => {
+          console.error("Failed to fetch photo details", err);
+          setLoadingPhotoDetails(false);
+        });
+    }
+  }, [activeTab, claimId, photoDetails, loadingPhotoDetails]);
+
   if (loading) {
     return (
       <AnalystLayout>
@@ -136,6 +164,21 @@ export default function AnalystClaimReport() {
   const pr = report.physics_reconstruction || {};
   const warnings = report.critical_warnings || [];
   const photoAnomalies = report.fraud_indicators?.photo_anomalies || [];
+
+  // From the separately-fetched (Media tab only) getAdminClaimDetails call
+  // -- getClaimFullReport doesn't carry raw per-photo detections/damage_zones.
+  const analystPhotos: any[] = photoDetails?.photos || [];
+  let analystPhotoResults: any[] = [];
+  if (photoDetails?.claim_details?.analysis_result) {
+    try {
+      const parsedAr = typeof photoDetails.claim_details.analysis_result === "string"
+        ? JSON.parse(photoDetails.claim_details.analysis_result)
+        : photoDetails.claim_details.analysis_result;
+      analystPhotoResults = parsedAr?.photo_analysis?.results || [];
+    } catch {
+      analystPhotoResults = [];
+    }
+  }
   const narrativeIssues = report.fraud_indicators?.narrative_inconsistencies || [];
   const crossPartyIssues = report.fraud_indicators?.cross_party_issues || [];
 
@@ -395,11 +438,15 @@ export default function AnalystClaimReport() {
           )}
         </div>
 
+        {/* Why This Claim Was Flagged + Final Triage Decision side by side --
+            both are naturally compact cards, previously stacked full-width
+            each leaving a lot of empty space to their right. */}
+        <div className="flex flex-col lg:flex-row gap-6 items-start w-full">
         {/* Why This Claim Was Flagged -- consolidated top reasons, ranked by
             severity, pulled from across the report so a reviewer gets the
             headline picture without clicking through every tab. */}
         {rankedReasons.length > 0 ? (
-          <Card className="overflow-hidden border-none shadow-sm w-full">
+          <Card className="overflow-hidden border-none shadow-sm w-full flex-1 min-w-0">
             <CardHeader className="flex-row items-center gap-3 space-y-0 border-b border-border">
               <span className="material-symbols-outlined text-destructive bg-destructive/10 p-2 rounded-xl text-[20px]">flag</span>
               <CardTitle className="text-sm font-black uppercase tracking-widest text-foreground">
@@ -408,7 +455,7 @@ export default function AnalystClaimReport() {
             </CardHeader>
             <CardContent className="pt-6">
               <div className="space-y-3">
-                {rankedReasons.map((r, idx) => {
+                {(reasonsExpanded ? rankedReasons : rankedReasons.slice(0, REASONS_COLLAPSED_COUNT)).map((r, idx) => {
                   const accent = getSeverityAccent(r.severity);
                   return (
                     <div key={idx} className={`p-4 rounded-xl border border-border border-l-4 bg-card flex gap-3 ${accent.border}`}>
@@ -424,6 +471,15 @@ export default function AnalystClaimReport() {
                   );
                 })}
               </div>
+              {rankedReasons.length > REASONS_COLLAPSED_COUNT && (
+                <button
+                  onClick={() => setReasonsExpanded((v) => !v)}
+                  className="w-full mt-3 flex items-center justify-center gap-1.5 py-2 text-xs font-bold text-primary hover:bg-primary/5 rounded-lg transition-colors"
+                >
+                  {reasonsExpanded ? "Show fewer reasons" : `Show all ${rankedReasons.length} reasons`}
+                  <span className="material-symbols-outlined text-[16px] transition-transform" style={{ transform: reasonsExpanded ? "rotate(180deg)" : "none" }}>expand_more</span>
+                </button>
+              )}
             </CardContent>
           </Card>
         ) : (
@@ -437,7 +493,11 @@ export default function AnalystClaimReport() {
             call. Distinct from `final_assessment.decision` above, which is
             only ever a freshly recomputed AI suggestion and was never
             written to the database before this. */}
-        <Card ref={decisionPanelRef} className="overflow-hidden border-none shadow-sm w-full">
+        {/* flex-1 to share the row with the flagged-reasons card instead of
+            floating narrow in the middle of it; sticky so its own short
+            height doesn't leave a tall dead void once the taller reasons
+            card keeps going below it. */}
+        <Card ref={decisionPanelRef} className="overflow-hidden border-none shadow-sm w-full flex-1 min-w-0 lg:sticky lg:top-4 lg:self-start">
           <CardHeader className="flex-row items-center gap-3 space-y-0 border-b border-border">
             <span className="material-symbols-outlined text-foreground bg-muted p-2 rounded-xl text-[20px]">gavel</span>
             <CardTitle className="text-sm font-black uppercase tracking-widest text-foreground">
@@ -547,6 +607,7 @@ export default function AnalystClaimReport() {
             )}
           </CardContent>
         </Card>
+        </div>
 
         {/* Diagnostic Tabs */}
         <div className="flex gap-2 border-b overflow-x-auto pb-px">
@@ -578,11 +639,13 @@ export default function AnalystClaimReport() {
           {/* TAB 1: OVERVIEW */}
           {activeTab === "overview" && (
             <div className="space-y-8 animate-in fade-in duration-300">
-              {/* Core Summaries Stacked Vertically */}
+              {/* Core Summaries -- Overall Score on the left, AI Anomaly
+                  Detection + Verification Pipeline stacked on the right,
+                  instead of each stacked full-width leaving empty space. */}
               <div className="flex flex-col gap-6 w-full">
-                
+                <div className="flex flex-col lg:flex-row gap-6 w-full items-start">
                 {/* Overall Score */}
-                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-5 w-full">
+                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-5 w-full flex-1 min-w-0">
                   <div className="flex items-center gap-3">
                     <span className="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-xl text-[20px]">speed</span>
                     <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest">Overall Score Index</h4>
@@ -659,27 +722,16 @@ export default function AnalystClaimReport() {
                   )}
                 </div>
 
-                {investigationSummary && (
-                  <InvestigationSummaryCard
-                    summary={investigationSummary}
-                    detailsByFactor={{
-                      photo_analysis: photoAnomalies,
-                      narrative_analysis: narrativeIssues,
-                      business_rules: report.business_rules?.findings || [],
-                    }}
-                    onStartReview={() => { setDecisionAction("ESCALATE"); decisionPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }); }}
-                    onViewFindings={() => setActiveTab("media")}
-                  />
-                )}
-
-                {/* Detection Summary */}
+                {/* Right column: AI Anomaly Detection stacked above
+                    Verification Pipeline. */}
+                <div className="flex flex-col gap-6 w-full flex-1 min-w-0">
                 <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
                   <div>
                     <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-4 flex items-center gap-1">
                       <span className="material-symbols-outlined text-sm">rule_folder</span>
                       AI Anomaly Detection
                     </h4>
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pb-2">
+                    <div className="grid grid-cols-2 gap-3 pb-2">
                       <div className="text-center p-3 bg-destructive/5 rounded-xl border border-destructive/10">
                         <p className="text-2xl font-black text-destructive">{ds.critical_issues ?? 0}</p>
                         <p className="text-[10px] font-black uppercase text-muted-foreground">Critical</p>
@@ -775,10 +827,27 @@ export default function AnalystClaimReport() {
                     </div>
                   </div>
                 </div>
+                </div>
+                </div>
 
+                {investigationSummary && (
+                  <InvestigationSummaryCard
+                    summary={investigationSummary}
+                    detailsByFactor={{
+                      photo_analysis: photoAnomalies,
+                      narrative_analysis: narrativeIssues,
+                      business_rules: report.business_rules?.findings || [],
+                    }}
+                    onStartReview={() => { setDecisionAction("ESCALATE"); decisionPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }); }}
+                    onViewFindings={() => setActiveTab("media")}
+                  />
+                )}
               </div>
 
-              {/* Component risk scoring matrix Stacked Vertically */}
+              {/* Component risk scoring matrix -- a data-dense solo card, not
+                  paired with a sibling, so it uses the full available width
+                  (still bounded by the page's own max-w-7xl) rather than an
+                  arbitrary narrower cap that just left space unused. */}
               <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-6 w-full">
                 <div className="flex justify-between items-center">
                   <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest flex items-center gap-1">
@@ -817,9 +886,10 @@ export default function AnalystClaimReport() {
                 </div>
               </div>
 
-              {/* Recommendations Stacked Vertically */}
-              <div className="flex flex-col gap-6 w-full">
-                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
+              {/* Recommendations side by side -- each is a short list, not
+                  dense enough to need full-width on its own. */}
+              <div className="flex flex-col lg:flex-row gap-6 w-full items-start">
+                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full flex-1 min-w-0">
                   <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest flex items-center gap-2">
                     <span className="material-symbols-outlined text-primary text-[20px]">lightbulb</span>
                     Strategic Fraud Recommendations
@@ -837,7 +907,7 @@ export default function AnalystClaimReport() {
                   </ul>
                 </div>
                 
-                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full">
+                <div className="bg-card p-6 rounded-2xl border border-border shadow-sm space-y-4 w-full flex-1 min-w-0">
                   <h4 className="text-xs font-black text-muted-foreground uppercase tracking-widest flex items-center gap-2">
                     <span className="material-symbols-outlined text-primary text-[20px]">playlist_add_check</span>
                     SIU Workflow Next Actions
@@ -1084,20 +1154,31 @@ export default function AnalystClaimReport() {
           {activeTab === "media" && (
             <div className="space-y-8 animate-in fade-in duration-300">
               
-              {/* Photo anomaly summary Stacked Vertically */}
-              <div className="flex flex-col gap-4 w-full">
-                <div className="p-4 bg-muted/20 border rounded-xl text-center w-full">
-                  <p className="text-3xl font-black text-foreground">{photoAnomalies.length}</p>
-                  <p className="text-[10px] font-black uppercase text-muted-foreground mt-1">Visual Anomalies Logged</p>
+              {/* Photo anomaly summary -- a tight grid of three matched stat
+                  cards, capped to the same width as the card below it,
+                  instead of small boxes scattered across the full page
+                  width with a large empty gap after them. */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full">
+                <div className="p-5 bg-card border border-border rounded-2xl shadow-sm flex items-center gap-3">
+                  <span className="material-symbols-outlined text-amber-600 bg-amber-500/10 p-2.5 rounded-xl text-[22px] shrink-0">warning</span>
+                  <div className="min-w-0">
+                    <p className="text-2xl font-black text-foreground tabular-nums leading-none">{photoAnomalies.length}</p>
+                    <p className="text-[9px] font-black uppercase text-muted-foreground mt-1.5 tracking-wide">Visual Anomalies</p>
+                  </div>
                 </div>
-                <div className="p-4 bg-muted/20 border rounded-xl text-center w-full">
-                  <p className="text-3xl font-black text-foreground">{rb.photo_risk}/100</p>
-                  <p className="text-[10px] font-black uppercase text-muted-foreground mt-1">Overall Media Risk Penalty</p>
+                <div className="p-5 bg-card border border-border rounded-2xl shadow-sm flex items-center gap-3">
+                  <span className="material-symbols-outlined text-destructive bg-destructive/10 p-2.5 rounded-xl text-[22px] shrink-0">shield_moon</span>
+                  <div className="min-w-0">
+                    <p className="text-2xl font-black text-foreground tabular-nums leading-none">{Math.round(rb.photo_risk)}<span className="text-sm text-muted-foreground">/100</span></p>
+                    <p className="text-[9px] font-black uppercase text-muted-foreground mt-1.5 tracking-wide">Media Risk Penalty</p>
+                  </div>
                 </div>
-                <div className="p-4 bg-muted/20 border rounded-xl flex items-center justify-center w-full">
-                  <Badge variant="outline" className="font-mono text-xs uppercase px-4 py-1.5 border-dashed">
-                    Photos verified: {Object.values(report.parties_analyzed).filter(Boolean).length} Parties
-                  </Badge>
+                <div className="p-5 bg-card border border-border rounded-2xl shadow-sm flex items-center gap-3">
+                  <span className="material-symbols-outlined text-primary bg-primary/10 p-2.5 rounded-xl text-[22px] shrink-0">verified_user</span>
+                  <div className="min-w-0">
+                    <p className="text-2xl font-black text-foreground tabular-nums leading-none">{Object.values(report.parties_analyzed).filter(Boolean).length}</p>
+                    <p className="text-[9px] font-black uppercase text-muted-foreground mt-1.5 tracking-wide">Parties Verified</p>
+                  </div>
                 </div>
               </div>
 
@@ -1111,8 +1192,8 @@ export default function AnalystClaimReport() {
                 </CardHeader>
                 <CardContent className="pt-6">
                   {photoAnomalies.length > 0 ? (
-                    <div className="space-y-4">
-                      {photoAnomalies.map((ano: any, idx: number) => {
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      {(photoAnomaliesExpanded ? photoAnomalies : photoAnomalies.slice(0, 5)).map((ano: any, idx: number) => {
                         const isCritical = ano.severity?.toLowerCase() === "critical" || ano.severity?.toLowerCase() === "high";
                         return (
                           <div key={idx} className={`p-5 rounded-2xl border flex items-start gap-4 transition-all w-full ${
@@ -1145,6 +1226,96 @@ export default function AnalystClaimReport() {
                   ) : (
                     <div className="text-center py-8 text-xs italic text-muted-foreground bg-muted/20 border border-dashed rounded-xl w-full">
                       No photographic structure or metadata anomalies verified. All signatures align.
+                    </div>
+                  )}
+                  {photoAnomalies.length > 5 && (
+                    <button
+                      onClick={() => setPhotoAnomaliesExpanded((v) => !v)}
+                      className="w-full mt-4 flex items-center justify-center gap-1.5 py-2 text-xs font-bold text-primary hover:bg-primary/5 rounded-lg transition-colors"
+                    >
+                      {photoAnomaliesExpanded ? "Show fewer" : `Show all ${photoAnomalies.length} verifications`}
+                      <span className="material-symbols-outlined text-[16px] transition-transform" style={{ transform: photoAnomaliesExpanded ? "rotate(180deg)" : "none" }}>expand_more</span>
+                    </button>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Photo evidence + AI damage detection -- the actual submitted
+                  photos with the trained CV model's bounding boxes/whole-photo
+                  scan overlaid, same view the assessor portal uses. Read-only
+                  here: an analyst reviews the finding, they don't make the
+                  repair/replace call themselves. */}
+              <Card className="overflow-hidden border-none shadow-sm w-full">
+                <CardHeader className="border-b border-border">
+                  <CardTitle className="text-sm font-black uppercase tracking-widest flex items-center gap-2 text-primary">
+                    <span className="material-symbols-outlined">directions_car</span>
+                    Submitted Photo Evidence & AI Damage Detection
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="pt-6">
+                  {loadingPhotoDetails ? (
+                    <div className="flex items-center justify-center py-10">
+                      <div className="size-6 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+                    </div>
+                  ) : analystPhotos.length === 0 ? (
+                    <div className="text-center py-8 text-xs italic text-muted-foreground bg-muted/20 border border-dashed rounded-xl w-full">
+                      No photos on record for this claim.
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      {analystPhotos.map((photo: any, i: number) => {
+                        const result = analystPhotoResults.find((r: any) => r.filename === photo.filename);
+                        const detectedParty = photo.party || result?.party || "Unknown";
+                        return (
+                          <div key={i} className="group border border-border rounded-2xl overflow-hidden p-5 hover:border-primary/30 transition-all space-y-4">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-border">
+                              <div className="flex items-center gap-3">
+                                {photo.id ? (
+                                  <a href={`${BASE_URL}/api/analysis/photos/${photo.id}/file`} target="_blank" rel="noopener noreferrer">
+                                    <img
+                                      src={`${BASE_URL}/api/analysis/photos/${photo.id}/file`}
+                                      alt={photo.filename}
+                                      className="size-14 rounded-lg object-cover border border-border hover:opacity-80 transition-opacity"
+                                    />
+                                  </a>
+                                ) : (
+                                  <span className="material-symbols-outlined text-muted-foreground">image</span>
+                                )}
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-bold text-foreground">{photo.filename}</span>
+                                  <span className="text-xs text-muted-foreground">{photo.file_size ? `${(photo.file_size / 1024 / 1024).toFixed(2)} MB` : ""}</span>
+                                </div>
+                              </div>
+                              <Badge variant="outline" className="font-mono text-[9px] uppercase">
+                                Party: {detectedParty}
+                              </Badge>
+                            </div>
+
+                            {/* damageZones ("(scan)" whole-photo part-name
+                                guesses) intentionally not passed -- see the
+                                matching note in AssessorClaimDetails.tsx. Only
+                                the trained detector's own findings gate whether
+                                this panel renders now. */}
+                            {result?.detections?.length > 0 ? (
+                              <DamagePanel
+                                claimId={claimId || ""}
+                                photoId={photo.id}
+                                filename={photo.filename}
+                                detections={result.detections || []}
+                                assessorId={localStorage.getItem("analystId") || ""}
+                                existingDecisions={Object.fromEntries(
+                                  (photoDetails?.damage_decisions || [])
+                                    .filter((d: any) => d.filename === photo.filename)
+                                    .map((d: any) => [d.detection_index, d.assessor_decision])
+                                )}
+                                readOnly
+                              />
+                            ) : (
+                              <p className="text-xs italic text-muted-foreground">No AI damage detections for this photo.</p>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </CardContent>

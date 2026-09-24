@@ -43,6 +43,7 @@ export default function DamagePanel({
   assessorId,
   existingDecisions,
   onDecided,
+  readOnly = false,
 }: {
   claimId: string;
   photoId: number;
@@ -52,6 +53,11 @@ export default function DamagePanel({
   assessorId: string;
   existingDecisions: Record<number, string>;
   onDecided?: () => void;
+  // For viewers who review but don't make the repair/replace call
+  // themselves (e.g. the analyst portal) -- shows the same photo,
+  // overlays, and AI findings, plus whatever decision an assessor already
+  // made, but hides the action buttons that would let this viewer make one.
+  readOnly?: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement>(null);
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
@@ -301,6 +307,8 @@ export default function DamagePanel({
                         <span className="material-symbols-outlined text-[14px]">check_circle</span>
                         {decided}
                       </span>
+                    ) : readOnly ? (
+                      <span className="text-[10px] font-bold uppercase text-muted-foreground italic">Pending assessor</span>
                     ) : (
                       <div className="flex gap-1.5">
                         <Button

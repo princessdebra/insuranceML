@@ -30,9 +30,23 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "gemma4:26b")
 CROP_PADDING_RATIO = 0.20  # extra margin around the bbox so the part's edges/context are visible
 MIN_ZOOM_DIMENSION = 512   # upscale small crops so the model gets a genuine close-up, not a thumbnail
+
+# No longer meaningful (the gateway has exactly one vision model) -- kept so
+# every existing `_vision_generate(..., VISION_MODEL, ...)` call site below
+# doesn't need touching; _vision_generate ignores this argument entirely.
+VISION_MODEL = None
+
+
+def _vision_generate(prompt: str, images: list, model: str = None, json_mode: bool = False, timeout: int = 60) -> str:
+    """Every vision call in this module goes through here -- routes to the
+    XeAI Gateway's qwen2.5-vl-7b (via ollama_client.py, which now proxies to
+    the gateway instead of a dedicated Ollama instance). `model` is accepted
+    for call-site compatibility but unused -- the gateway has exactly one
+    vision model."""
+    from ollama_client import generate
+    return generate(prompt, images=images, json_mode=json_mode, timeout=timeout)
 
 # Free-form "give me x1,y1,x2,y2 as fractions 0-1" coordinate regression is a
 # known weak spot for vision-LLMs -- a live claim showed a "Roof" damage zone
@@ -167,11 +181,9 @@ async def verify_and_identify_low_confidence_region(image_data: bytes, bbox: Lis
     if not bbox or len(bbox) != 4:
         return None
     try:
-        from ollama_client import generate
-
         crop_bytes = crop_and_zoom(image_data, bbox)
         response_text = await asyncio.to_thread(
-            generate, _VERIFY_PROMPT, model=VISION_MODEL, images=[crop_bytes], json_mode=True, timeout=60,
+            _vision_generate, _VERIFY_PROMPT, [crop_bytes], VISION_MODEL, True, 60,
         )
         result = json.loads(response_text)
         if not result.get("damage_visible"):
@@ -285,10 +297,8 @@ async def classify_photo_purpose(image_data: bytes) -> bool:
     missed real damage zone is worse than an occasional wasted scan call.
     """
     try:
-        from ollama_client import generate
-
         response_text = await asyncio.to_thread(
-            generate, _CLASSIFY_PROMPT, model=VISION_MODEL, images=[image_data], json_mode=True, timeout=30,
+            _vision_generate, _CLASSIFY_PROMPT, [image_data], VISION_MODEL, True, 30,
         )
         parsed = json.loads(response_text)
         if isinstance(parsed, dict) and "is_damage_photo" in parsed:
@@ -322,10 +332,8 @@ async def describe_location_context(image_data: bytes) -> Optional[str]:
     fail-safe spirit as everything else in this module.
     """
     try:
-        from ollama_client import generate
-
         response_text = await asyncio.to_thread(
-            generate, _LOCATION_CONTEXT_PROMPT, model=VISION_MODEL, images=[image_data], json_mode=True, timeout=30,
+            _vision_generate, _LOCATION_CONTEXT_PROMPT, [image_data], VISION_MODEL, True, 30,
         )
         parsed = json.loads(response_text)
         if not isinstance(parsed, dict):
@@ -377,11 +385,9 @@ async def _scan_small_parts_followup(image_data: bytes) -> List[Dict[str, Any]]:
     see the comment above _SMALL_PARTS for why this exists as a separate
     call rather than folded into the main checklist prompt."""
     try:
-        from ollama_client import generate
-
         grid_image = _add_grid_overlay(image_data)
         response_text = await asyncio.to_thread(
-            generate, _SMALL_PARTS_PROMPT, model=VISION_MODEL, images=[grid_image], json_mode=True, timeout=60,
+            _vision_generate, _SMALL_PARTS_PROMPT, [grid_image], VISION_MODEL, True, 60,
         )
         parsed = json.loads(response_text)
         if isinstance(parsed, list):
@@ -463,8 +469,6 @@ async def scan_all_damage_zones(image_data: bytes, is_damage_photo: Optional[boo
     on the same photo), skips a redundant second classification call.
     """
     try:
-        from ollama_client import generate
-
         if is_damage_photo is None:
             is_damage_photo = await classify_photo_purpose(image_data)
         if not is_damage_photo:
@@ -473,7 +477,7 @@ async def scan_all_damage_zones(image_data: bytes, is_damage_photo: Optional[boo
         grid_image = _add_grid_overlay(image_data)
         response_text, small_parts_zones = await asyncio.gather(
             asyncio.to_thread(
-                generate, _SCAN_PROMPT, model=VISION_MODEL, images=[grid_image], json_mode=True, timeout=90,
+                _vision_generate, _SCAN_PROMPT, [grid_image], VISION_MODEL, True, 90,
             ),
             _scan_small_parts_followup(image_data),
         )
@@ -569,11 +573,9 @@ async def identify_specific_part(image_data: bytes, bbox: List[float]) -> Option
     if not bbox or len(bbox) != 4:
         return None
     try:
-        from ollama_client import generate
-
         crop_bytes = crop_and_zoom(image_data, bbox)
         response_text = await asyncio.to_thread(
-            generate, _PROMPT, model=VISION_MODEL, images=[crop_bytes], json_mode=True, timeout=60,
+            _vision_generate, _PROMPT, [crop_bytes], VISION_MODEL, True, 60,
         )
         result = json.loads(response_text)
         part = result.get("part")
@@ -751,11 +753,9 @@ async def estimate_crush_depth_mm(image_data: bytes, part: str, vehicle_width_mm
     fabricated number.
     """
     try:
-        from ollama_client import generate
-
         prompt = _CRUSH_DEPTH_PROMPT_TEMPLATE.format(part=part, vehicle_width_mm=vehicle_width_mm)
         response_text = await asyncio.to_thread(
-            generate, prompt, model=VISION_MODEL, images=[image_data], json_mode=True, timeout=45,
+            _vision_generate, prompt, [image_data], VISION_MODEL, True, 45,
         )
         parsed = json.loads(response_text)
         if not isinstance(parsed, dict):

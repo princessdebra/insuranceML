@@ -15,8 +15,6 @@ import traceback
 import functools
 import re
 import math
-# Gemini imports
-import google.generativeai as genai
 
 from utils import ImageProcessor, TextProcessor, MetricsCalculator
 from schemas import PhotoAnomalySchema, NarrativeAnalysisSchema, RiskScoringSchema, RiskLevel
@@ -27,10 +25,11 @@ import business_rules
 import graph_relationship
 import narrative_similarity
 
-# The dev GPU can only host one large model at a time — the team standardized
-# on gemma4:26b (also used for photo vision), so all text-reasoning tasks that
-# used to call Gemini share this same model instead of a second one.
-TEXT_REASONING_MODEL = os.environ.get("OLLAMA_TEXT_MODEL", "gemma4:26b")
+# All text-reasoning tasks (this used to name a specific self-hosted model,
+# back when the team ran its own dedicated Ollama instance) now go through
+# ollama_client.py, which itself proxies to the XeAI Gateway's gpt-oss-20b --
+# see xeai_gateway_client.py. Name kept for the log lines that reference it.
+TEXT_REASONING_MODEL = "gpt-oss-20b"
 
 # Configure comprehensive logging
 logging.basicConfig(
@@ -44,9 +43,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Gemini API Configuration
-#GEMINI_API_KEY = "AIzaSyBASeUr3bcegRWGiiNreYEr4A-TYpcsQUQ"
-GEMINI_API_KEY = "AIzaSyBAIlTiNR3thcxU7nbn8DH654swOY25bPw"
 # Performance logging decorator
 def log_performance(func):
     """Decorator to log function performance metrics"""
@@ -465,6 +461,120 @@ class PhotoAnalysisService:
             is_damage_photo = await part_identifier.classify_photo_purpose(image_data)
             damage_zones = await part_identifier.scan_all_damage_zones(image_data, is_damage_photo=is_damage_photo)
 
+            # ── Same-photo front/rear contradiction check ─────────────────────
+            # scan_all_damage_zones can name several parts per photo, and it
+            # sometimes gets one of them wrong -- confirmed on a real claim: a
+            # clearly rear-view photo (visible number plate, taillamp) got one
+            # zone correctly named "Rear Left Fender" and a second, adjacent
+            # zone wrongly named "Front Grille" in the same call. Showing both
+            # side by side undermines trust in the whole system even when one
+            # of them is right, so the contradicting one is dropped outright
+            # rather than merely flagged. Precedence: the trained YOLO
+            # detector's own class wins outright when it names a side at all
+            # (a handful of its classes do -- bumper-dent-front/rear,
+            # headlight/taillight-damage, hood-bonnet-dent, trunk-damage);
+            # most YOLO classes ("minor-deformation" etc) don't encode a side,
+            # in which case this falls back to majority vote among the scan's
+            # own zones for this one photo (a single close-up overwhelmingly
+            # shows one end of the car, so the odd-one-out is more likely the
+            # hallucination) -- and drops all of them on an exact tie, since
+            # there's no reliable signal to prefer one over the other.
+            _FRONT_REAR_HINT = {
+                "front bumper": "front", "rear bumper": "rear",
+                "bonnet/hood": "front", "boot/trunk": "rear",
+                "front left fender": "front", "front right fender": "front",
+                "rear left fender": "rear", "rear right fender": "rear",
+                "windscreen": "front", "rear windscreen": "rear",
+                "left headlamp": "front", "right headlamp": "front",
+                "left taillamp": "rear", "right taillamp": "rear",
+                "front grille": "front",
+                "front left wheel": "front", "front right wheel": "front",
+                "rear left wheel": "rear", "rear right wheel": "rear",
+            }
+            _YOLO_CLASS_SIDE = {
+                "bumper-dent-front": "front", "bumper-dent-rear": "rear",
+                "hood-bonnet-dent": "front", "trunk-damage": "rear",
+                "headlight-damage": "front", "taillight-damage": "rear",
+                "glass-crack-windscreen-front": "front", "glass-crack-windscreen-rear": "rear",
+            }
+            if damage_zones:
+                yolo_sides = {_YOLO_CLASS_SIDE[d["class"]] for d in detections_with_recommendations if d.get("class") in _YOLO_CLASS_SIDE}
+                yolo_side = yolo_sides.pop() if len(yolo_sides) == 1 else None  # None if YOLO found nothing side-specific, or disagrees with itself
+
+                sided = [(z, _FRONT_REAR_HINT.get((z.get("part") or "").lower())) for z in damage_zones]
+                if yolo_side:
+                    dropped = [z for z, s in sided if s and s != yolo_side]
+                    kept = [z for z, s in sided if not (s and s != yolo_side)]
+                    source_note = f"YOLO-detected {yolo_side}-side damage ({[d['class'] for d in detections_with_recommendations if d.get('class') in _YOLO_CLASS_SIDE]})"
+                else:
+                    front_count = sum(1 for _, s in sided if s == "front")
+                    rear_count = sum(1 for _, s in sided if s == "rear")
+                    if front_count and rear_count:
+                        if front_count == rear_count:
+                            dropped = [z for z, s in sided if s in ("front", "rear")]
+                            kept = [z for z, s in sided if not s]
+                        else:
+                            majority = "front" if front_count > rear_count else "rear"
+                            dropped = [z for z, s in sided if s and s != majority]
+                            kept = [z for z, s in sided if not (s and s != majority)]
+                        source_note = "majority vote among this photo's own scan zones"
+                    else:
+                        dropped, kept = [], damage_zones
+                        source_note = ""
+                if dropped:
+                    logger.warning(
+                        f"Front/rear contradiction in whole-photo scan for {filename}: "
+                        f"dropping {[z.get('part') for z in dropped]}, keeping {[z.get('part') for z in kept]} "
+                        f"({source_note})"
+                    )
+                    damage_zones = kept
+
+            # ── Reconcile against the earlier fraud-check pass ────────────────
+            # _analyze_with_llm (above) and scan_all_damage_zones are two
+            # independent vision-LLM calls on the SAME photo that don't talk
+            # to each other -- one can conclude "no damage visible" while the
+            # other finds specific, grid-localized damage on the same image
+            # (confirmed on a real claim: a visibly shattered taillamp got
+            # flagged as a fraud "damage inconsistency -- photo shows intact
+            # parts" by the first pass, while this second, more specific pass
+            # correctly found it). Since this scan runs second, uses a
+            # grid-anchored technique for localization, and produces a
+            # specific part+severity read rather than a generic yes/no, treat
+            # its find as the stronger evidence when the two disagree, and
+            # drop the earlier pass's contradicting "no damage" claim rather
+            # than surfacing a fraud flag we already know is wrong.
+            if damage_zones:
+                _NO_DAMAGE_ANOMALY_TYPES = {"ai_detected_damage_inconsistency", "ai_detected_narrative_mismatch"}
+                _NO_DAMAGE_PHRASES = ("intact", "pristine", "not visible", "not captured", "no damage", "undamaged", "no physical", "no corresponding damage")
+                reconciled_anomalies, dropped = [], []
+                for a in anomalies:
+                    text = (a.get("description") or "").lower()
+                    contradicts_found_damage = (
+                        a.get("type") in _NO_DAMAGE_ANOMALY_TYPES
+                        and a.get("party") == party
+                        and any(p in text for p in _NO_DAMAGE_PHRASES)
+                    )
+                    if contradicts_found_damage:
+                        dropped.append(a)
+                    else:
+                        reconciled_anomalies.append(a)
+                if dropped:
+                    logger.warning(
+                        f"Reconciling {filename}: whole-photo scan found real damage "
+                        f"({[z['part'] for z in damage_zones]}), overriding {len(dropped)} contradicting "
+                        f"'no damage visible' anomaly/anomalies from the earlier fraud-check pass"
+                    )
+                    anomalies[:] = reconciled_anomalies
+                    # NOTE: risk_score was already incremented by the earlier
+                    # pass's aggregate llm_analysis["risk_score"], which isn't
+                    # itemized per-anomaly -- it can't be precisely reduced
+                    # here for just the dropped anomaly without a deeper
+                    # refactor of _analyze_with_llm to return per-finding
+                    # contributions. The misleading anomaly TEXT is what
+                    # reaches the assessor UI and is what's fixed here; the
+                    # aggregate score may still run slightly high on claims
+                    # where this reconciliation fires. Flagged as a follow-up.
+
             # A photo that isn't a damage close-up is usually the member
             # showing WHERE they were (a parking-lot/street shot submitted
             # to corroborate their narrative) -- pull any visible location
@@ -677,11 +787,24 @@ class PhotoAnalysisService:
                     logger.info(f"Low-confidence recovery found {len(detections)} vision-confirmed detection(s) for {filename}")
 
             if detections:
-                detected_damage_section = "DETECTED DAMAGE (from trained CV model — treat as ground truth unless the photo clearly contradicts it):\n" + "\n".join(
-                    f"- {d['class']} (confidence: {d['confidence']:.2f})" for d in detections
+                detected_damage_section = (
+                    "DETECTED DAMAGE (from trained CV model): a useful starting point, but this detector "
+                    "has real recall gaps (e.g. cracked lenses, subtle deformation, or unusual damage types "
+                    "it wasn't trained on can be missed) -- do not treat its list as exhaustive or as "
+                    "overriding what you can see:\n" + "\n".join(
+                        f"- {d['class']} (confidence: {d['confidence']:.2f})" for d in detections
+                    )
                 )
             else:
-                detected_damage_section = "DETECTED DAMAGE (from trained CV model): none detected above confidence threshold."
+                detected_damage_section = (
+                    "DETECTED DAMAGE (from trained CV model): none detected above confidence threshold. "
+                    "This does NOT mean the vehicle is undamaged -- this detector has real recall gaps and "
+                    "regularly misses genuine damage (cracked lenses, subtle deformation, damage types "
+                    "outside its training set). You must independently assess the actual photo pixels for "
+                    "visible damage rather than assuming an empty detector result means the vehicle is "
+                    "pristine. Only report 'no damage visible' if you have actually looked and confirmed "
+                    "it yourself, not because the detector found nothing."
+                )
 
             # Build narrative cross-reference section if narrative is available
             narrative_section = f"""
@@ -1119,22 +1242,11 @@ AI generation indicators to check:
         )
 
 class NarrativeAnalysisService:
-    """Enhanced LLM-powered narrative analysis service using Gemini with database integration"""
-    
-    def __init__(self, gemini_api_key: str = None):
+    """LLM-powered narrative analysis service, backed by the XeAI Gateway
+    (via ollama_client.py) with database integration."""
+
+    def __init__(self):
         self.text_processor = TextProcessor()
-        
-        # Initialize Gemini with the provided API key
-        api_key = gemini_api_key or GEMINI_API_KEY
-        
-        try:
-            logger.info("Configuring Gemini API for narrative analysis")
-            genai.configure(api_key=api_key)
-            self.gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini model initialized for narrative analysis")
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini for narrative analysis: {str(e)}")
-            self.gemini_model = None
     
     async def analyze_narrative(self, narrative: str, claim_id: str, party: str = "member") -> NarrativeAnalysisSchema:
         """Comprehensive narrative analysis using the self-hosted LLM, with database logging"""
@@ -1252,8 +1364,12 @@ class NarrativeAnalysisService:
     """
     
         try:
+            # Fraud-pattern credibility/inconsistency analysis -- the same
+            # "hard reasoning" category the gateway guide calls out for
+            # reasoning_effort="high", not a simple extraction task.
             parsed = await asyncio.to_thread(
                 generate_json, prompt, model=TEXT_REASONING_MODEL, retries=1, timeout=120,
+                reasoning_effort="high",
             )
             parsed["party"] = party
             return parsed
@@ -1426,23 +1542,12 @@ class NarrativeAnalysisService:
         )
 
 class RiskScoringService:
-    """Enhanced ML-powered risk scoring service with AI-generated insights and database integration"""
-    
-    def __init__(self, gemini_api_key: str = None):
+    """ML-powered risk scoring service with AI-generated insights (XeAI
+    Gateway, via ollama_client.py) and database integration."""
+
+    def __init__(self):
         self.model_version = "1.1"
         self.metrics_calculator = MetricsCalculator()
-        
-        # Initialize Gemini for AI-generated recommendations
-        api_key = gemini_api_key or GEMINI_API_KEY
-        
-        try:
-            logger.info("Configuring Gemini API for risk scoring")
-            genai.configure(api_key=api_key)
-            self.gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini model initialized for risk scoring")
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini for risk scoring: {str(e)}")
-            self.gemini_model = None
     
     @log_performance
     async def calculate_risk_score(
@@ -1937,13 +2042,11 @@ class ClaimOrchestrator:
     Handles member, assessor, and repair shop submissions
     """
     
-    def __init__(self, gemini_api_key: str = None):
-        api_key = gemini_api_key or GEMINI_API_KEY
-        
+    def __init__(self):
         self.photo_service = PhotoAnalysisService()
-        self.narrative_service = NarrativeAnalysisService(api_key)
-        self.risk_service = RiskScoringService(api_key)
-        
+        self.narrative_service = NarrativeAnalysisService()
+        self.risk_service = RiskScoringService()
+
         logger.info("ClaimOrchestrator initialized with multi-party support")
     
     @log_performance
@@ -2746,7 +2849,9 @@ physics_applicable is FALSE for:
     You are a senior motor insurance fraud investigator in Kenya writing a forensic report
     for a claims committee. Explain the following physics reconstruction findings clearly
     and professionally. Connect the numbers together — explain what they mean, not just
-    what they are. Use plain English. Do not use bullet points. Write 2-3 paragraphs.
+    what they are. Use plain English. Do not use bullet points. Write exactly ONE paragraph
+    covering the verdict and its main reasoning -- do not add a second paragraph speculating
+    further on the discrepancy or restating the numbers.
 
     Findings:
     - Insured vehicle (V1): {result.vehicle_1_key}
@@ -2872,16 +2977,89 @@ physics_applicable is FALSE for:
             with db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT physics_fraud_score FROM claims WHERE claim_id = ?",
+                    "SELECT physics_fraud_score, physics_verdict, physics_result, reconstruction_pathway, "
+                    "physics_timeline, simulation_video_path, measurement_discrepancy_flag "
+                    "FROM claims WHERE claim_id = ?",
                     (claim_id,)
                 )
                 row = cursor.fetchone()
                 if row and row["physics_fraud_score"] not in (None, 0) and not has_assessor_override:
-                    logger.info(f"Physics already run for {claim_id} — skipping")
+                    logger.info(f"Physics already run for {claim_id} — skipping re-run, reusing stored result")
+                    # Re-running is skipped for performance, but the caller
+                    # (analysis_result.physics_reconstruction, read by the
+                    # interactive reconstruction UI on every claim-details
+                    # load) still needs the FULL result, not just the score --
+                    # a 3-field stub here previously made a claim with a real,
+                    # already-computed verdict/timeline render as "Not yet
+                    # determined" / "Telemetry unavailable" once its one-time
+                    # analysis_result write had already happened and this
+                    # skip path took over on every later reprocess (e.g. after
+                    # a late photo or document upload).
+                    try:
+                        stored_result = _json.loads(row["physics_result"]) if row["physics_result"] else {}
+                    except (TypeError, ValueError):
+                        stored_result = {}
+                    try:
+                        stored_timeline = _json.loads(row["physics_timeline"]) if row["physics_timeline"] else None
+                    except (TypeError, ValueError):
+                        stored_timeline = None
                     return {
                         "status": "already_run",
-                        "physics_fraud_score": row["physics_fraud_score"],
                         "claim_category": classification.get("claim_category"),
+                        "pathway": row["reconstruction_pathway"] or stored_result.get("pathway"),
+                        "vehicle_1_key": stored_result.get("vehicle_1_key"),
+                        "vehicle_2_key": stored_result.get("vehicle_2_key"),
+                        "v2_body_type": None,
+                        "physics_fraud_score": row["physics_fraud_score"],
+                        "physics_verdict": row["physics_verdict"] or stored_result.get("physics_verdict"),
+                        "confidence": stored_result.get("confidence"),
+                        "verdict_reason": stored_result.get("verdict_reason"),
+                        "physics_explanation": stored_result.get("physics_explanation"),
+                        "simulation_method": stored_result.get("simulation_method"),
+                        "inconsistencies": stored_result.get("inconsistencies", []),
+                        "warnings": [],
+                        "measurement_flags": [],
+                        "has_measurement_discrepancy": bool(row["measurement_discrepancy_flag"]),
+                        "timeline": stored_timeline,
+                        "simulation_video_path": row["simulation_video_path"],
+                        "delta_v_kmh": stored_result.get("delta_v_kmh"),
+                        "kinetic_energy_j": stored_result.get("kinetic_energy_j"),
+                        "crush_energy_j": stored_result.get("crush_energy_j"),
+                        "energy_consistent": stored_result.get("energy_consistent"),
+                        "impact_force_magnitude_n": stored_result.get("impact_force_magnitude_n"),
+                        "impact_force_is_estimated": stored_result.get("impact_force_is_estimated"),
+                        "v1_impact_vertex_xyz": stored_result.get("v1_impact_vertex_xyz"),
+                        "terrain_adjusted": stored_result.get("terrain_adjusted"),
+                        "slope_adjustment_kmh": stored_result.get("slope_adjustment_kmh"),
+                        "impact_zone_v1": None,
+                        "impact_zone_v1_source": None,
+                        "impact_zone_v1_detected_part": None,
+                        "comparison": {
+                            "speed_v1_kmh": {
+                                "claimed": stored_result.get("stated_speed_v1_kmh"),
+                                "reconstructed": stored_result.get("computed_speed_v1_kmh"),
+                                "delta": stored_result.get("stated_vs_computed_delta_kmh"),
+                            },
+                            "speed_v2_kmh": {
+                                "claimed": stored_result.get("stated_speed_v2_kmh"),
+                                "reconstructed": stored_result.get("computed_speed_v2_kmh"),
+                            },
+                            "v2_speed_is_inferred": stored_result.get("v2_speed_is_inferred"),
+                            "v2_speed_confidence": stored_result.get("v2_speed_confidence"),
+                            "crush_depth_mm": {
+                                "claimed": stored_result.get("stated_crush_depth_mm"),
+                                "reconstructed": stored_result.get("expected_crush_depth_mm"),
+                                "delta": stored_result.get("crush_depth_delta_mm"),
+                            },
+                            "velocity_fraud_flag": stored_result.get("velocity_fraud_flag"),
+                            "velocity_fraud_severity": stored_result.get("velocity_fraud_severity"),
+                            "impact_consistency_score": stored_result.get("impact_consistency_score"),
+                            "v1_speed_is_inferred": stored_result.get("v1_speed_is_inferred"),
+                            "v1_speed_confidence": stored_result.get("v1_speed_confidence"),
+                            "approach_angle_deg": None,
+                            "data_quality_score": None,
+                        },
+                        "data_sources": {},
                     }
 
             # ── Step 2.5: Look up the claimant's actual vehicle from their policy ──
@@ -3005,6 +3183,15 @@ physics_applicable is FALSE for:
                     f"-> {photo_impact_zone}, angle {photo_impact_angle}° -- overriding narrative-inferred zone/angle"
                 )
 
+            # Declared here (before first use below) rather than at its
+            # original spot further down -- the claimant-stated-geometry
+            # cross-check immediately below also appends to this list, and
+            # having the declaration after that first use caused a genuine
+            # UnboundLocalError ("cannot access local variable
+            # 'measurement_flags'") on any claim that reached this branch,
+            # e.g. a claim with a claimant-confirmed FNOL position answer.
+            measurement_flags: List[str] = []
+
             # Claimant-confirmed position (FNOL "where was the other vehicle"
             # question) -- a STATED input, same tier as stated speed/crush
             # depth: used as the geometry when nothing stronger exists, but
@@ -3039,7 +3226,6 @@ physics_applicable is FALSE for:
             # independently described and (b) what the trained CV model sees
             # in the photos, and any material mismatch is recorded rather
             # than silently discarded.
-            measurement_flags: List[str] = []
 
             CV_SEVERITY_CRUSH_RANGE_MM = {
                 "low":    (0, 50),
@@ -3730,8 +3916,8 @@ physics_applicable is FALSE for:
                     })
                 all_hashes[h] = party
         
-        # 2. AI-Powered narrative consistency check using Gemini
-        if self.narrative_service.gemini_model and assessor_analysis:
+        # 2. AI-powered narrative consistency check (XeAI Gateway)
+        if assessor_analysis:
             logger.info("Running AI-powered cross-party narrative verification")
             try:
                 ai_verification = await self._ai_verify_narratives(
@@ -3849,7 +4035,7 @@ physics_applicable is FALSE for:
             "photos_by_party": photo_hashes_by_party,
             "damage_claims_by_party": damage_claims,
             "cross_party_risk_score": cross_party_risk,
-            "verification_quality": "ai_enhanced" if self.narrative_service.gemini_model else "rule_based"
+            "verification_quality": "ai_enhanced"
         }
 
     # Must match nlp/scripts/build_finetune_dataset.py's SYSTEM_PROMPT exactly --
@@ -3956,9 +4142,14 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
 
         try:
             from ollama_client import generate_json, OllamaError
+            # This is the final fraud-signal consolidation step across every
+            # upstream analysis (photos, narrative, physics, business rules,
+            # relationships, similarity) -- exactly the "hard reasoning,
+            # fraud analysis" case the gateway guide calls out for "high".
             advisory = await asyncio.to_thread(
                 generate_json, user_text, model="claims-advisory-v1",
                 system=self.AI_ADVISORY_SYSTEM_PROMPT, timeout=90,
+                reasoning_effort="high",
             )
             advisory["source"] = "claims-advisory-v1"
             advisory["business_rules_observation"] = business_rules_section
@@ -4093,8 +4284,6 @@ Preliminary rule-based risk score: {risk_result.overall_score}/100 ({risk_result
     
 
 # Factory function
-def create_claim_orchestrator(gemini_api_key: str = None) -> ClaimOrchestrator:
-    """Create ClaimOrchestrator with API key"""
-    api_key = gemini_api_key or GEMINI_API_KEY
-    logger.info(f"Creating ClaimOrchestrator with API key: ***{api_key[-4:]}")
-    return ClaimOrchestrator(api_key)
+def create_claim_orchestrator() -> ClaimOrchestrator:
+    """Create a ClaimOrchestrator (all LLM calls go through the XeAI Gateway)."""
+    return ClaimOrchestrator()

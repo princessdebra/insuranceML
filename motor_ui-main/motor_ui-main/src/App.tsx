@@ -15,8 +15,11 @@ import AnalystLogin from "./pages/AnalystLogin";
 import AnalystDashboard from "./pages/AnalystDashboard";
 import AnalystClaimIntake from "./pages/AnalystClaimIntake";
 import AnalystClaimFormUpload from "./pages/AnalystClaimFormUpload";
+import AnalystMarineClaimForm from "./pages/AnalystMarineClaimForm";
 import AnalystClaimPhotos from "./pages/AnalystClaimPhotos";
 import AnalystClaimReport from "./pages/AnalystClaimReport";
+import AnalystAllClaims from "./pages/AnalystAllClaims";
+import AnalystSettings from "./pages/AnalystSettings";
 import AssessorLogin from "./pages/AssessorLogin";
 import AssessorDashboard from "./pages/AssessorDashboard";
 import AssessorClaimDetails from "./pages/AssessorClaimDetails";
@@ -54,8 +57,11 @@ const App = () => (
           <Route path="/analyst/dashboard" element={<AnalystDashboard />} />
           <Route path="/analyst/file-claim" element={<AnalystClaimIntake />} />
           <Route path="/analyst/upload-claim-form" element={<AnalystClaimFormUpload />} />
+          <Route path="/analyst/file-marine-claim" element={<AnalystMarineClaimForm />} />
           <Route path="/analyst/claim/:claimId/photos" element={<AnalystClaimPhotos />} />
           <Route path="/analyst/claim/:claimId" element={<AnalystClaimReport />} />
+          <Route path="/analyst/claims" element={<AnalystAllClaims />} />
+          <Route path="/analyst/settings" element={<AnalystSettings />} />
           <Route path="/assessor/login" element={<AssessorLogin />} />
           <Route path="/assessor/dashboard" element={<AssessorDashboard />} />
           <Route path="/assessor/claim/:claimId" element={<AssessorClaimDetails />} />

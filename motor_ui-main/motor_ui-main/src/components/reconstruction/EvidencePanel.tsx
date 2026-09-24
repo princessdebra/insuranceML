@@ -317,14 +317,19 @@ export default function EvidencePanel({ physics }: { physics: PhysicsReconstruct
         </div>
       )}
 
-      {/* Why explanation */}
+      {/* Why explanation -- only the first paragraph. The underlying model
+          is prompted for 2-3 paragraphs, but everything past the first
+          tends to be speculative elaboration on the discrepancy rather than
+          the core verdict reasoning, so it's trimmed here rather than
+          risking the model still writing more than one paragraph despite a
+          prompt change. */}
       {physics.physics_explanation && (
         <details className="rounded-2xl border border-border bg-card shadow-sm overflow-hidden" open={whyOpen} onToggle={(e) => setWhyOpen((e.target as HTMLDetailsElement).open)}>
           <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-[10px] font-black uppercase tracking-widest text-muted-foreground">
             Why did the system reach this verdict?
             <span className="material-symbols-outlined text-[16px] transition-transform" style={{ transform: whyOpen ? "rotate(180deg)" : "none" }}>expand_more</span>
           </summary>
-          <p className="px-4 pb-4 text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap">{physics.physics_explanation}</p>
+          <p className="px-4 pb-4 text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap">{physics.physics_explanation.split(/\n\s*\n/)[0]}</p>
         </details>
       )}
 

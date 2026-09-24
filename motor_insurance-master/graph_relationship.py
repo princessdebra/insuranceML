@@ -47,7 +47,10 @@ class RelationshipResult:
         return "\n".join(f"- [{f.severity.upper()}] {f.description}" for f in self.findings)
 
 
-def analyze_relationships(db_manager, claim_id: str, member_id: str, repair_shop_id: str = None) -> RelationshipResult:
+def analyze_relationships(
+    db_manager, claim_id: str, member_id: str, repair_shop_id: str = None,
+    surveyor_contact: str = None,
+) -> RelationshipResult:
     result = RelationshipResult()
 
     member = db_manager.get_member_info(member_id) or {}
@@ -111,6 +114,34 @@ def analyze_relationships(db_manager, claim_id: str, member_id: str, repair_shop
                 f"This claim's repair shop ({row['name']}) has a fraud-flag rate of "
                 f"{row['fraud_flag_count']}/{row['total_claims']} claims — above what's typical, "
                 "worth factoring in alongside this claim's own signals.",
+                [],
+            ))
+
+    # Marine: shared surveyor contact or bank token across otherwise-
+    # unrelated cargo/hull claims (developer guide's M01 illustration).
+    # No dedicated surveyors table exists yet -- this searches
+    # claim_documents' own OCR-extracted parsed_fields for a matching
+    # contact, the same "handful of shared-field lookups" spirit as the
+    # phone/bank checks above rather than a new graph schema.
+    if surveyor_contact:
+        try:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT DISTINCT claim_id, parsed_fields FROM claim_documents "
+                    "WHERE claim_id != ? AND parsed_fields LIKE ?",
+                    (claim_id, f"%{surveyor_contact}%"),
+                )
+                other_claim_ids = sorted({row["claim_id"] for row in cursor.fetchall()})
+        except Exception as e:
+            logger.warning(f"graph_relationship surveyor-contact lookup failed: {e}")
+            other_claim_ids = []
+        if other_claim_ids:
+            result.findings.append(RelationshipFinding(
+                "shared_surveyor_contact", "medium",
+                f"The surveyor/contact on this claim also appears on {len(other_claim_ids)} other "
+                f"claim(s) — {', '.join(other_claim_ids)} — this requires verification, not a finding "
+                "of collusion on its own.",
                 [],
             ))
 

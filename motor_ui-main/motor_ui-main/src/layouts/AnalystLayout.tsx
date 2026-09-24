@@ -11,6 +11,9 @@ const navItems = [
   { label: "Dashboard", icon: "dashboard", path: "/analyst/dashboard" },
   { label: "File a Claim (Phone)", icon: "add_call", path: "/analyst/file-claim" },
   { label: "Upload Claim Form", icon: "document_scanner", path: "/analyst/upload-claim-form" },
+  { label: "File a Marine Claim", icon: "anchor", path: "/analyst/file-marine-claim" },
+  { label: "All Claims", icon: "list_alt", path: "/analyst/claims" },
+  { label: "Settings", icon: "tune", path: "/analyst/settings" },
 ];
 
 export default function AnalystLayout({ children, analystName, analystId }: AnalystLayoutProps) {

@@ -382,6 +382,22 @@ export default function ReconstructionCanvas({
     const dy2 = t2[t2.length - 1].position[1] - t2[0].position[1];
     const heading2 = (dx2 === 0 && dy2 === 0) ? Math.PI : Math.atan2(dy2, dx2);
 
+    // heading1 is V1's direction of TRAVEL, not necessarily which way its
+    // body faces -- those are the same thing for a normal forward impact,
+    // but not when the member reversed into a fixed object (impact_zone_v1
+    // is a rear zone): the car moves toward the barrier tail-first, so its
+    // front/nose actually points AWAY from the barrier. Drawing the sprite
+    // with heading1 directly put the nose facing the wall even for a
+    // reversing claim, which is backwards. v1BodyHeading is what should
+    // drive the sprite's rotation AND the impact-zone highlight's side
+    // (front_bumper/rear_bumper are relative to the car's own body, not its
+    // travel direction) -- heading1 itself stays untouched for anything
+    // about the physical path (barrier contact-point nudge, trajectories).
+    const v1RearImpactOnFixedObject =
+      physics.v2_body_type === "fixed_object" &&
+      (physics.impact_zone_v1 === "rear_bumper" || physics.impact_zone_v1 === "rear_driver" || physics.impact_zone_v1 === "rear_passenger");
+    const v1BodyHeading = v1RearImpactOnFixedObject ? heading1 + Math.PI : heading1;
+
     // ── Trajectories (real telemetry positions up to tSim, not a fit curve) ──
     if (layers.trajectories) {
       [{ tl: t1, color: V1_COLOR }, { tl: t2, color: V2_COLOR }].forEach(({ tl, color }) => {
@@ -419,8 +435,8 @@ export default function ReconstructionCanvas({
       const v1HalfLen = toPx((v1Info?.length_m || 4.4) / 2);
       const v1HalfWid = toPx((v1Info?.width_m || 1.7) / 2);
       const localOff = impactZoneOffset(physics.impact_zone_v1, v1HalfLen, v1HalfWid);
-      const worldOffX = localOff.x * Math.cos(heading1) - localOff.y * Math.sin(heading1);
-      const worldOffY = localOff.x * Math.sin(heading1) + localOff.y * Math.cos(heading1);
+      const worldOffX = localOff.x * Math.cos(v1BodyHeading) - localOff.y * Math.sin(v1BodyHeading);
+      const worldOffY = localOff.x * Math.sin(v1BodyHeading) + localOff.y * Math.cos(v1BodyHeading);
       damageZones.forEach((z) => {
         if (!z.bbox_normalized) return;
         const targetIsV2 = z.vehicle?.toLowerCase().includes("2");
@@ -511,17 +527,23 @@ export default function ReconstructionCanvas({
     const BARRIER_THICKNESS_M = 1.2; // must match drawBarrier's own halfLen*2
 
     let p1 = worldToScreen(s1.x, s1.y);
-    // Once V1 is pinned at the barrier post-impact (service.py clamps world
-    // position to exactly the barrier's own center, y<=0 -- see the
-    // "V1 driving through the barrier" fix), drawing the car sprite dead-
-    // center on that same point makes it look like the car is embedded
-    // inside the wall rather than stopped against its face. Nudge the
-    // SPRITE only (not s1 itself, which everything else -- skid marks, HUD
-    // speed, trajectory -- still reads unmodified) back along V1's own
-    // approach direction by half its length plus half the barrier's
-    // thickness, so the front bumper visually touches the wall instead of
-    // passing through its centerline.
-    if (v2IsFixedObject && tSim >= 0) {
+    // drawVehicle draws the car body CENTERED on p1, extending v1Len/2 in
+    // both directions along its heading -- so even when the telemetry
+    // CENTER point (s1) is still short of y=0, the body's own near edge can
+    // already be past the barrier's face once the center gets within half
+    // the car's length of it. This was previously only corrected for
+    // tSim >= 0 (post-impact, where service.py pins V1 exactly at the
+    // barrier's center) -- but at low reconstructed speeds the car can
+    // brake to a stop well under one car-length from the barrier while
+    // tSim is still negative (pre-impact), so the sprite visibly embedded
+    // in the wall for however long it sat there before t=0. Applying the
+    // same backward nudge at every tSim (not just post-impact) fixes that
+    // for any claim, not just fast ones -- a uniform offset along the
+    // whole pre-impact approach is imperceptible when the car is still far
+    // out, and is exactly what's needed once it's close. Nudges the SPRITE
+    // only (not s1 itself, which everything else -- skid marks, HUD speed,
+    // trajectory -- still reads unmodified).
+    if (v2IsFixedObject) {
       const backAlong = v1Len / 2 + BARRIER_THICKNESS_M / 2;
       const nudged = worldToScreen(s1.x - Math.cos(heading1) * backAlong, s1.y - Math.sin(heading1) * backAlong);
       p1 = nudged;
@@ -543,14 +565,14 @@ export default function ReconstructionCanvas({
     const barrierHeading = heading1;
 
     if (layers.labels) {
-      drawVehicle(ctx, p1.x, p1.y, heading1, v1Len, v1Wid, V1_COLOR, `V1 ${v1Info?.model || v1Info?.make || ""}`.trim(), `${Math.max(0, s1.velocityKmh).toFixed(0)} km/h`, toPx, v1Info?.body_type);
+      drawVehicle(ctx, p1.x, p1.y, v1BodyHeading, v1Len, v1Wid, V1_COLOR, `V1 ${v1Info?.model || v1Info?.make || ""}`.trim(), `${Math.max(0, s1.velocityKmh).toFixed(0)} km/h`, toPx, v1Info?.body_type);
       if (v2IsFixedObject) {
         drawBarrier(ctx, p2.x, p2.y, barrierHeading, toPx, v2Info?.model || "Fixed Object");
       } else {
         drawVehicle(ctx, p2.x, p2.y, heading2, v2Len, v2Wid, V2_COLOR, `V2 ${v2Info?.model || v2Info?.make || ""}`.trim(), `${Math.max(0, s2.velocityKmh).toFixed(0)} km/h`, toPx, v2Info?.body_type);
       }
     } else {
-      drawVehicle(ctx, p1.x, p1.y, heading1, v1Len, v1Wid, V1_COLOR, "", "", toPx, v1Info?.body_type);
+      drawVehicle(ctx, p1.x, p1.y, v1BodyHeading, v1Len, v1Wid, V1_COLOR, "", "", toPx, v1Info?.body_type);
       if (v2IsFixedObject) {
         drawBarrier(ctx, p2.x, p2.y, barrierHeading, toPx, "");
       } else {

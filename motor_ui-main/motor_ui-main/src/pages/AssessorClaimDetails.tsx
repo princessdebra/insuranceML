@@ -464,7 +464,11 @@ export default function AssessorClaimDetails() {
                             </div>
                           </div>
 
-                          {(result?.detections?.length > 0 || result?.damage_zones?.length > 0) ? (
+                          {/* damageZones ("(scan)" whole-photo part-name
+                              guesses) intentionally not passed to DamagePanel
+                              below -- see its own comment. Only the trained
+                              detector's findings gate whether this renders. */}
+                          {result?.detections?.length > 0 ? (
                             <div>
                               <p className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-3 flex items-center gap-1.5">
                                 <span className="material-symbols-outlined text-sm text-primary">directions_car</span>
@@ -475,7 +479,16 @@ export default function AssessorClaimDetails() {
                                 photoId={photo.id}
                                 filename={photo.filename}
                                 detections={result.detections || []}
-                                damageZones={result.damage_zones || []}
+                                // damageZones (the whole-photo vision-LLM part-name
+                                // scan, "(scan)" rows) intentionally not passed --
+                                // it's been confidently mislabeling parts (e.g.
+                                // "Left Headlamp" on a plain rear-bumper photo).
+                                // Showing only the trained detector's findings
+                                // (generic but accurate) until that's retrained
+                                // on a proper part-location taxonomy. The
+                                // underlying damage_zones data is untouched and
+                                // still feeds cost estimation/physics elsewhere --
+                                // this only turns off its display here.
                                 assessorId={localStorage.getItem("assessorId") || ""}
                                 existingDecisions={Object.fromEntries(
                                   damageDecisions

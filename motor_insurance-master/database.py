@@ -376,6 +376,158 @@ class DatabaseManager:
                 )
             ''')
 
+            # ------------------------------------------------------------
+            # Domestic Package / Marine Hull / Marine Cargo / Goods in
+            # Transit foundation -- new product lines alongside Motor. Each
+            # *_policy_details table follows the same 1:1 policy_id PK/FK
+            # convention as motor_policy_details above. marine_policy_details
+            # and domestic_policy_details already exist on deployed DBs
+            # (created outside this file's own init path historically) --
+            # CREATE TABLE IF NOT EXISTS here is a no-op against their
+            # existing shape there, and the correct place for a genuinely
+            # fresh DB to get them; new columns for both are added via the
+            # guarded ALTER loop further below rather than in the CREATE
+            # statement, since IF NOT EXISTS won't retrofit an already-live
+            # table.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS marine_policy_details (
+                    policy_id TEXT PRIMARY KEY,
+                    cargo_description TEXT,
+                    origin TEXT,
+                    destination TEXT,
+                    conveyance_type TEXT,
+                    icc_clause TEXT,
+                    packing_warranty BOOLEAN,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS domestic_policy_details (
+                    policy_id TEXT PRIMARY KEY,
+                    premises_address TEXT,
+                    buildings_sum_insured REAL,
+                    contents_sum_insured REAL,
+                    valuables_limit REAL,
+                    security_warranty TEXT,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            # Marine Hull -- vessel/navigation/survey data. Distinct table
+            # from marine_policy_details (which is Cargo-shaped) since Hull's
+            # fields (vessel, navigation area, survey/operator certificates)
+            # have almost nothing in common with a shipment's.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS marine_hull_policy_details (
+                    policy_id TEXT PRIMARY KEY,
+                    vessel_id TEXT,
+                    registration_number TEXT,
+                    description TEXT,
+                    vessel_use TEXT,
+                    navigation_area_description TEXT,
+                    navigation_zone TEXT,
+                    survey_valid_to DATE,
+                    operator_certificate_valid_to DATE,
+                    insured_value REAL,
+                    deductible REAL,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            # Goods in Transit -- approved vehicle/driver/transporter and
+            # conveyance limit, distinct from Marine Cargo (owner's-goods
+            # interest over a defined transit vs a carrier/road-transport
+            # policy insuring a specific conveyance).
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS goods_in_transit_policy_details (
+                    policy_id TEXT PRIMARY KEY,
+                    transit_id TEXT,
+                    approved_vehicle_reg TEXT,
+                    approved_driver_name TEXT,
+                    approved_transporter_name TEXT,
+                    commodity TEXT,
+                    conveyance_limit REAL,
+                    overnight_parking_warranty TEXT,
+                    route_description TEXT,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            # Generalizes "separately selected/purchased" cover components --
+            # Domestic's selectable sections (Buildings/Contents/All Risks/
+            # Burglary/Liability/Domestic employees) and Marine's separately
+            # purchased extensions (P&I, war risk, temperature extension)
+            # both fit this one shape rather than needing per-product schema.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS policy_sections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    policy_id TEXT NOT NULL,
+                    section_name TEXT NOT NULL,
+                    limit_amount REAL,
+                    excess REAL,
+                    selected BOOLEAN DEFAULT 1,
+                    effective_date DATE,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            # Individually scheduled Domestic items (e.g. a specified
+            # laptop) -- a claimed item must match one of these on
+            # description/serial/value, the same role motor_policy_details'
+            # vehicle fields play for a Motor claim.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS domestic_specified_items (
+                    item_id TEXT PRIMARY KEY,
+                    policy_id TEXT NOT NULL,
+                    description TEXT,
+                    serial_number TEXT,
+                    scheduled_value REAL,
+                    FOREIGN KEY (policy_id) REFERENCES policies(policy_id)
+                )
+            ''')
+
+            # AIS/GPS tracks, telematics logs, temperature-logger data --
+            # evidence files for Hull collision/grounding, Goods in Transit
+            # overturning, and Cargo temperature-excursion claims. Same
+            # raw-file-plus-extracted-JSON shape as claim_documents/
+            # claim_photo_files rather than a dedicated time-series store.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS claim_tracking_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id TEXT NOT NULL,
+                    party TEXT NOT NULL,
+                    data_type TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_data BLOB,
+                    parsed_summary TEXT,
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (claim_id) REFERENCES claims(claim_id)
+                )
+            ''')
+
+            # New columns on the two pre-existing *_policy_details tables --
+            # same guarded-ALTER pattern as the block below (duplicate-column
+            # and no-such-table are both fine to swallow).
+            for table, coltype in (
+                ("domestic_policy_details", "fuel_storage_wording TEXT"),
+                ("domestic_policy_details", "contents_limit_changed_at DATE"),
+                ("domestic_policy_details", "contents_limit_previous REAL"),
+                ("marine_policy_details", "cover_type TEXT"),
+                ("marine_policy_details", "clause TEXT"),
+                ("marine_policy_details", "shipment_id TEXT"),
+                ("marine_policy_details", "declaration_reference TEXT"),
+            ):
+                try:
+                    cursor.execute(f'ALTER TABLE {table} ADD COLUMN {coltype}')
+                    conn.commit()
+                    logger.info(f"Added {coltype.split()[0]} column to {table}")
+                except sqlite3.OperationalError as e:
+                    msg = str(e).lower()
+                    if "duplicate column" not in msg and "no such table" not in msg:
+                        raise
+            # ------------------------------------------------------------
+
             # These depend on `policies`/`members` existing, which are only
             # created by the separate migrate.py seeding script, not by
             # init_database() itself -- guard so a fresh/unusual DB state
@@ -650,6 +802,36 @@ class DatabaseManager:
                         (key, json.dumps(value), updated_by),
                     )
             conn.commit()
+
+    def list_assessor_capacity(self) -> List[Dict[str, Any]]:
+        """Assessor roster with workload/capacity, for the Settings page's
+        capacity table -- lets an analyst see who's maxed out before it
+        silently blocks auto-assignment."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT assessor_id, name, location, specialization,
+                       active_status, current_workload, max_workload, rating
+                FROM assessors
+                ORDER BY specialization, location, name
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_assessor_capacity(self, assessor_id: str, max_workload: int) -> Dict[str, Any]:
+        """Raises/lowers one assessor's max_workload cap -- called from the
+        analyst Settings page when auto-assignment dead-ends because every
+        assessor for a location+specialization is at capacity."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT assessor_id FROM assessors WHERE assessor_id = ?", (assessor_id,))
+            if not cursor.fetchone():
+                return {"success": False, "reason": f"Assessor {assessor_id} not found"}
+            cursor.execute(
+                "UPDATE assessors SET max_workload = ? WHERE assessor_id = ?",
+                (max_workload, assessor_id),
+            )
+            conn.commit()
+            return {"success": True, "assessor_id": assessor_id, "max_workload": max_workload}
 
     MEMBER_EDITABLE_CLAIM_FIELDS = {"estimated_cost", "location", "narrative"}
 
@@ -1236,25 +1418,45 @@ class DatabaseManager:
         """
         
         cursor = conn.cursor()
-        
+
         # Extract city from location
         city = incident_location.split(',')[0].strip()
-        
+
+        # claim_type's vocabulary (motor/marine_hull/marine_cargo/
+        # goods_in_transit/domestic -- see routes.py's _resolve_claim_type)
+        # is more specific than assessors.specialization currently is --
+        # the assessor roster only has broad motor/marine/domestic
+        # specialists seeded. A strict equality match here would find zero
+        # assessors for every Marine sub-type. Accept an assessor whose
+        # specialization matches the claim type exactly (a true Hull/Cargo/
+        # GIT specialist, if one's ever added) OR the broader "marine"
+        # specialization as a fallback, same spirit as the existing
+        # Nairobi-fallback for location -- and rank an exact specialist
+        # ahead of the generic fallback when both are available.
+        _SPECIALIZATION_FALLBACKS = {
+            "marine_hull": ("marine_hull", "marine"),
+            "marine_cargo": ("marine_cargo", "marine"),
+            "goods_in_transit": ("goods_in_transit", "marine"),
+        }
+        acceptable_specializations = _SPECIALIZATION_FALLBACKS.get(claim_type, (claim_type,))
+        placeholders = ", ".join("?" for _ in acceptable_specializations)
+
         # Find best assessor
-        cursor.execute('''
-            SELECT assessor_id, name, current_workload, rating, location
+        cursor.execute(f'''
+            SELECT assessor_id, name, current_workload, rating, location, specialization
             FROM assessors
             WHERE active_status = 1
-            AND specialization = ?
+            AND specialization IN ({placeholders})
             AND (location LIKE ? OR location LIKE '%Nairobi%')
             AND current_workload < max_workload
-            ORDER BY 
+            ORDER BY
+                CASE WHEN specialization = ? THEN 0 ELSE 1 END,  -- Prefer an exact specialist
                 CASE WHEN location LIKE ? THEN 0 ELSE 1 END,  -- Prefer same location
                 current_workload ASC,
                 rating DESC
             LIMIT 1
-        ''', (claim_type, f'%{city}%', f'%{city}%'))
-        
+        ''', (*acceptable_specializations, f'%{city}%', claim_type, f'%{city}%'))
+
         assessor = cursor.fetchone()
         
         if not assessor:
@@ -1725,6 +1927,74 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error correcting document {document_id}: {str(e)}")
             raise
+
+    def store_tracking_data(
+        self,
+        claim_id: str,
+        party: str,
+        data_type: str,
+        filename: str,
+        file_data: bytes,
+        parsed_summary: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        Store an AIS/GPS track, telematics log, or temperature-logger file --
+        evidence for Hull collision/grounding (BR-MET-008's metadata
+        comparison), Goods in Transit overturning, and Cargo temperature-
+        excursion claims. Same raw-file-plus-extracted-JSON shape as
+        store_document, deliberately not a dedicated time-series store --
+        actual row-by-row parsing of the CSV into structured points is a
+        later phase; this just gets the file safely attached to the claim
+        so the file itself is retrievable, with parsed_summary left null
+        until that parsing exists.
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO claim_tracking_data (claim_id, party, data_type, filename, file_data, parsed_summary)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    claim_id, party, data_type, filename, file_data,
+                    json.dumps(parsed_summary, ensure_ascii=False) if parsed_summary else None,
+                ))
+                conn.commit()
+                tracking_id = cursor.lastrowid
+                logger.info(f"Stored tracking data: {filename} ({data_type}) for {party} in claim {claim_id} (ID: {tracking_id})")
+                return tracking_id
+        except Exception as e:
+            logger.error(f"Error storing tracking data {filename}: {str(e)}")
+            raise
+
+    def get_tracking_data_by_claim(self, claim_id: str, party: Optional[str] = None) -> List[Dict]:
+        """Retrieve tracking-data records (without the raw file bytes) for a claim, optionally filtered by party."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                query = '''
+                    SELECT id, claim_id, party, data_type, filename, parsed_summary, uploaded_at
+                    FROM claim_tracking_data
+                    WHERE claim_id = ?
+                '''
+                params = [claim_id]
+                if party:
+                    query += ' AND party = ?'
+                    params.append(party)
+                query += ' ORDER BY uploaded_at ASC'
+
+                cursor.execute(query, params)
+                records = []
+                for row in cursor.fetchall():
+                    rec = dict(row)
+                    try:
+                        rec['parsed_summary'] = json.loads(rec['parsed_summary']) if rec['parsed_summary'] else None
+                    except (json.JSONDecodeError, TypeError):
+                        rec['parsed_summary'] = None
+                    records.append(rec)
+                return records
+        except Exception as e:
+            logger.error(f"Error retrieving tracking data for claim {claim_id}: {str(e)}")
+            return []
 
     def store_photo_file(
         self,

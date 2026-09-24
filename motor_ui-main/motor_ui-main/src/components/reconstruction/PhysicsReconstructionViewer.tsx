@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from "react";
+﻿import { useMemo, useRef, useState } from "react";
 import { PhysicsReconstruction, VehicleInfo, DEFAULT_LAYERS, CameraMode, DamageZoneWithParty, vehicleInfoFromKey } from "./types";
 import { telemetryBounds, deriveEvents } from "./interpolateTelemetry";
 import { usePlaybackClock } from "./usePlaybackClock";
@@ -61,6 +61,7 @@ export default function PhysicsReconstructionViewer({
   const [measuring, setMeasuring] = useState(false);
   const [measurement, setMeasurement] = useState<number | null>(null);
   const [showEvidence, setShowEvidence] = useState(true);
+  const evidenceRef = useRef<HTMLDivElement>(null);
 
   const timeline = physics.timeline;
   const hasTimeline = !!(timeline?.v1_insured_telemetry?.length && timeline?.v2_third_party_telemetry?.length);
@@ -243,9 +244,17 @@ export default function PhysicsReconstructionViewer({
             v2Info={resolvedV2Info}
             claimId={claimId}
             onReplay={clock.replay}
-            onViewEvidence={() => setShowEvidence(true)}
+            onViewEvidence={() => {
+              // showEvidence already defaults to true (the panel is always
+              // rendered), so setting it to true again was a no-op -- the
+              // button appeared broken with nothing to reveal. What's
+              // actually useful is scrolling it into view, which matters on
+              // narrower screens where it can be well below the fold.
+              setShowEvidence(true);
+              evidenceRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
           />
-          {showEvidence && <EvidencePanel physics={physics} />}
+          {showEvidence && <div ref={evidenceRef}><EvidencePanel physics={physics} /></div>}
           <ComparisonTable comparison={physics.comparison} />
         </div>
       </div>

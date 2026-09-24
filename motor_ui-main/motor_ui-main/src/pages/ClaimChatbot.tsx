@@ -170,6 +170,18 @@ type Message = {
   component?: React.ReactNode;
 };
 
+// Theft/fire claims have no vehicle left to photograph (or nothing usefully
+// photographable), unlike a collision -- forcing a damage photo before
+// "Submit Claim" unlocks on those blocks a legitimate claimant with nothing
+// to attach. Keyword-based, same style as the backend's own narrative
+// keyword fallbacks (pipeline_bridge.py) -- a simple, explainable heuristic
+// rather than another LLM round-trip just to decide whether a photo picker
+// should be required.
+const NO_PHOTO_NEEDED_PATTERN = /\b(stolen|theft|stole|carjack(ed)?|hijack(ed)?|burnt|burned|burnt out|gutted by fire|caught fire|engulfed in flames)\b/i;
+function narrativeSuggestsNoPhotosNeeded(narrative: string): boolean {
+  return NO_PHOTO_NEEDED_PATTERN.test(narrative || "");
+}
+
 export default function ClaimChatbot({ analystMode = false }: { analystMode?: boolean }) {
   const navigate = useNavigate();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -923,7 +935,9 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
       await addBotMessage(
         analystMode
           ? "Last step. If the caller has emailed or sent photos you have on hand, you can attach them now — otherwise skip ahead, the assessor will capture photos during the on-site inspection."
-          : getRand(RESPONSES.ASK_PHOTOS)
+          : narrativeSuggestsNoPhotosNeeded(formDataRef.current.narrative)
+            ? "Since there's no vehicle available to photograph, photos are optional here — attach any you have (e.g. the scene, a police report photo) or just submit."
+            : getRand(RESPONSES.ASK_PHOTOS)
       );
     } else if (step === "ASK_THIRD_PARTY") {
       const yn = parseYesNo(val);
@@ -1090,6 +1104,14 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
       const result = await createClaim(claimPayload);
       if (result.success) {
         updateForm({ claim_id: result.claim_id });
+        // assessor_assignment has no assessor_name at all when none was
+        // available to auto-assign (assigned: false, reason: "...") --
+        // reading assessor_name[0] unconditionally for the avatar initial
+        // threw a TypeError in that case, which the catch block below
+        // reported as "Claim registration failed" even though the claim had
+        // already been created successfully. Render a neutral "pending
+        // assignment" state instead of crashing when that happens.
+        const hasAssessor = !!result.assessor_assignment?.assigned && !!result.assessor_assignment?.assessor_name;
         await addBotMessage(
           result.message,
           <div className="mt-3 space-y-4">
@@ -1099,8 +1121,13 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                 <Badge variant="secondary" className="bg-white/20 text-white border-none">ACTIVE</Badge>
               </div>
               <div className="flex items-center gap-3 bg-white/10 p-3 rounded-lg">
-                <Avatar className="size-8 bg-white/20 text-xs flex items-center justify-center font-bold">{result.assessor_assignment.assessor_name[0]}</Avatar>
-                <div><p className="text-[10px] opacity-70">Assigned Assessor</p><p className="text-xs font-bold">{result.assessor_assignment.assessor_name}</p></div>
+                <Avatar className="size-8 bg-white/20 text-xs flex items-center justify-center font-bold">
+                  {hasAssessor ? result.assessor_assignment.assessor_name[0] : "?"}
+                </Avatar>
+                <div>
+                  <p className="text-[10px] opacity-70">Assigned Assessor</p>
+                  <p className="text-xs font-bold">{hasAssessor ? result.assessor_assignment.assessor_name : "Pending assignment"}</p>
+                </div>
               </div>
             </div>
             <Button className="w-full bg-primary py-6 font-bold" onClick={() => { addUserMessage("Moving to final step."); setStep("ASK_NARRATIVE"); addBotMessage(getRand(RESPONSES.ASK_NARRATIVE)); }}>
@@ -1216,7 +1243,13 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                 <Avatar className="size-8 bg-primary text-primary-foreground flex items-center justify-center"><span className="material-symbols-outlined text-sm">psychology</span></Avatar>
                 <div className="bg-card border rounded-2xl p-5 w-full max-w-[85%] shadow-lg">
                   <label className="text-[10px] text-muted-foreground mb-1 block">
-                    Damage photos {analystMode ? "(optional — assessor will capture these on-site)" : ""}
+                    Damage photos {
+                      analystMode
+                        ? "(optional — assessor will capture these on-site)"
+                        : narrativeSuggestsNoPhotosNeeded(formDataRef.current.narrative)
+                          ? "(optional — there's no vehicle to photograph for a theft/fire claim)"
+                          : ""
+                    }
                   </label>
                   <Input
                     type="file"
@@ -1264,7 +1297,11 @@ export default function ClaimChatbot({ analystMode = false }: { analystMode?: bo
                     </div>
                   </div>
 
-                  <Button className="w-full bg-primary font-bold py-6" disabled={(!analystMode && photos.length === 0) || isTyping} onClick={() => handleFinalSubmit(photos)}>
+                  <Button
+                    className="w-full bg-primary font-bold py-6"
+                    disabled={(!analystMode && photos.length === 0 && !narrativeSuggestsNoPhotosNeeded(formDataRef.current.narrative)) || isTyping}
+                    onClick={() => handleFinalSubmit(photos)}
+                  >
                     Submit Claim
                   </Button>
                 </div>

@@ -127,19 +127,42 @@ class ConfigurableMultiVehicleEngine:
                 abs_t = abs(t)
                 is_colliding = False
 
+                # time_to_stop: at low reconstructed speeds (a slow reverse
+                # into a barrier, say), the vehicle can fully stop under
+                # hard braking well before the fixed 1-second braking_duration_s
+                # window ends. The position formula below is a downward
+                # parabola in abs_t -- past the real stopping point it keeps
+                # evaluating and starts DECREASING the distance-from-impact
+                # again, eventually going negative, which put the car
+                # visually on the wrong side of (or overlapping) the impact
+                # point during frames that are still supposed to be
+                # pre-impact. Holding position at the true stopping distance
+                # once speed reaches zero fixes that for any claim, not just
+                # this one -- previously this was masked by every prior test
+                # claim happening to have high enough speed that the natural
+                # stop always landed past 1 second anyway.
+                time_to_stop = (v1_pre_impact_mps / a_braking) if a_braking > 0 else float("inf")
+                braking_end_t = min(braking_duration_s, time_to_stop)
                 if abs_t <= braking_duration_s:
-                    v1_speed = max(0.0, v1_pre_impact_mps - (a_braking * abs_t))
-                    m1 = (v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (abs_t ** 2))
+                    if abs_t >= time_to_stop:
+                        v1_speed = 0.0
+                        m1 = (v1_pre_impact_mps ** 2) / (2 * a_braking) if a_braking > 0 else 0.0
+                    else:
+                        v1_speed = max(0.0, v1_pre_impact_mps - (a_braking * abs_t))
+                        m1 = (v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (abs_t ** 2))
                 elif abs_t <= (braking_duration_s + human_prt_seconds):
                     v1_speed = v1_pre_impact_mps
                     brake_start_dist = (
-                        (v1_pre_impact_mps * braking_duration_s) -
-                        (0.5 * a_braking * (braking_duration_s ** 2))
+                        (v1_pre_impact_mps * braking_end_t) -
+                        (0.5 * a_braking * (braking_end_t ** 2))
                     )
                     m1 = brake_start_dist + (v1_pre_impact_mps * (abs_t - braking_duration_s))
                 else:
                     v1_speed = v1_pre_impact_mps
-                    m1 = (v1_pre_impact_mps * abs_t) - (0.5 * a_braking * (braking_duration_s ** 2))
+                    m1 = (
+                        (v1_pre_impact_mps * (abs_t - braking_duration_s + braking_end_t)) -
+                        (0.5 * a_braking * (braking_end_t ** 2))
+                    )
 
                 v2_speed = v2_pre_impact_mps
                 m2 = v2_pre_impact_mps * abs_t

@@ -83,24 +83,88 @@ class PolicyCoverageChecker:
             • Use Outside Policy Conditions
             """,
             
-            "marine": """
+            "marine_cargo": """
             MARINE CARGO INSURANCE POLICY - Specimen Policy Wording
-            
+
             SECTION 3 – INSURED TRANSIT
-            Cover attaches from the time the cargo leaves the warehouse at origin 
+            Cover attaches from the time the cargo leaves the warehouse at origin
             and continues during ordinary course of transit until delivery to final warehouse.
-            
+
             SECTION 10 – EXCLUSIONS
             • Inherent Vice - Loss caused by natural characteristics of cargo
             • Delay - Loss caused by delay in transit
             • Poor Packing - Loss caused by inadequate packing
             • Ordinary Leakage or Loss of Weight
-            
+
             SECTION 11 – PACKING WARRANTY
             Cargo shall be properly packed and prepared for transit.
             Failure to comply may invalidate a claim.
             """,
-            
+
+            "marine_hull": """
+            MARINE HULL AND MACHINERY INSURANCE POLICY - Specimen Policy Wording
+
+            SECTION 2 – WHAT IS COVERED
+            Loss of or damage to the insured vessel and its machinery caused by:
+            • Perils of the seas, rivers or other navigable waters
+            • Fire, explosion, collision or contact with any external object
+            • Stranding, grounding, sinking or capsizing
+
+            SECTION 5 – NAVIGATION LIMITS
+            The vessel must operate only within the navigation area stated in the Schedule.
+            The Insurer shall not be liable for loss occurring outside the permitted navigation area
+            unless held up by circumstances beyond the Master's control.
+
+            SECTION 6 – VESSEL USE
+            The vessel may only be used for the purposes stated in the Schedule.
+            Use for an unstated commercial purpose (e.g. paid passenger carriage on a pleasure
+            vessel) may fall outside cover.
+
+            SECTION 7 – SURVEY AND CLASS WARRANTY
+            The vessel must be maintained in a seaworthy condition and hold a valid survey/class
+            certificate as required by the Schedule. Cover is subject to this warranty; a lapsed
+            survey is referred for review, not an automatic decline.
+
+            SECTION 8 – MASTER AND OPERATOR WARRANTY
+            The vessel must be operated only by a Master/operator holding the qualification stated
+            in the Schedule.
+
+            GENERAL EXCLUSIONS
+            • Wear and tear, gradual deterioration or inadequate maintenance
+            • Unseaworthiness known to the Insured at the start of the voyage
+            • War and associated risks unless separately purchased
+            """,
+
+            "goods_in_transit": """
+            GOODS IN TRANSIT INSURANCE POLICY - Specimen Policy Wording
+
+            SECTION 2 – WHAT IS COVERED
+            Loss of or damage to goods declared for transit, while in transit by the approved
+            vehicle(s) and driver(s)/transporter(s) stated in the Schedule, caused by:
+            • Collision or overturning of the carrying vehicle
+            • Fire, theft or hijacking
+            • Accidental external damage during loading or unloading
+
+            SECTION 4 – APPROVED VEHICLE, DRIVER AND TRANSPORTER
+            Cover applies only while goods are carried by the vehicle, driver and transporter
+            approved in the Schedule (or a listed subcontractor). Use of an unapproved vehicle,
+            driver or transporter is referred for a transit-party check.
+
+            SECTION 5 – PER CONVEYANCE LIMIT
+            The Insurer's liability for any one vehicle or movement shall not exceed the per
+            conveyance limit stated in the Schedule.
+
+            SECTION 6 – OVERNIGHT PARKING WARRANTY
+            Where stated in the Schedule, the vehicle must be parked overnight only at the type
+            or place of parking specified. Parking elsewhere during the specified hours may be
+            referred for warranty compliance review.
+
+            GENERAL EXCLUSIONS
+            • Inherent vice or natural deterioration of the goods
+            • Unexplained shortage without evidence of loss during an insured transit
+            • Route deviation not reasonably explained by traffic, safety or delivery requirements
+            """,
+
             "domestic": """
             DOMESTIC PACKAGE INSURANCE POLICY - Specimen Policy Wording
             
@@ -225,7 +289,7 @@ class PolicyCoverageChecker:
                     if motor_details:
                         policy.update(dict(motor_details))
                 
-                elif claim_type == 'marine':
+                elif claim_type == 'marine_cargo':
                     cursor.execute('''
                         SELECT * FROM marine_policy_details
                         WHERE policy_id = ?
@@ -233,7 +297,25 @@ class PolicyCoverageChecker:
                     marine_details = cursor.fetchone()
                     if marine_details:
                         policy.update(dict(marine_details))
-                
+
+                elif claim_type == 'marine_hull':
+                    cursor.execute('''
+                        SELECT * FROM marine_hull_policy_details
+                        WHERE policy_id = ?
+                    ''', (policy['policy_id'],))
+                    hull_details = cursor.fetchone()
+                    if hull_details:
+                        policy.update(dict(hull_details))
+
+                elif claim_type == 'goods_in_transit':
+                    cursor.execute('''
+                        SELECT * FROM goods_in_transit_policy_details
+                        WHERE policy_id = ?
+                    ''', (policy['policy_id'],))
+                    git_details = cursor.fetchone()
+                    if git_details:
+                        policy.update(dict(git_details))
+
                 elif claim_type == 'domestic':
                     cursor.execute('''
                         SELECT * FROM domestic_policy_details
@@ -242,7 +324,18 @@ class PolicyCoverageChecker:
                     domestic_details = cursor.fetchone()
                     if domestic_details:
                         policy.update(dict(domestic_details))
-                
+
+                # Separately-selected sections (Domestic) / separately
+                # purchased extensions (Marine) -- see database.py's
+                # policy_sections table. Not a hard requirement for every
+                # product, so absence here is normal, not an error.
+                if claim_type in ('domestic', 'marine_hull', 'marine_cargo'):
+                    cursor.execute('''
+                        SELECT section_name, limit_amount, excess, selected, effective_date
+                        FROM policy_sections WHERE policy_id = ?
+                    ''', (policy['policy_id'],))
+                    policy['sections'] = [dict(row) for row in cursor.fetchall()]
+
                 logger.info(f"Found policy: {policy['policy_number']} - Cover: {policy.get('cover_type','N/A')}")
                 return policy
                 
@@ -351,6 +444,53 @@ class PolicyCoverageChecker:
                 if cover_type == 'TPO':
                     checks['exclusions_triggered'].append("Third Party Only policy does not cover own vehicle damage")
 
+        elif claim_type == 'domestic':
+            # Security warranty compliance -- 'unusual does not mean
+            # fraudulent' (developer guide): an unconfirmed alarm status is
+            # a warning for the AI/handler to weigh, never an automatic
+            # exclusion applied here.
+            warranty = (policy.get('security_warranty') or '').strip()
+            alarm_status = incident_details.get('alarm_armed')
+            if warranty and alarm_status is not None and str(alarm_status).lower() in ('unknown', 'cannot determine', 'unresolved'):
+                checks['warnings'].append(
+                    f"Security warranty on file ('{warranty}') but compliance at the time of loss could not be confirmed"
+                )
+            checks['security_warranty_on_file'] = bool(warranty)
+
+            # Occupancy warranty -- unoccupied beyond the configured
+            # threshold is a referral per the developer guide's example,
+            # not decided here (no fixed day-count is hardcoded; the DB
+            # doesn't carry an occupancy-days field yet, so this only fires
+            # when the intake flow explicitly passes one).
+            unoccupied_days = incident_details.get('unoccupied_days')
+            if unoccupied_days is not None:
+                try:
+                    if int(unoccupied_days) > 30:
+                        checks['warnings'].append(
+                            f"Property reported unoccupied for {unoccupied_days} days -- occupancy warranty referral"
+                        )
+                except (TypeError, ValueError):
+                    pass
+
+        elif claim_type == 'marine_hull':
+            # Navigation area and survey/operator-certificate validity --
+            # seaworthiness itself stays a specialist conclusion, never
+            # decided by this DB-level check (developer guide: "This is a
+            # specialist conclusion, not a yes/no field for AI").
+            navigation_zone = (policy.get('navigation_zone') or '').strip()
+            incident_zone = (incident_details.get('navigation_zone') or '').strip()
+            if navigation_zone and incident_zone and navigation_zone.lower() != incident_zone.lower():
+                checks['exclusions_triggered'].append(
+                    f"Incident reported in '{incident_zone}', outside the vessel's permitted navigation area ('{navigation_zone}')"
+                )
+
+            survey_valid_to = policy.get('survey_valid_to')
+            incident_dt_str = incident_details.get('incident_datetime')
+            if survey_valid_to and incident_dt_str and str(survey_valid_to) < str(incident_dt_str)[:10]:
+                checks['warnings'].append(
+                    f"Vessel survey expired {survey_valid_to}, before the reported incident date -- refer, do not decide seaworthiness here"
+                )
+
         logger.debug(f"DB checks completed: {checks}")
         return checks
 
@@ -435,7 +575,13 @@ Respond with ONLY a JSON object in this exact shape:
             # calls, which would otherwise freeze the whole asyncio event loop
             # (every request on the server, not just this one) for as long as
             # Ollama takes to respond.
-            result = await asyncio.to_thread(generate_json, prompt, model=COVERAGE_CHECK_MODEL, retries=2, timeout=120)
+            # Coverage decisions are genuine policy-terms reasoning (not
+            # simple extraction) -- worth the higher thinking budget per the
+            # gateway's own guidance on when "high" is warranted.
+            result = await asyncio.to_thread(
+                generate_json, prompt, model=COVERAGE_CHECK_MODEL, retries=2, timeout=120,
+                reasoning_effort="high",
+            )
 
             # Add metadata
             result['member_id'] = policy.get('member_id')

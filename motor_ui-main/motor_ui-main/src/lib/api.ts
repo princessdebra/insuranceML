@@ -213,6 +213,13 @@ export async function submitMemberClaim(data: {
   injuries_reported?: string;
   injury_details?: string;
   id_document?: File;
+  // Claim-type-specific fields the business rules engine reads directly
+  // (not narrative text) -- e.g. { vessel_id, navigation_zone } for Marine
+  // Hull, { shipment_id } for Marine Cargo, { vehicle_reg, driver_name,
+  // transporter_name } for Goods in Transit, { item_serial_number,
+  // incident_address, alarm_armed } for Domestic. See routes.py's
+  // submit_member_claim structured_details param.
+  structured_details?: Record<string, string | number | boolean>;
 }) {
   const formData = new FormData();
   formData.append("claim_id", data.claim_id);
@@ -232,6 +239,9 @@ export async function submitMemberClaim(data: {
     const value = data[key];
     if (typeof value === "string") formData.append(key, value);
   });
+  if (data.structured_details && Object.keys(data.structured_details).length > 0) {
+    formData.append("structured_details", JSON.stringify(data.structured_details));
+  }
   data.photos.forEach((p) => formData.append("photos", p));
   if (data.id_document) formData.append("id_document", data.id_document);
   const res = await fetch(`${BASE_URL}/api/analysis/member`, {
@@ -245,7 +255,9 @@ export async function submitMemberClaim(data: {
 export async function uploadDocument(data: {
   claimId: string;
   party: "member" | "assessor";
-  documentType: "police_abstract" | "id_document" | "garage_quote" | "claim_form" | "other";
+  documentType: "police_abstract" | "id_document" | "garage_quote" | "claim_form"
+    | "invoice" | "packing_list" | "bill_of_lading" | "delivery_note" | "survey_report" | "master_statement"
+    | "other";
   uploaderId: string;
   file: File;
 }): Promise<{
@@ -262,6 +274,26 @@ export async function uploadDocument(data: {
   formData.append("uploader_id", data.uploaderId);
   formData.append("file", data.file);
   const res = await fetch(`${BASE_URL}/api/analysis/documents/upload`, {
+    method: "POST",
+    headers: { accept: "application/json" },
+    body: formData,
+  });
+  return res.json();
+}
+
+export async function uploadTrackingData(data: {
+  claimId: string;
+  party: "member" | "assessor";
+  dataType: "ais_gps" | "telematics" | "temperature_log";
+  uploaderId: string;
+  file: File;
+}): Promise<{ success: boolean; tracking_id?: number; detail?: string }> {
+  const formData = new FormData();
+  formData.append("party", data.party);
+  formData.append("data_type", data.dataType);
+  formData.append("uploader_id", data.uploaderId);
+  formData.append("file", data.file);
+  const res = await fetch(`${BASE_URL}/api/analysis/claim/${data.claimId}/tracking-data`, {
     method: "POST",
     headers: { accept: "application/json" },
     body: formData,
@@ -810,6 +842,35 @@ export async function updateBusinessRulesConfig(updates: Record<string, number |
   body.append("updates", JSON.stringify(updates));
   body.append("admin_id", adminId);
   const res = await fetch(`${BASE_URL}/api/analysis/admin/business-rules-config`, {
+    method: "POST", headers: { accept: "application/json" }, body,
+  });
+  return res.json();
+}
+
+export type AssessorCapacityRow = {
+  assessor_id: string;
+  name: string;
+  location: string;
+  specialization: string;
+  active_status: number;
+  current_workload: number;
+  max_workload: number;
+  rating: number;
+  available_capacity: number;
+  is_at_capacity: boolean;
+};
+
+export async function getAssessorCapacity(): Promise<{ success: boolean; assessors: AssessorCapacityRow[] }> {
+  const res = await fetch(`${BASE_URL}/api/analysis/admin/assessor-capacity`, { headers: { accept: "application/json" } });
+  return res.json();
+}
+
+export async function updateAssessorCapacity(assessorId: string, maxWorkload: number, adminId: string): Promise<{ success: boolean; assessor_id?: string; max_workload?: number; detail?: string }> {
+  const body = new URLSearchParams();
+  body.append("assessor_id", assessorId);
+  body.append("max_workload", String(maxWorkload));
+  body.append("admin_id", adminId);
+  const res = await fetch(`${BASE_URL}/api/analysis/admin/assessor-capacity`, {
     method: "POST", headers: { accept: "application/json" }, body,
   });
   return res.json();

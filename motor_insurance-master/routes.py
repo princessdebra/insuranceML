@@ -42,6 +42,30 @@ def get_claim_orchestrator() -> ClaimOrchestrator:
     return ClaimOrchestrator()
 
 
+def _resolve_claim_type(policy_id: Optional[str]) -> str:
+    """
+    The `claims` table deliberately has no claim_type column (see
+    database.py) -- claim type is only ever knowable via the claim's own
+    policy_id -> policies.policy_type. Every background analysis worker
+    below was previously hardcoding claim_type="motor" regardless of what
+    the claim's actual policy was, which meant a Domestic/Marine claim's
+    entire analysis (business rules, physics-applicability classification)
+    silently ran as if it were Motor. Falls back to "motor" only when the
+    policy genuinely can't be resolved, not as a default assumption.
+    """
+    if not policy_id:
+        return "motor"
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT policy_type FROM policies WHERE policy_id = ?", (policy_id,))
+            row = cursor.fetchone()
+            return row["policy_type"] if row and row["policy_type"] else "motor"
+    except Exception as e:
+        logger.warning(f"Could not resolve claim_type for policy {policy_id}: {e}")
+        return "motor"
+
+
 # ─── Background analysis workers ─────────────────────────────────────────
 # The full AI chain (photo analysis, narrative analysis, cross-party check,
 # physics reconstruction, video render) is the slow part of every submission
@@ -147,6 +171,7 @@ async def _process_member_claim_background(
     estimated_cost: float,
     location: str,
     id_document_data: Optional[tuple] = None,
+    extra_incident_details: Optional[Dict[str, Any]] = None,
 ):
     try:
         from document_ocr import extract_document_data, build_document_evidence_block
@@ -196,6 +221,15 @@ async def _process_member_claim_background(
         if ob_number:
             incident_details["ob_number"] = ob_number
 
+        # Marine/Domestic/Goods-in-Transit fields the intake form captured
+        # directly (vessel_id, shipment_id, navigation_zone, vehicle_reg,
+        # item_serial_number, etc.) -- see submit_member_claim's
+        # structured_details param. Doesn't override the OCR-derived keys
+        # above (police_reported/ob_number), which take precedence since
+        # they're independently verified rather than analyst-entered.
+        if extra_incident_details:
+            incident_details = {**extra_incident_details, **incident_details}
+
         # Re-check for assessor/repair-shop data that may have arrived WHILE
         # this task was queued or running (this pipeline routinely takes
         # minutes) -- without this, whichever of the member/assessor/
@@ -244,7 +278,7 @@ async def _process_member_claim_background(
             location=location,
             member_id=claim_row.get("member_id"),
             policy_id=claim_row.get("policy_id"),
-            claim_type="motor",
+            claim_type=_resolve_claim_type(claim_row.get("policy_id")),
             incident_details=incident_details,
         )
 
@@ -341,7 +375,7 @@ async def _process_assessor_analysis_background(
             assessor_id=assessor_id,
             member_id=claim_row.get("member_id"),
             policy_id=claim_row.get("policy_id"),
-            claim_type="motor",
+            claim_type=_resolve_claim_type(claim_row.get("policy_id")),
         )
         db_manager.store_claim(analysis_result)
         logger.info(
@@ -381,7 +415,7 @@ async def _process_repairshop_analysis_background(
             location=location,
             member_id=claim_row.get("member_id"),
             policy_id=claim_row.get("policy_id"),
-            claim_type="motor",
+            claim_type=_resolve_claim_type(claim_row.get("policy_id")),
         )
         db_manager.store_claim(analysis_result)
         logger.info(
@@ -516,7 +550,7 @@ async def _reevaluate_business_rules_background(claim_id: str):
             claim_id=claim_id,
             member_id=claim["member_id"],
             policy_id=claim["policy_id"],
-            claim_type="motor",
+            claim_type=_resolve_claim_type(claim.get("policy_id")),
             narrative_text=narrative,
             photo_count=len(photos),
             incident_details=incident_details,
@@ -577,19 +611,29 @@ async def _reprocess_claim_after_late_photos_background(claim_id: str):
     """
     Fully re-runs the multi-party analysis (photo CV/damage detection,
     narrative, physics reconstruction, business rules, risk scoring) after
-    new photos land on a claim that already went through initial analysis --
-    most importantly, a paper-form claim filed with zero photos, whose
-    member later adds them via the notify-member link.
+    a claim that already went through (or was supposed to go through)
+    initial analysis changes in some way that should be reflected in
+    analysis_result -- late photos, or a member filling in a field the
+    original paper-form OCR left blank (see member_update_claim_fields).
 
     Without this, a late-added photo's CV analysis was computed once (for
     the AI-ROL audit trail) and then discarded -- never shown to the
     assessor, and the claim's risk/decision stayed frozen at whatever the
-    evidence-free original submission produced. This re-runs the exact same
-    analyze_multiparty_claim() pipeline the original submission used, over
-    ALL currently-stored member photos (not just the newest one) plus the
-    claim's current narrative/estimated_cost/location -- so a claim that
-    got photos added late ends up in the same state a claim filed WITH
-    those photos from the start would be in.
+    evidence-free original submission produced. Same problem for a
+    paper-form claim filed with a missing estimated_cost/location/
+    narrative: analyze_multiparty_claim never runs at intake time for those
+    (analysis_result stays "{}"), so the claim was both invisible on the
+    analyst claims list (which skips any claim with no analysis_result) and,
+    even once it did get analyzed via some other trigger, its estimated_cost
+    stayed frozen at whatever analysis_result captured that run -- never the
+    member's later answer, since update_claim_member_fields only writes the
+    raw `claims` column and previously never triggered a re-run at all.
+    This re-runs the exact same analyze_multiparty_claim() pipeline the
+    original submission used, over ALL currently-stored member photos (not
+    just the newest one, and possibly zero -- a pure field-fill has none)
+    plus the claim's CURRENT narrative/estimated_cost/location, so the
+    result reflects whatever is true right now, not what was true at
+    initial filing.
     """
     try:
         claim = db_manager.get_claim(claim_id)
@@ -605,9 +649,10 @@ async def _reprocess_claim_after_late_photos_background(claim_id: str):
             )
             member_photos = [(row["file_data"], row["filename"]) for row in cursor.fetchall()]
 
-        if not member_photos:
-            return
-
+        # Zero photos is a valid, common case here (a paper-form claim with
+        # no photos at all, reprocessed purely because a pending field was
+        # just filled in) -- analyze_multiparty_claim handles an empty photo
+        # list fine, so this no longer bails out on that alone.
         orchestrator = get_claim_orchestrator()
         analysis_result = await orchestrator.analyze_multiparty_claim(
             claim_id=claim_id,
@@ -617,7 +662,7 @@ async def _reprocess_claim_after_late_photos_background(claim_id: str):
             location=claim.get("location") or "",
             member_id=claim.get("member_id"),
             policy_id=claim.get("policy_id"),
-            claim_type="motor",
+            claim_type=_resolve_claim_type(claim.get("policy_id")),
         )
 
         # Physics reconstruction (and its rendered video) only re-runs when
@@ -637,7 +682,7 @@ async def _reprocess_claim_after_late_photos_background(claim_id: str):
                 conn.commit()
 
         logger.info(
-            f"[background] Reprocessed {claim_id} after late photo(s) "
+            f"[background] Reprocessed {claim_id} "
             f"over {len(member_photos)} total member photo(s) "
             f"(Risk: {analysis_result['fraud_risk_score']}/100)"
         )
@@ -894,6 +939,102 @@ async def get_document_file(document_id: int):
         raise
     except Exception as e:
         logger.error(f"Error serving document file {document_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/claim/{claim_id}/tracking-data")
+async def upload_tracking_data(
+    claim_id: str,
+    party: str = Form(..., description="'member' or 'assessor'"),
+    data_type: str = Form(..., description="'ais_gps' / 'telematics' / 'temperature_log'"),
+    uploader_id: str = Form(..., description="member_id or assessor_id, for ownership verification"),
+    file: UploadFile = File(...),
+):
+    """
+    **Upload an AIS/GPS track, telematics log, or temperature-logger file**
+
+    Evidence for Marine Hull collision/grounding, Goods in Transit
+    overturning, and Marine Cargo temperature-excursion claims -- these are
+    CSV/log files, not images, so this is deliberately a separate endpoint
+    from /documents/upload rather than overloading that one's image-only
+    validation. Stores the raw file only; row-by-row parsing into a
+    structured timeline (for an actual physics/plausibility check) is a
+    later phase -- this makes the evidence attachable and retrievable now
+    rather than blocking on that.
+    """
+    try:
+        if len(file.filename or "") == 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must have a filename")
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds 10MB limit")
+
+        claim = db_manager.get_claim(claim_id)
+        if not claim:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Claim not found")
+
+        authorized = False
+        if party == "member":
+            authorized = claim.get("member_id") == uploader_id
+        elif party == "assessor":
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM claim_assignments WHERE claim_id = ? AND assessor_id = ?",
+                    (claim_id, uploader_id)
+                )
+                authorized = cursor.fetchone() is not None
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="party must be 'member' or 'assessor'")
+
+        if not authorized:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to upload tracking data for this claim")
+
+        tracking_id = db_manager.store_tracking_data(
+            claim_id=claim_id, party=party, data_type=data_type,
+            filename=file.filename, file_data=content,
+        )
+        logger.info(f"Tracking data uploaded for {claim_id}: {file.filename} ({data_type}) -> id {tracking_id}")
+        return {"success": True, "tracking_id": tracking_id, "claim_id": claim_id, "data_type": data_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading tracking data for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/claim/{claim_id}/tracking-data")
+async def list_tracking_data(claim_id: str, party: Optional[str] = Query(None)):
+    """**List AIS/GPS/telematics/temperature-log files attached to a claim** (metadata only, not the raw file)."""
+    try:
+        records = db_manager.get_tracking_data_by_claim(claim_id, party=party)
+        return {"success": True, "claim_id": claim_id, "tracking_data": records}
+    except Exception as e:
+        logger.error(f"Error listing tracking data for {claim_id}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.get("/tracking-data/{tracking_id}/file")
+async def get_tracking_data_file(tracking_id: int):
+    """**Download the raw AIS/GPS/telematics/temperature-log file** attached via /tracking-data."""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT file_data, filename FROM claim_tracking_data WHERE id = ?",
+                (tracking_id,)
+            )
+            row = cursor.fetchone()
+        if not row or not row["file_data"]:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tracking data file not found")
+        return Response(
+            content=row["file_data"], media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving tracking data file {tracking_id}: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -1163,6 +1304,7 @@ async def notify_member_to_add_photos(
 
 @analysis_router.post("/claim/{claim_id}/member-update-fields")
 async def member_update_claim_fields(
+    background_tasks: BackgroundTasks,
     claim_id: str,
     member_id: str = Form(...),
     fields: str = Form(..., description='JSON object of {field_key: value}, e.g. {"estimated_cost": 45000}'),
@@ -1181,6 +1323,16 @@ async def member_update_claim_fields(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="fields must be valid JSON")
 
         result = db_manager.update_claim_member_fields(claim_id, member_id, parsed_fields)
+        # Filling in a pending field (e.g. estimated_cost) previously only
+        # ever touched the raw `claims` column -- a paper-form claim that
+        # never had analyze_multiparty_claim run at intake (analysis_result
+        # still "{}") stayed invisible on the analyst claims list forever,
+        # and even an already-analyzed claim kept showing the pre-fill
+        # value everywhere that reads analysis_result.estimated_cost. Same
+        # background reprocessing photo uploads use, so this claim ends up
+        # analyzed/visible with the member's real answer either way.
+        if result.get("updated"):
+            background_tasks.add_task(_reprocess_claim_after_late_photos_background, claim_id)
         return {"success": True, **result}
 
     except PermissionError as e:
@@ -1286,6 +1438,17 @@ async def submit_member_claim(
     injuries_reported: Optional[str] = Form(None),
     injury_details: Optional[str] = Form(None),
     id_document: Optional[UploadFile] = File(None, description="Photo of national ID or driving licence — optional"),
+    structured_details: Optional[str] = Form(
+        None,
+        description=(
+            "JSON object of claim-type-specific fields the business rules engine reads directly "
+            "(not narrative text) -- e.g. Marine Hull: vessel_id, navigation_zone, incident_datetime; "
+            "Marine Cargo: shipment_id; Goods in Transit: vehicle_reg, driver_name, transporter_name; "
+            "Domestic: item_serial_number, incident_address, alarm_armed. Unrecognised keys are simply "
+            "ignored by every rule that doesn't look for them -- this is intentionally generic rather "
+            "than one Form parameter per claim type."
+        ),
+    ),
 ):
     """
     **Member submits initial claim**
@@ -1345,6 +1508,15 @@ async def submit_member_claim(
         if id_document:
             id_document_data = (await id_document.read(), id_document.filename)
 
+        parsed_structured_details: Dict[str, Any] = {}
+        if structured_details:
+            try:
+                parsed_structured_details = json.loads(structured_details)
+                if not isinstance(parsed_structured_details, dict):
+                    parsed_structured_details = {}
+            except json.JSONDecodeError:
+                logger.warning(f"Could not parse structured_details JSON for {claim_id}, ignoring: {structured_details!r}")
+
         clean_narrative = ValidationUtils.sanitize_narrative(narrative)
         structured_block = build_structured_intake_block(
             third_party_involved, third_party_details, third_party_fled,
@@ -1377,7 +1549,7 @@ async def submit_member_claim(
         background_tasks.add_task(
             _process_member_claim_background,
             claim_id, enriched_narrative, photo_data, estimated_cost, location,
-            id_document_data,
+            id_document_data, parsed_structured_details,
         )
 
         logger.info(f"Member submission accepted for {claim_id} — analysis running in background")
@@ -2792,6 +2964,45 @@ async def update_business_rules_config(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
+@analysis_router.get("/admin/assessor-capacity")
+async def get_assessor_capacity():
+    """
+    **Assessor roster with current/max workload, for the Settings page.**
+    Auto-assignment silently fails once an assessor's current_workload hits
+    max_workload -- this lets an analyst see and raise that cap before it
+    blocks new claims.
+    """
+    try:
+        assessors = db_manager.list_assessor_capacity()
+        for a in assessors:
+            a["available_capacity"] = a["max_workload"] - a["current_workload"]
+            a["is_at_capacity"] = a["current_workload"] >= a["max_workload"]
+        return {"success": True, "assessors": assessors}
+    except Exception as e:
+        logger.error(f"Error retrieving assessor capacity: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@analysis_router.post("/admin/assessor-capacity")
+async def update_assessor_capacity(
+    assessor_id: str = Form(..., description="Assessor whose max_workload to change"),
+    max_workload: int = Form(..., ge=1, description="New maximum concurrent claim capacity"),
+    admin_id: str = Form(..., description="Analyst/admin making the change, for the audit trail"),
+):
+    """**Raise or lower one assessor's max concurrent-claim capacity.**"""
+    try:
+        result = db_manager.update_assessor_capacity(assessor_id, max_workload)
+        if not result.get("success"):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.get("reason", "Update failed"))
+        logger.info(f"Assessor {assessor_id} max_workload set to {max_workload} by {admin_id}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating assessor capacity: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
 @analysis_router.get("/claim/{claim_id}/full-report")
 async def get_full_fraud_analysis(
     claim_id: str,
@@ -2820,7 +3031,15 @@ async def get_full_fraud_analysis(
             analysis_result = json.loads(analysis_result)
  
         risk_score      = analysis_result.get('fraud_risk_score', 0)
-        estimated_cost  = analysis_result.get('estimated_cost', 0)
+        # claims.estimated_cost is the live figure -- it's what
+        # member_update_claim_fields writes when a member fills in a
+        # pending value after the fact, and what the repair-shop stage
+        # later overwrites as the "final" figure. analysis_result's own
+        # copy is just a snapshot from whenever analysis last ran, so it
+        # goes stale the moment either of those happens without a re-run.
+        # Prefer the column; fall back to the blob only for the rare case
+        # where the column is genuinely unset.
+        estimated_cost  = claim.get('estimated_cost') if claim.get('estimated_cost') not in (None, 0) else analysis_result.get('estimated_cost', 0)
         location        = analysis_result.get('location', '')
         cross_party     = analysis_result.get('cross_party_verification', {})
         photo_analysis  = analysis_result.get('photo_analysis', {})
@@ -3063,9 +3282,21 @@ async def get_full_fraud_analysis(
             # independent of analysis timing; the "final" estimated_cost
             # column becomes the repair shop's figure once they submit,
             # same convention member_stated_estimate above relies on).
+            # assessor_estimated_cost is written synchronously the moment the
+            # assessor submits (see submit_assessor_report), well before the
+            # background re-analysis that fills in analysis_result's own
+            # assessor_submission (report text/photo count) completes -- that
+            # background run alone can take a minute or more. Previously this
+            # whole block went to None until that background run finished, so
+            # a just-submitted assessor estimate was invisible on the analyst
+            # page for that whole window even though the number was already
+            # in the database. Fall back to a synthetic entry (cost only,
+            # report/analysis pending) instead of hiding a real submission.
             "assessor_submission": (
                 {**analysis_result['assessor_submission'], "estimated_cost": claim.get('assessor_estimated_cost')}
-                if analysis_result.get('assessor_submission') else None
+                if analysis_result.get('assessor_submission')
+                else ({"report": None, "analysis": None, "photos_count": None, "estimated_cost": claim.get('assessor_estimated_cost'), "processing": True}
+                      if claim.get('assessor_estimated_cost') is not None else None)
             ),
             "repair_shop_submission": (
                 {**analysis_result['repair_shop_submission'], "total_cost": claim.get('estimated_cost')}
@@ -3356,7 +3587,10 @@ async def get_all_claims_analysis(
                 continue
  
             risk_score      = analysis_result.get('fraud_risk_score', 0)
-            estimated_cost  = analysis_result.get('estimated_cost', 0)
+            # See the matching comment in get_full_fraud_analysis -- the
+            # column is the live figure, the blob is a stale snapshot once a
+            # member fills a pending field or the repair shop submits.
+            estimated_cost  = claim.get('estimated_cost') if claim.get('estimated_cost') not in (None, 0) else analysis_result.get('estimated_cost', 0)
             location        = analysis_result.get('location', '')
             cross_party     = analysis_result.get('cross_party_verification', {})
             photo_analysis  = analysis_result.get('photo_analysis', {})
@@ -3530,9 +3764,21 @@ async def get_all_claims_analysis(
             # independent of analysis timing; the "final" estimated_cost
             # column becomes the repair shop's figure once they submit,
             # same convention member_stated_estimate above relies on).
+            # assessor_estimated_cost is written synchronously the moment the
+            # assessor submits (see submit_assessor_report), well before the
+            # background re-analysis that fills in analysis_result's own
+            # assessor_submission (report text/photo count) completes -- that
+            # background run alone can take a minute or more. Previously this
+            # whole block went to None until that background run finished, so
+            # a just-submitted assessor estimate was invisible on the analyst
+            # page for that whole window even though the number was already
+            # in the database. Fall back to a synthetic entry (cost only,
+            # report/analysis pending) instead of hiding a real submission.
             "assessor_submission": (
                 {**analysis_result['assessor_submission'], "estimated_cost": claim.get('assessor_estimated_cost')}
-                if analysis_result.get('assessor_submission') else None
+                if analysis_result.get('assessor_submission')
+                else ({"report": None, "analysis": None, "photos_count": None, "estimated_cost": claim.get('assessor_estimated_cost'), "processing": True}
+                      if claim.get('assessor_estimated_cost') is not None else None)
             ),
                 "repair_shop_submission": (
                 {**analysis_result['repair_shop_submission'], "total_cost": claim.get('estimated_cost')}
